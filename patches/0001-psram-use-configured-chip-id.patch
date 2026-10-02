@@ -1,0 +1,19 @@
+diff --git a/middleware/driver/psram/psram_driver.c b/middleware/driver/psram/psram_driver.c
+index 0ada695f..c9383b5b 100755
+--- a/middleware/driver/psram/psram_driver.c
++++ b/middleware/driver/psram/psram_driver.c
+@@ -221,6 +221,14 @@ bk_err_t bk_psram_init(void)
+ 	{
+ 		chip_id = s_psram_id.psram_id;
+ 	}
++#if (!CONFIG_PSRAM_AUTO_DETECT && CONFIG_PSRAM_APS128XXO_OB9)
++	else
++	{
++		/* doorbell-bk7258-fw: no cached id and no auto-detect, so use the
++		 * configured part instead of probing (probing hangs on this board). */
++		chip_id = PSRAM_APS128XXO_OB9_ID;
++	}
++#endif
+ 
+ 	PSRAM_LOGI("%s, chip_id:%x\r\n", __func__, chip_id);
+ 
