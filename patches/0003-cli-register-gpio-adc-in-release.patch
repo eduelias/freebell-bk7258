@@ -1,0 +1,25 @@
+diff --git a/components/bk_cli/cli_main.c b/components/bk_cli/cli_main.c
+old mode 100755
+new mode 100644
+index bb5b10e5..d2b6276b
+--- a/components/bk_cli/cli_main.c
++++ b/components/bk_cli/cli_main.c
+@@ -1585,6 +1585,18 @@ int bk_cli_init(void)
+ #endif
+ #endif
+ 
++#if !CONFIG_DEBUG_FIRMWARE
++	/* doorbell-bk7258-fw: pin mapping needs the gpio/adc CLIs in release builds too.
++	 * (Enabling CONFIG_DEBUG_FIRMWARE instead drags in cli_reg + *_struct_dump, which
++	 * fail to link because hal_config.h reads the flag before sdkconfig.h.) */
++#if (CLI_CFG_GPIO == 1)
++	cli_gpio_init();
++#endif
++#if (CLI_CFG_ADC == 1)
++	cli_adc_init();
++#endif
++#endif
++
+ #if CONFIG_DEBUG_FIRMWARE
+ #if !CONFIG_CLI_CODE_SIZE_OPTIMIZE_ENABLE
+ 

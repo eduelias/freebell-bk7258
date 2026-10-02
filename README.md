@@ -42,12 +42,27 @@ scripts/flash.sh --write    # flash the latest build
 ```
 
 The tool waits for the BootROM: press the doorbell button (battery connected) when it says so.
+With firmware v0.2.0+ running, **`scripts/flash.sh --write --kick` is fully hands-free**: it sends
+our `reboot` command (`bk_reboot()`, the NMI-watchdog path with the reboot tag), the ROM answers
+link-check within a second, and the flash proceeds (proven 2026-10-02 19:23). Things that do
+*not* open the ROM window, so don't bother: the Beken bkreg reboot frame (ignored by the SDK
+shell), a deep-sleep RTC wake-up (`pm 2 1 8 9 12 8000 0 1000000000` resets the chip but the ROM
+skips the window), the doorbell button while the firmware runs (soft reset, same), and
+`--kick-wdt` (the SDK `memset` command silently refuses). From a kick-less image the only way in
+is a real power-on with battery **and** USB unplugged first, and check the hooks: a slipped
+adapter-TX wire cost an hour of "the ROM is not answering".
 It only clears the flash's write-protection bits (keeping quad-enable), skips identical sectors,
 reads back every written sector, restores protection, and refuses `0x7C0000-0x800000`
 (stock per-device KV and RF calibration) unless `--allow-tail`.
 
-To boot the new image, unplug and replug the battery. Watch the log with
-`python3 tools/serial_capture.py 115200 60 boot.bin`.
+After flashing the chip stays parked in the BootROM. Boot the new image with
+
+```bash
+python3 tools/bkreboot.py        # ROM CMD_Reboot, then prints 30 s of boot log
+```
+
+(Pulling the battery does **not** power-cycle the board while the USB charger is connected.)
+Watch the log any time with `python3 tools/serial_capture.py 115200 60 boot.bin`.
 
 ### Restore the stock Tuya firmware
 
@@ -57,12 +72,100 @@ cd tools && python3 bkwrite.py ~/data/doorbell-bk7258/doorbell_flash_20261002.bi
 
 The BK7258's download mode lives in ROM, so no flash content can brick it.
 
+Note: the build rewrites `project/config/bk7258/config` (sorts keys, strips comments), so
+document option choices here, not in that file.
+
+## Prototype: Wi-Fi + Home Assistant webhook (firmware v0.7.0)
+
+The device joins Wi-Fi with credentials stored in its own KV flash (never compiled in), then
+POSTs JSON to a Home Assistant webhook (`local_only`, no token) on boot, ring, motion, every
+5 min (heartbeat) and on request:
+
+```json
+{"event":"ring","fw":"0.7.0","ip":"192.168.x.y","mv":3068,"uptime_s":123,"motion_count":4,"ring_count":1}
+```
+
+| Command | What it does |
+|---|---|
+| `wifi set SSID PASS` | save credentials to KV and connect (auto-connects on every boot afterwards) |
+| `wifi status` / `wifi connect` / `wifi clear` | link state, RSSI, IP / reconnect / forget |
+| `hook show` | current target, default `192.168.2.80:8123/api/webhook/doorbell_bk7258_9f3c` |
+| `hook set HOST:PORT/PATH` | change the target (saved to KV) |
+| `hook test` / `hook ring` / `hook motion` | fire a report without touching the hardware |
+
+Inputs: PIR on GPIO 24 (rising edge, 3 s debounce) and button on GPIO 53 (falling edge, pull-up,
+0.8 s debounce). `reboot` now restores the pristine boot GPIO config first so the ROM download
+window stays reachable.
+
+HA side (created 2026-10-02, on the box): automation `Doorbell BK7258: webhook events`
+(`automation.doorbell_bk7258_webhook_events`) writes every payload to
+`input_text.doorbell_bk7258_last_report`, and on `ring` sends `notify.mobile_app_sm_s908b` plus a
+persistent notification; `motion` -> persistent notification; `boot` -> logbook entry.
+
+From the Mac: `python3 tools/shell.py wifi set <ssid> <password>` (see `tools/shell.py -i`).
+
+## Our shell commands
+
+The SDK's `gpio`/`adc_test` commands print through `CLI_LOGI`, which is compiled out in this
+build (`CFG_LOG_LEVEL=2`), so the firmware adds its own `os_printf`-based commands on UART0:
+
+| Command | What it does |
+|---|---|
+| `pin all` | one line with the level of all 56 GPIOs (`PINS 0101...`); pins read `1` until input-enabled |
+| `pin mux` | per-pin config byte from the AON GPIO registers (bit2 in-en, bit3 out-en, bit4/5 pull, bit6 peripheral function) |
+| `pin get N` | read one pin (+ its config byte) |
+| `pin in N [up\|down\|none]` | reclaim N from any peripheral function, make it a true input (output stage off) with that pull, print the level |
+| `pin hiz N` | reclaim N and leave it high-impedance (no input, no output, no pull) |
+| `pin out N 0\|1` | reclaim N and drive it |
+| `pin blink N [count]` | reclaim N, toggle at 300 ms (LED hunting), leave it low |
+| `pin watch SECONDS` | poll all pins every 5 ms on the device and print each edge with a timestamp |
+| `adc CHANNEL` | one calibrated SARADC reading (raw + mV) |
+
+`pin in/out/blink` refuse GPIO 10/11 (the console). Host-side helpers in `tools/`:
+`pinmap_session.py` (mux / pull classification / scan / watch / ADC sweep), `led_hunt.py`
+(interactive: blinks one candidate pin at a time and asks what you saw), `led_by_light.py`
+(tries to use an ADC as the eyes; on this board neither the light sensor nor the supply sense
+reacts to the LEDs, so it found nothing), `pinscan.py` (older, one pin per command).
+
+## Pin map (work in progress, 2026-10-02)
+
+From `tools/pinmap_session.py` (`~/data/doorbell-bk7258/pinmap_session*.txt`). Important: at boot
+the SDK's default pin map leaves almost every pin owned by a peripheral function (`pin mux` shows
+bit 6 set), and reads/pulls on such pins are meaningless. Firmware v0.4.0+ reclaims a pin with
+`gpio_dev_unmap()` + `bk_gpio_set_config(..., GPIO_SECOND_FUNC_DISABLE)`; results from v0.2/v0.3
+sessions (before that worked) are noise, except the ADC readings.
+
+| GPIO | Finding | Guess |
+|---|---|---|
+| 7 (ADC9) | 3.07 V on the ADC, stable across sessions | battery / supply sense (divider) |
+| 8 (ADC10) | 0.30 V on the ADC, stable | light sensor or PIR analog |
+| 9 | active-high enable: high = light sensor alive (303 mV), low/hi-Z = dead (24 mV) | sensor / LED rail power enable |
+| 5, 8 | boot as plain GPIO like 9, no effect on the sensor rail | LED or other plain GPIO |
+| 24 | idle low; 8 isolated high pulses of 2-4 s in 8 min at irregular intervals with nobody at the device (`pinmap_watch10/11_passive.txt`) | **PIR motion output**, active-high, 2-4 s hold (one wave in front of it will confirm) |
+| 53 | externally held high; one 0.2 s low pulse seen | button (active-low) or sensor interrupt |
+| 45 (ADC11) | externally low; driving it **high once switched the white fill LED off**, and it stayed off whatever 45 did afterwards (camera-verified, `led_by_camera3.txt`) | white-LED driver kill/toggle input, to be confirmed from a fresh power-on |
+| 10, 11 | UART0 console | never touch |
+| others | see the latest `pinmap_session*.txt` (v0.4.0 reclaim) | |
+
+Open: which pin is the button, the PIR, the LEDs (`pin blink` on 5/8/9 first), the chime, the
+charger status, and the power-hold line.
+
 ## SDK patches
 
 - `0001-psram-use-configured-chip-id.patch`: with no cached PSRAM id, the stock driver probes the
   8 MB APS6408L first, which hangs this board right after the shell prompt. With
   `CONFIG_PSRAM_AUTO_DETECT=n` and `CONFIG_PSRAM_APS128XXO_OB9=y` (in
   `project/config/bk7258/config`) it now uses the configured part instead.
+- `0002-cli-enable-adc-commands.patch`: `CLI_CFG_ADC` is hard-coded 0 in `cli_config.h`; set it
+  to 1 on CPU0 so `adc_driver` / `adc_test` exist (battery sensing).
+- `0003-cli-register-gpio-adc-in-release.patch`: the whole driver CLI block in `cli_main.c`
+  (`gpio`, `uart`, `spi`, `i2c`, `timer`, `flash`, `reg`, `adc`) sits behind
+  `CONFIG_DEBUG_FIRMWARE`, which only Beken's internal build defines (as a `-D` flag; there is
+  no Kconfig symbol, so the defconfig's `=n` is silently dropped). Declaring the symbol and
+  setting it `y` does enable the block, but then `cli_reg` references `*_struct_dump` helpers
+  that compile to nothing, because `hal_config.h` tests the flag before `sdkconfig.h` is in
+  scope, and the link fails. So instead this patch registers just `cli_gpio_init()` and
+  `cli_adc_init()` unconditionally when `CONFIG_DEBUG_FIRMWARE` is off.
 
 ## Status
 
@@ -71,6 +174,13 @@ The BK7258's download mode lives in ROM, so no flash content can brick it.
 - [x] PSRAM fix verified (2026-10-02): boots past the old hang, banner + 5 s heartbeat on UART0,
       shell answers (`help` lists 79 commands: wifi `net sta`, `ping`, `iperf`, `ble`, `pm`,
       `memshow`, `mqttsend`), `psram_malloc 65536` returns 0x60700020
-- [ ] Map GPIOs: LEDs, button, PIR, chime, battery sense, power hold
-- [ ] Wi-Fi join, then MQTT/HTTP to Home Assistant (ring, motion, battery)
+- [~] Map GPIOs: GPIO 9 = sensor-rail enable (found); ADC readings known; LEDs, button, PIR,
+      chime, battery sense, power hold still open (LED hunt needs eyes: `pin blink N`)
+- [x] Wi-Fi join (credentials in KV, auto-reconnect, ~1 s after boot) and HTTP webhook to
+      Home Assistant: boot/motion/test verified end-to-end on 2026-10-02 22:41 over a throwaway
+      hotspot on du7 (`doorbell-test`); HA automation + `input_text` helper live
+- [ ] Switch to the real home Wi-Fi (`tools/shell.py wifi set SSID PASS`), then tear down the du7
+      hotspot (`nmcli con down doorbell-test; nmcli con delete doorbell-test`, kill the DHCP-only
+      dnsmasq, drop the MASQUERADE/FORWARD rules)
+- [ ] Confirm the button really is GPIO 53 (press it, expect a `ring` report) and tune PIR debounce
 - [ ] Camera (DVP/MIPI sensor on the FPC) and JPEG/H.264 snapshot or stream

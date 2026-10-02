@@ -1,0 +1,13 @@
+diff --git a/components/bk_cli/cli_config.h b/components/bk_cli/cli_config.h
+index e90f4310..be39bf74 100755
+--- a/components/bk_cli/cli_config.h
++++ b/components/bk_cli/cli_config.h
+@@ -100,7 +100,7 @@ extern "C" {
+ 
+ #if (CONFIG_SYS_CPU0)
+ #define CLI_CFG_UART        1
+-#define CLI_CFG_ADC         0
++#define CLI_CFG_ADC         1
+ #define CLI_CFG_SPI         1
+ #define CLI_CFG_MICO        1
+ #define CLI_CFG_REG         1

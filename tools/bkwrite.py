@@ -95,6 +95,11 @@ def main():
     ap.add_argument("--write", action="store_true", help="actually erase/write (default: dry run)")
     ap.add_argument("--allow-tail", action="store_true", help="allow writing 0x7C0000-0x800000")
     ap.add_argument("--wait", type=float, default=180, help="seconds to wait for the ROM link")
+    ap.add_argument("--kick", action="store_true",
+                    help="first ask the running firmware to reboot (bkreg frame + our `reboot` command)")
+    ap.add_argument("--kick-wdt", type=lambda s: int(s, 0), metavar="AON_WDT_ADDR",
+                    help="first force a watchdog reset via the SDK shell's `memset` (two key writes), "
+                         "then catch the ROM window immediately")
     a = ap.parse_args()
 
     img = open(a.image, "rb").read()
@@ -108,6 +113,18 @@ def main():
     print(f"image {a.image}: {len(img)//1024} KB -> flash {hex(a.start)}-{hex(end)}  mode={'WRITE' if a.write else 'DRY RUN'}", flush=True)
 
     bk = BKW()
+    if a.kick:
+        # Reset the *running* firmware, then catch the ROM's link window right after:
+        # Beken bkreg frame (CMD_Reboot) for stock/SDK images, plus our own `reboot` command.
+        bk.s.write(bytes.fromhex("01e0fc020ea5"))
+        bk.s.write(b"\r\nreboot\r\n")
+        print(time.strftime("%T"), "sent reboot kick to the running firmware", flush=True)
+    if a.kick_wdt:
+        # wdt_hal_force_reboot(): REG_WRITE(SOC_AON_WDT_REG_BASE, 0x5A000A); REG_WRITE(..., 0xA5000A)
+        # The SDK `memset` CLI takes hex and writes one 32-bit word. The reset follows within ms,
+        # so the link-check loop below must already be running: no delay here.
+        bk.s.write(f"\r\nmemset {a.kick_wdt:x} 5A000A\r\nmemset {a.kick_wdt:x} A5000A\r\n".encode())
+        print(time.strftime("%T"), f"sent watchdog-reset kick via memset @0x{a.kick_wdt:x}", flush=True)
     print(time.strftime("%T"), "waiting for ROM (press the doorbell button)...", flush=True)
     t0 = time.time()
     while not bk.link(seconds=1.0):
