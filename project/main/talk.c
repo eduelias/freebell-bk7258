@@ -28,6 +28,7 @@ extern int bk_get_env_enhance(const char *key, void *value, int value_len);
 #define TALK_MAX_DEFAULT_S 30
 #define TALK_MAX_LIMIT_S 120
 #define TALK_MIC_MAX_S 600
+#define TALK_MIC_WARM_MS 200   /* first 200 ms of /mic.wav are sent as silence (ADC start pop) */
 #define TALK_HDR_MAX 1024                 /* request header buffer */
 #define TALK_IO_CHUNK 2048                /* socket read size while playing */
 #define TALK_MIC_WORDS 4096               /* bytes of 32-bit mic words per /mic.wav chunk (64 ms at 16 kHz) */
@@ -804,6 +805,7 @@ static int send_piece(int sock, bool chunked, const uint8_t *p, uint32_t n)
 static void mic_get(int sock, uint32_t seconds, bool http10)
 {
 	uint32_t rate = aud_mic_rate(), limit, sent = 0, idle = 0, muted = 0, pieces = 0, t0;
+	uint32_t warm = rate * 2 * TALK_MIC_WARM_MS / 1000;   /* bytes of ADC start transient replaced by silence */
 	bool chunked = !http10 && seconds == 0;
 	uint8_t *words, *pcm, hdr[44];
 	char http[224];
@@ -859,11 +861,13 @@ static void mic_get(int sock, uint32_t seconds, bool http10)
 		if (samples * 2 > limit - sent)
 			samples = (limit - sent) / 2;
 		mute = aud_spk_busy();   /* half duplex: silence while the speaker plays (talk, chime, spk) */
+		if (sent < warm)         /* measured 2026-10-03: ~60 ms at full scale + ~110 ms DC settle after bk_aud_adc_start */
+			mute = true;
 		for (k = 0; k < samples; k++) {   /* lo16 of each FIFO word = MIC1 */
 			pcm[2 * k] = mute ? 0 : words[4 * k];
 			pcm[2 * k + 1] = mute ? 0 : words[4 * k + 1];
 		}
-		if (mute)
+		if (mute && sent >= warm)
 			muted++;
 		if (send_piece(sock, chunked, pcm, samples * 2))
 			break;
