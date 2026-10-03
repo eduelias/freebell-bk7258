@@ -1,6 +1,7 @@
 set(incs .)
 set(srcs
     app_main.c
+    power.c
     )
 
 if (CONFIG_OVERRIDE_FLASH_PARTITION)
