@@ -250,3 +250,9 @@ default `allowlist_external_dirs`, so `camera.snapshot` can write there.
 
 Timeline of the unattended cycle (`sleep on`, `force on`, `idle 20`, `snap_min 10`, `wake_pir on`,
 hook on HA, started 19:36:39): filled in below.
+- 19:36:14 boot (OTA 0.21.1), 19:36:39 settings applied, **19:38:16 idle sleep** (= end of boot hold, last activity 19:37:06), **19:48:16 RTC wake** (600 s), HA `boot` + `wake rtc` at 19:48:16, `wake_latest.jpg` 19:48:21, **19:50:16 idle sleep** again (hold 120 s + the HA snapshot/pwr status activity at 19:48:2x -> idle 20 s reached before the hold ended). Each cycle: 2 min awake / 10 min asleep, like clockwork.
+- 20:00:17 RTC wake #2 (HA logged boot + wake), 20:02:19 idle sleep #3, 20:12:19 RTC wake #3. Three
+  full cycles, every edge within 1-4 s of the prediction, battery flat at 3884-3890 mV throughout.
+  No owner action happened in the window (button / PIR / USB wake still unproven), so at 20:12:29
+  (inside the boot hold) everything was switched back: `sleep off`, `force off`, `wake_pir off`,
+  `idle 60`, `snap_min 0`. Device left awake on 0.21.1 with the defaults.
