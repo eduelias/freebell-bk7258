@@ -1,5 +1,5 @@
 # AVDK flavour of the doorbell firmware: the same app sources as project/, built inside Beken's
-# bk_avdk tree so the multimedia (camera) components are available. Mounted at /avdk/projects/du7
+# bk_avdk tree so the multimedia (camera) components are available. Mounted at /avdk/projects/doorbell
 # by scripts/build-avdk.sh, with project/main mounted at ./shared.
 cmake_minimum_required(VERSION 3.5)
 set(EXTRA_COMPONENTS_DIRS
