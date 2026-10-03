@@ -230,5 +230,8 @@ python3 tools/dbcmd.py rtsp on
   3/8 bad in a cold-open loop), v0.22.2 uses 800 ms / 150 ms (7/8 ok) + stall self-heal + one retry
   in acquire: 6/6 DESCRIBEs with HA still-polls in between, the one silent open was repaired by the
   next DESCRIBE (7.8 s). Switch cost ~2.1 s.
-- Step 6: 20 min TCP soak from du7 (`systemd-run --user --unit rtsp-soak`), results in NOTES.md.
+- Step 6: 20 min TCP soak from du7 (`systemd-run --user --unit rtsp-soak`, 21:11-21:31): no reboot
+  (uptime 1852 s), ~3600 frames, `drop busy 2 big 0`, lost 0, ffmpeg log empty, heap 109 K with the
+  client and back to 115 K after it left (no leak). v0.22.3 (power off on a failed open) then 6/6
+  cold opens, DESCRIBE ok, heap 115.5 K.
 - Not done: UI live view by eye, audio track, daylight frame-rate check, `rtsp port` change.

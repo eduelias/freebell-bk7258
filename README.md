@@ -92,13 +92,14 @@ be the previous JPEG (the handler does not wait for a new frame).
   CPU1->CPU0 hand-off). Consequence: ffmpeg/ffprobe need 5-11 s to probe the stream and HA's
   still-from-stream takes ~7 s (its 10 s timeout is marginal at 3 fps). Fix candidates: disable
   night mode in the sensor table (constant ~9 fps, darker night picture) or a GOP of ~10 frames.
-- **Camera power-cycle on close (v0.22.1/0.22.2)**: `cam_close_locked()` drops GPIO 28/5/6 and the
+- **Camera power-cycle on close (v0.22.1-0.22.3)**: `cam_close_locked()` drops GPIO 28/5/6 and the
   next open waits for 800 ms of power-off plus 150 ms settle before the GPIO 52 pulse. Without it a
   close followed by a reopen within a few seconds (exactly what the JPEG<->H.264 switch does) left
   the sensor silent ("camera wedge", reboot-only before; now also cleared by `cam probe rails off`
   + `on`). 250 ms/60 ms was not enough (3/8 cold opens silent or undetected); 800/150 gave 7/8 and
   the remaining case is self-healed: a camera open for 4 s without a frame is power-cycled at the
-  next use (`cam_stalled_locked()`), and `rtsp_cam_acquire()` retries a silent open once. A
+  next use (`cam_stalled_locked()`), `rtsp_cam_acquire()` retries a silent open once, and a failed
+  `media_app_camera_open` powers the sensor off so the retry is a real power cycle (0.22.3). A
   JPEG->H.264 switch now takes ~2.1 s.
 - Home Assistant: the generic camera entry `01M40YN6CC2SS5DFP8X8Y35ZRN` ("Doorbell BK7258") is
   **stream-only** since 2026-10-03: `stream_source rtsp://192.168.2.89:554/live`, `advanced.rtsp_transport
