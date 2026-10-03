@@ -1,0 +1,30 @@
+diff --git a/components/http/utils_httpc.c b/components/http/utils_httpc.c
+index 00fe3c3a..28b9b639 100755
+--- a/components/http/utils_httpc.c
++++ b/components/http/utils_httpc.c
+@@ -1175,6 +1175,12 @@ int httpclient_response_parse(httpclient_t *client, char *data, int len, uint32_
+ 		data[crlf_pos] = '\0';
+ 
+ 		n = sscanf(data, "%31[^:]: %31[^\r\n]", key, value);
++		if (n == 1) {
++			/* doorbell-bk7258-fw: tolerate headers with an empty value, e.g. "Server: " as sent
++			 * by Home Assistant's aiohttp; otherwise every OTA from HA fails with ERROR_HTTP. */
++			value[0] = '\0';
++			n = 2;
++		}
+ 		if (n == 2) {
+ 			log_debug("Read header : %s: %s", key, value);
+ 			if (!os_strcmp(key, "Content-Length")) {
+@@ -1191,8 +1197,10 @@ int httpclient_response_parse(httpclient_t *client, char *data, int len, uint32_
+ 			len -= (crlf_pos + 2);
+ 
+ 		} else {
+-			log_err("Could not parse header");
+-			return ERROR_HTTP;
++			/* doorbell-bk7258-fw: skip lines we cannot parse instead of aborting */
++			log_err("Could not parse header, skipping");
++			os_memmove(data, &data[crlf_pos + 2], len - (crlf_pos + 2) + 1);
++			len -= (crlf_pos + 2);
+ 		}
+ 	}
+ 

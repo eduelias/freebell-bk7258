@@ -106,19 +106,40 @@ From the Mac: `python3 tools/shell.py wifi set <ssid> <password>` (see `tools/sh
 
 ## OTA over Wi-Fi (firmware v0.8.0+)
 
-Each build also produces an OTA image, `build/app/bk7258/encrypt/app_pack.rbl` (compressed +
-encrypted app, ~0.9 MB; `scripts/build.sh` copies it next to the flash images). The firmware's
-`ota URL` command uses the SDK's HTTP OTA client: it streams the file into the `ota` partition
-(0x286000, 1428 KB) and reboots; the bootloader then installs it. Serve the file from any HTTP
-server the doorbell can reach, e.g. on the Mac:
+Each build also produces an OTA image, `doorbell-fw_<ver>_app_pack.rbl` (compressed + encrypted
+app, ~0.9 MB, copied next to the flash images by `scripts/build.sh`). The firmware's `ota URL`
+command uses the SDK's HTTP OTA client: it streams the file into the `ota` partition (0x286000,
+1428 KB) and reboots; the bootloader installs it (~35 s end to end on the LAN).
+
+**Image host: Home Assistant.** Files in `/config/www/doorbell/` on the HA box are served at
+`http://192.168.2.80:8123/local/doorbell/<file>` with no token, always on, already reachable by
+the device. SDK patch `0004` is required for this: HA's aiohttp sends `Server:` with an empty
+value, which the stock header parser rejected (`[ota] result -4`). The Mac is *not* a usable host
+while its firewall blocks incoming connections to Python (`socketfilterfw --listapps`).
+
+**Hands-free release** (needs the TCP command channel, below):
 
 ```bash
-cd ~/data/doorbell-bk7258/firmware && python3 -m http.server 8765 --bind <mac-lan-ip>
-python3 tools/shell.py -w 60 ota http://<mac-lan-ip>:8765/doorbell-fw_0.8.1_app_pack.rbl
+scripts/release.sh        # build -> copy rbl Mac -> du7 -> HA -> `ota` over TCP -> device reboots
 ```
 
-Recovery if an OTA image is bad: the bootloader keeps the old app unless the download completed
-and verified; worst case the UART + ROM path (`scripts/flash.sh`) still works.
+Recovery if an image is bad: the bootloader only switches after a complete, verified download;
+worst case the UART + ROM path (`scripts/flash.sh`) still works.
+
+## TCP command channel (firmware v0.9.0+)
+
+Port 2323, one line per connection: `<token> <command>`, reply `ok` / `unknown` / `denied`.
+Command output still goes to UART0; the reply only tells you the command was accepted. The token
+is stored once over serial (`tok set SECRET`, kept in KV; `tok clear` disables the channel), the
+Mac keeps it in `~/data/doorbell-bk7258/tcp_token.env`. All shell commands are available:
+
+```bash
+python3 tools/dbcmd.py hook ring
+python3 tools/dbcmd.py ota http://192.168.2.80:8123/local/doorbell/doorbell-fw_0.9.1_app_pack.rbl
+python3 tools/dbcmd.py reboot
+```
+
+It is plain TCP on the home LAN with a shared secret: fine for a prototype, not for the internet.
 
 Ring reports are rate-limited to one per 10 s (button debounce stays 0.8 s; `ring_count` counts
 every press).

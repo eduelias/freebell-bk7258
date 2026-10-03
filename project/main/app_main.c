@@ -4,6 +4,7 @@
 #include <os/os.h>
 #include <os/str.h>
 #include <os/mem.h>
+#include <string.h>
 #include <stdio.h>
 #include <components/shell_task.h>
 #include <driver/gpio.h>
@@ -20,7 +21,7 @@
 #endif
 
 #define FW_NAME "doorbell-bk7258-fw"
-#define FW_VERSION "0.8.1"
+#define FW_VERSION "0.9.2"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -495,6 +496,17 @@ static void cli_wifi_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, cha
 }
 
 extern int bk_http_ota_download(const char *url);
+static char s_ota_url[160];
+static beken_thread_t ota_thread;
+
+static void ota_task(beken_thread_arg_t arg)
+{
+	int ret = bk_http_ota_download(s_ota_url);
+
+	os_printf("[ota] result %d%s\r\n", ret, ret == 0 ? " (rebooting)" : "");
+	ota_thread = NULL;
+	rtos_delete_thread(NULL);
+}
 
 static void cli_ota_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
 {
@@ -508,9 +520,12 @@ static void cli_ota_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 		os_printf("[ota] no network\r\n");
 		return;
 	}
-	os_printf("[ota] downloading %s\r\n", argv[1]);
-	ret = bk_http_ota_download(argv[1]);
-	os_printf("[ota] result %d%s\r\n", ret, ret == 0 ? " (reboot to apply)" : "");
+	os_strlcpy(s_ota_url, argv[1], sizeof(s_ota_url));
+	os_printf("[ota] downloading %s\r\n", s_ota_url);
+	/* run in its own thread so the shell / TCP channel reply at once; the device reboots on success */
+	ret = rtos_create_thread(&ota_thread, BEKEN_APPLICATION_PRIORITY, "ota", ota_task, 8192, NULL);
+	if (ret != BK_OK)
+		os_printf("[ota] thread failed %d\r\n", ret);
 }
 
 static void cli_hook_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
@@ -531,6 +546,94 @@ static void cli_hook_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, cha
 }
 
 
+
+/* ---- TCP command channel: the same commands as the UART shell, over the LAN ----
+ * One line per connection: "<token> <command...>\n". The token is the KV string db_token
+ * (set once over serial: `tok set SECRET`); without a stored token the channel is disabled.
+ * Replies are "ok", "denied" or "unknown"; command output still goes to UART0. */
+#define KV_TOKEN "db_token"
+#define TCP_CMD_PORT 2323
+static char s_token[48];
+static const struct cli_command s_doorbell_commands[];
+static unsigned s_doorbell_command_count;
+
+static int run_line(char *line)
+{
+	char *argv[12];
+	int argc = 0;
+	unsigned i;
+
+	for (char *t = strtok(line, " \t\r\n"); t && argc < 12; t = strtok(NULL, " \t\r\n"))
+		argv[argc++] = t;
+	if (!argc)
+		return -1;
+	for (i = 0; i < s_doorbell_command_count; i++)
+		if (os_strcmp(argv[0], s_doorbell_commands[i].name) == 0) {
+			s_doorbell_commands[i].function(NULL, 0, argc, argv);
+			return 0;
+		}
+	return -1;
+}
+
+static void tcp_cmd_task(beken_thread_arg_t arg)
+{
+	struct sockaddr_in sa = {0};
+	int ls, cs, n, one = 1;
+	char line[192], *cmd;
+	struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+
+	ls = socket(AF_INET, SOCK_STREAM, 0);
+	setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	sa.sin_family = AF_INET;
+	sa.sin_port = htons(TCP_CMD_PORT);
+	sa.sin_addr.s_addr = INADDR_ANY;
+	if (bind(ls, (struct sockaddr *)&sa, sizeof(sa)) < 0 || listen(ls, 1) < 0) {
+		os_printf("[tcp] bind/listen failed\r\n");
+		close(ls);
+		rtos_delete_thread(NULL);
+		return;
+	}
+	os_printf("[tcp] command channel on port %d\r\n", TCP_CMD_PORT);
+	while (1) {
+		cs = accept(ls, NULL, NULL);
+		if (cs < 0)
+			continue;
+		setsockopt(cs, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+		n = recv(cs, line, sizeof(line) - 1, 0);
+		if (n > 0) {
+			line[n] = 0;
+			cmd = os_strchr(line, ' ');
+			if (!s_token[0] || !cmd || os_strncmp(line, s_token, cmd - line) != 0
+			    || os_strlen(s_token) != (size_t)(cmd - line)) {
+				send(cs, "denied\n", 7, 0);
+			} else {
+				cmd++;
+				os_printf("[tcp] %s\r\n", cmd);
+				if (run_line(cmd) == 0)
+					send(cs, "ok\n", 3, 0);
+				else
+					send(cs, "unknown\n", 8, 0);
+			}
+		}
+		rtos_delay_milliseconds(100);
+		close(cs);
+	}
+}
+
+static void cli_tok_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
+{
+	if (argc >= 3 && os_strcmp(argv[1], "set") == 0) {
+		os_strlcpy(s_token, argv[2], sizeof(s_token));
+		kv_set_str(KV_TOKEN, s_token);
+		os_printf("[tok] token set (%u chars); TCP channel active after reboot\r\n", os_strlen(s_token));
+	} else if (argc >= 2 && os_strcmp(argv[1], "clear") == 0) {
+		s_token[0] = 0;
+		kv_set_str(KV_TOKEN, "");
+		os_printf("[tok] cleared\r\n");
+	} else {
+		os_printf("[tok] %s  (tok set SECRET | clear)\r\n", s_token[0] ? "set" : "not set");
+	}
+}
 #endif /* CONFIG_SYS_CPU0 */
 
 /* ---- reboot: lets the host reach ROM download mode without touching the board ---- */
@@ -562,8 +665,12 @@ static const struct cli_command s_doorbell_commands[] = {
 	{"wifi", "wifi set SSID PASS | clear | connect | (status)", cli_wifi_cmd},
 	{"hook", "hook set HOST:PORT/PATH | test | ring | motion | (show)", cli_hook_cmd},
 	{"ota", "ota URL (download app_pack.rbl over HTTP, then reboot)", cli_ota_cmd},
+	{"tok", "tok set SECRET | clear (token for the TCP command channel, port 2323)", cli_tok_cmd},
 #endif
 };
+#if (CONFIG_SYS_CPU0)
+static unsigned s_doorbell_command_count = sizeof(s_doorbell_commands) / sizeof(s_doorbell_commands[0]);
+#endif
 
 /* ---- app ---- */
 
@@ -579,7 +686,7 @@ static void heartbeat_task(beken_thread_arg_t arg)
 
 void user_app_main(void)
 {
-	beken_thread_t heartbeat, reporter;
+	beken_thread_t heartbeat, reporter, tcpcmd;
 
 	os_printf("\r\n==== " FW_NAME " " FW_VERSION ": hello from our own firmware ====\r\n");
 	cli_register_commands(s_doorbell_commands,
@@ -597,6 +704,12 @@ void user_app_main(void)
 	inputs_init();
 	rtos_create_thread(&reporter, BEKEN_APPLICATION_PRIORITY, "reporter",
 			   reporter_task, 4096, NULL);
+	kv_get_str(KV_TOKEN, s_token, sizeof(s_token));
+	if (s_token[0])
+		rtos_create_thread(&tcpcmd, BEKEN_APPLICATION_PRIORITY, "tcpcmd",
+				   tcp_cmd_task, 4096, NULL);
+	else
+		os_printf("[tcp] disabled (no token: `tok set SECRET`)\r\n");
 	os_printf("[cfg] ssid '%s' hook %s\r\n", s_ssid, s_hook);
 	if (s_ssid[0])
 		wifi_connect();
@@ -604,6 +717,7 @@ void user_app_main(void)
 		os_printf("[wifi] no credentials: use `wifi set SSID PASS`\r\n");
 #else
 	(void)reporter;
+	(void)tcpcmd;
 #endif
 }
 
