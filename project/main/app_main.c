@@ -40,7 +40,7 @@
 #endif
 
 #define FW_NAME "doorbell-bk7258-fw"
-#define FW_VERSION "0.17.1"
+#define FW_VERSION "0.18.1"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -275,6 +275,14 @@ static bool s_reply_on;
 
 static char s_ssid[WIFI_SSID_STR_LEN], s_pass[WIFI_PASSWORD_LEN], s_hook[128];
 static volatile bool s_got_ip, s_pend_motion, s_pend_ring, s_pend_boot, s_pend_test;
+static volatile bool s_pend_fx;
+static uint32_t s_dark_mv = 400;      /* light sensor (ADC10, GPIO 8) below this = dark -> white light on ring */
+static bool s_fx_enabled = true;
+#define KV_DARK "db_dark_mv"
+#define KV_FX "db_fx"
+#define LIGHT_ADC_CHAN 10
+#define WHITE_LIGHT_MS 30000
+static void ringfx_start(void);
 static volatile uint32_t s_last_motion_ms, s_last_ring_ms, s_motion_count, s_ring_count;
 static char s_ip[16] = "0.0.0.0";
 
@@ -380,9 +388,9 @@ static int report(const char *event)
 	if (!s_got_ip)
 		return -ENOTCONN;
 	snprintf(json, sizeof(json),
-		 "{\"event\":\"%s\",\"fw\":\"" FW_VERSION "\",\"ip\":\"%s\",\"mv\":%u,"
+		 "{\"event\":\"%s\",\"fw\":\"" FW_VERSION "\",\"ip\":\"%s\",\"mv\":%u,\"light_mv\":%u,"
 		 "\"uptime_s\":%u,\"motion_count\":%u,\"ring_count\":%u}",
-		 event, s_ip, adc_read_mv(9), rtos_get_time() / 1000, s_motion_count, s_ring_count);
+		 event, s_ip, adc_read_mv(9), adc_read_mv(LIGHT_ADC_CHAN), rtos_get_time() / 1000, s_motion_count, s_ring_count);
 	st = http_post_json(s_hook, json);
 	os_printf("[hook] %s -> %d\r\n", event, st);
 	return st;
@@ -408,6 +416,7 @@ static void button_isr(gpio_id_t id)
 	if (now - s_last_ring_ms > 800) {
 		s_last_ring_ms = now;
 		s_ring_count++;
+		s_pend_fx = true;   /* local feedback on every press: chime, ring LEDs, light when dark */
 		if (now - s_last_ring_report_ms > 10000) {   /* one notification per 10 s */
 			s_last_ring_report_ms = now;
 			s_pend_ring = true;
@@ -461,6 +470,10 @@ static void reporter_task(beken_thread_arg_t arg)
 			s_pend_boot = false;
 			report("boot");
 			last_hb = rtos_get_time();
+		}
+		if (s_pend_fx) {
+			s_pend_fx = false;
+			ringfx_start();
 		}
 		if (s_pend_ring) {
 			s_pend_ring = false;
@@ -1731,6 +1744,70 @@ static void cli_reboot_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, c
 	bk_reboot();
 }
 
+#if (CONFIG_SYS_CPU0)
+/* ---- ring effects: what the doorbell itself does on a press, independent of Wi-Fi ---- */
+static volatile bool s_fx_running;
+
+static void ringfx_task(beken_thread_arg_t arg)
+{
+	uint32_t light = adc_read_mv(LIGHT_ADC_CHAN);
+	bool dark = light < s_dark_mv;
+
+	os_printf("[fx] ring: light %u mV (%s)\r\n", light, dark ? "dark" : "day");
+	if (!s_spk_busy)
+		spk_start(0, 0, 0x60e000 + 16, 66450 - 16);   /* stock bell chime from flash */
+	pin_configure(PIN_LED_RING, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+	if (dark) {
+		pin_configure(PIN_LED_WHITE, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+		bk_gpio_set_output_high(PIN_LED_WHITE);
+	}
+	for (int i = 0; i < 8; i++) {   /* blue ring: 8 blinks over ~2.4 s */
+		bk_gpio_set_output_high(PIN_LED_RING);
+		rtos_delay_milliseconds(150);
+		bk_gpio_set_output_low(PIN_LED_RING);
+		rtos_delay_milliseconds(150);
+	}
+	if (dark) {
+		rtos_delay_milliseconds(WHITE_LIGHT_MS - 2400);
+		bk_gpio_set_output_low(PIN_LED_WHITE);
+	}
+	s_fx_running = false;
+	rtos_delete_thread(NULL);
+}
+
+static void ringfx_start(void)
+{
+	beken_thread_t t;
+
+	if (!s_fx_enabled || s_fx_running)
+		return;
+	s_fx_running = true;
+	if (rtos_create_thread(&t, BEKEN_APPLICATION_PRIORITY, "ringfx", ringfx_task, 3072, NULL) != BK_OK)
+		s_fx_running = false;
+}
+
+static void cli_ring_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
+{
+	char buf[16];
+
+	if (argc >= 2 && os_strcmp(argv[1], "test") == 0) {
+		ringfx_start();
+		REPLY("[ring] effects started (light %u mV, dark below %u)\r\n", adc_read_mv(LIGHT_ADC_CHAN), s_dark_mv);
+	} else if (argc >= 3 && os_strcmp(argv[1], "dark") == 0) {
+		s_dark_mv = os_strtoul(argv[2], NULL, 10);
+		snprintf(buf, sizeof(buf), "%u", s_dark_mv);
+		kv_set_str(KV_DARK, buf);
+		REPLY("[ring] dark threshold %u mV\r\n", s_dark_mv);
+	} else if (argc >= 3 && os_strcmp(argv[1], "fx") == 0) {
+		s_fx_enabled = os_strcmp(argv[2], "on") == 0;
+		kv_set_str(KV_FX, s_fx_enabled ? "1" : "0");
+		REPLY("[ring] local effects %s\r\n", s_fx_enabled ? "on" : "off");
+	} else {
+		REPLY("ring test | dark MV | fx on|off   (light now %u mV, dark < %u, fx %d)\r\n", adc_read_mv(LIGHT_ADC_CHAN), s_dark_mv, s_fx_enabled);
+	}
+}
+#endif /* CONFIG_SYS_CPU0 */
+
 static const struct cli_command s_doorbell_commands[] = {
 	{"pin", "pin all|mux|get|in|out|blink|watch ... (GPIO mapping)", cli_pin_cmd},
 	{"adc", "adc CHANNEL (one calibrated SARADC reading)", cli_adc_read_cmd},
@@ -1741,6 +1818,9 @@ static const struct cli_command s_doorbell_commands[] = {
 	{"ota", "ota URL (download app_pack.rbl over HTTP, then reboot)", cli_ota_cmd},
 	{"tok", "tok set SECRET | clear (token for the TCP command channel, port 2323)", cli_tok_cmd},
 	{"led", "led white|ring on|off (white fill LED GPIO 44 / blue button ring GPIO 45)", cli_led_cmd},
+#if (CONFIG_SYS_CPU0)
+	{"ring", "ring test | dark MV | fx on|off (local chime, ring LEDs, light when dark)", cli_ring_cmd},
+#endif
 #if defined(DU7_AVDK) && (CONFIG_SYS_CPU0)
 	{"cam", "cam open [W H] | close | stat | snap HOST PORT (AVDK build)", cli_cam_cmd},
 #endif
@@ -1776,6 +1856,8 @@ void user_app_main(void)
 
 #if (CONFIG_SYS_CPU0)
 	pa_set(0);   /* amplifier enable floats at boot and half-turns the speaker on: park it low */
+	pin_configure(9, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);   /* sensor rail: light sensor (ADC10) reads ~25 mV dead without it */
+	bk_gpio_set_output_high(9);
 #if defined(DU7_AVDK)
 	{
 		beken_thread_t http;
@@ -1787,6 +1869,13 @@ void user_app_main(void)
 	pin_configure(PIN_LED_RING, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
 	bk_gpio_set_output_low(PIN_LED_RING);
 	kv_get_str(KV_SSID, s_ssid, sizeof(s_ssid));
+	{
+		char v[16];
+		if (kv_get_str(KV_DARK, v, sizeof(v)))
+			s_dark_mv = os_strtoul(v, NULL, 10);
+		if (kv_get_str(KV_FX, v, sizeof(v)))
+			s_fx_enabled = v[0] != '0';
+	}
 	kv_get_str(KV_PASS, s_pass, sizeof(s_pass));
 	if (!kv_get_str(KV_HOOK, s_hook, sizeof(s_hook)))
 		os_strlcpy(s_hook, HOOK_DEFAULT, sizeof(s_hook));
