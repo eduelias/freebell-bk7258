@@ -38,6 +38,8 @@
 #endif
 #endif
 #endif
+#include <stdarg.h>
+#include "night.h"   /* LED arbiter, night light, ring indicator, `night` / `sys` commands (night.c) */
 
 #define FW_NAME "doorbell-bk7258-fw"
 /* ---- reply buffer: command output for the TCP channel (UART still gets everything) ---- */
@@ -46,7 +48,19 @@ static bool s_reply_on;
 #define REPLY(...) do { os_printf(__VA_ARGS__); if (s_reply_on) { size_t _l = os_strlen(s_reply); \
 	if (_l < sizeof(s_reply) - 1) snprintf(s_reply + _l, sizeof(s_reply) - _l, __VA_ARGS__); } } while (0)
 
-#define FW_VERSION "0.18.5"
+/* REPLY() for other source files (night.c) */
+void db_reply(const char *fmt, ...)
+{
+	char buf[256];
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	REPLY("%s", buf);
+}
+
+#define FW_VERSION "0.19.0"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -489,6 +503,7 @@ static void reporter_task(beken_thread_arg_t arg)
 		}
 		if (s_pend_motion) {
 			s_pend_motion = false;
+			night_on_motion();   /* white light for 20 s when dark, before the snapshot HA will take */
 			report("motion");
 		}
 		if (s_pend_test) {
@@ -658,6 +673,7 @@ static const int16_t s_sine32[32] = {0,6393,12539,18204,23170,27245,30273,32137,
  * double buffer (2 x AUD_FRAME); the finish interrupt fires per half. Threads only touch the byte
  * rings s_spk_ring / s_mic_ring, so Wi-Fi preemption no longer glitches the audio. ---- */
 #define AUD_FRAME 1024                 /* bytes per DMA half: 512 s16 samples = 64 ms at 8 kHz */
+#define PA_SETTLE_MS 50                /* silence played before the PA is enabled / after it is disabled (pop fix) */
 #define SPK_RING (16 * 1024)
 #define MIC_RING (32 * 1024)
 static uint8_t *s_dac_dma_buf, *s_adc_dma_buf;
@@ -740,6 +756,7 @@ static int aud_dma_start(int dir)
 		*buf = os_malloc(2 * AUD_FRAME);
 	if (!*buf)
 		return -1;
+	os_memset(*buf, 0, 2 * AUD_FRAME);   /* the first two DAC halves play before the ISR refills them: silence, not heap garbage */
 	bk_dma_driver_init();
 	*id = bk_dma_alloc(DMA_DEV_AUDIO);
 	if (*id >= DMA_ID_MAX)
@@ -813,12 +830,13 @@ static void spk_task(beken_thread_arg_t arg)
 	s_spk_w = s_spk_r = 0;
 	s_dac_half = 0;
 	s_spk_underrun = s_dac_frames = 0;
-	s_spk_feeding = true;
+	s_spk_feeding = false;   /* the pre-roll below plays zeros on purpose: don't count it as underruns */
 	if (bk_aud_dac_init(&cfg) != BK_OK) {
 		os_printf("[spk] dac init failed\r\n");
 		goto out;
 	}
-	pa_set(1);
+	/* Amplifier pop fix (v0.19): start the DAC + DMA first (the ring is empty, so the DMA streams
+	 * zeros = the DAC's idle level), let the analog output settle, and only then enable the PA. */
 	if ((rc = aud_dma_start(0)) != 0 || bk_aud_dac_start() != BK_OK) {
 		os_printf("[spk] dma/dac start failed (%d)\r\n", rc);
 		aud_dma_stop(0);
@@ -826,6 +844,10 @@ static void spk_task(beken_thread_arg_t arg)
 		pa_set(0);
 		goto out;
 	}
+	rtos_delay_milliseconds(PA_SETTLE_MS);
+	pa_set(1);
+	rtos_delay_milliseconds(PA_SETTLE_MS);   /* the amplifier's own turn-on transient, on silence */
+	s_spk_feeding = true;
 	if (s_spk_net_port) {   /* s16le mono PCM streamed from a TCP peer */
 		int sock = tcp_connect(s_net_host, s_spk_net_port), r;
 		if (sock < 0)
@@ -863,10 +885,12 @@ static void spk_task(beken_thread_arg_t arg)
 	for (i = 0; i < 100 && s_spk_w != s_spk_r && !s_spk_stop; i++)   /* let the DMA drain the ring */
 		rtos_delay_milliseconds(10);
 	rtos_delay_milliseconds(2 * AUD_FRAME / 2 * 1000 / s_dac_rate);   /* plus the two halves in flight */
+	/* pop fix: the DMA is now streaming zeros again; drop the PA on silence, then stop the DAC */
+	pa_set(0);
+	rtos_delay_milliseconds(PA_SETTLE_MS);
 	aud_dma_stop(0);
 	bk_aud_dac_stop();
 	bk_aud_dac_deinit();
-	pa_set(0);
 	os_printf("[spk] done, %u samples, %u dma frames, %u underruns\r\n", total, s_dac_frames, s_spk_underrun);
 out:
 	s_spk_busy = false;
@@ -1695,23 +1719,21 @@ static void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 #define PIN_LED_RING 45
 static void cli_led_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
 {
-	int pin = -1, on;
+	int which = -1, state;
 
 	if (argc >= 3 && os_strcmp(argv[1], "white") == 0)
-		pin = PIN_LED_WHITE;
+		which = NIGHT_LED_WHITE;
 	else if (argc >= 3 && os_strcmp(argv[1], "ring") == 0)
-		pin = PIN_LED_RING;
-	if (pin < 0 || (os_strcmp(argv[2], "on") && os_strcmp(argv[2], "off"))) {
-		REPLY("led white|ring on|off\r\n");
+		which = NIGHT_LED_RING;
+	if (which < 0 || (os_strcmp(argv[2], "on") && os_strcmp(argv[2], "off") && os_strcmp(argv[2], "auto"))) {
+		REPLY("led white|ring on|off|auto   (on/off = manual override of the night light / ring pattern, auto = release)\r\n");
 		return;
 	}
-	on = os_strcmp(argv[2], "on") == 0;
-	pin_configure(pin, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
-	if (on)
-		bk_gpio_set_output_high(pin);
-	else
-		bk_gpio_set_output_low(pin);
-	REPLY("[led] %s %s (GPIO %d)\r\n", argv[1], on ? "on" : "off", pin);
+	/* manual on/off overrides the automatic night light / ring indicator until `auto` or a reboot (night.c) */
+	state = os_strcmp(argv[2], "auto") == 0 ? -1 : os_strcmp(argv[2], "on") == 0;
+	night_led_manual(which, state);
+	REPLY("[led] %s %s (GPIO %d%s)\r\n", argv[1], argv[2], which == NIGHT_LED_WHITE ? PIN_LED_WHITE : PIN_LED_RING,
+	      state < 0 ? ", automatic" : ", manual override: `led ... auto` to release");
 }
 
 static void cli_tok_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
@@ -1786,11 +1808,9 @@ static void ringfx_task(beken_thread_arg_t arg)
 	if (!s_spk_busy)
 		spk_start(0, 0, 0x60e000 + 16, 66450 - 16);   /* stock bell chime from flash */
 	pin_configure(PIN_LED_RING, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
-	if (dark) {
-		pin_configure(PIN_LED_WHITE, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
-		bk_gpio_set_output_high(PIN_LED_WHITE);
-	}
-	for (int i = 0; i < 8; i++) {   /* blue ring: 8 blinks over ~2.4 s */
+	if (dark)
+		night_white_set(NIGHT_SRC_FX, true);   /* via the arbiter: the night light may hold it on afterwards */
+	for (int i = 0; i < 8; i++) {   /* blue ring: 8 blinks over ~2.4 s (night.c leaves the pin alone while s_fx_running) */
 		bk_gpio_set_output_high(PIN_LED_RING);
 		rtos_delay_milliseconds(150);
 		bk_gpio_set_output_low(PIN_LED_RING);
@@ -1798,7 +1818,7 @@ static void ringfx_task(beken_thread_arg_t arg)
 	}
 	if (dark) {
 		rtos_delay_milliseconds(WHITE_LIGHT_MS - 2400);
-		bk_gpio_set_output_low(PIN_LED_WHITE);
+		night_white_set(NIGHT_SRC_FX, false);
 	}
 	s_fx_running = false;
 	rtos_delete_thread(NULL);
@@ -1852,7 +1872,9 @@ static const struct cli_command s_doorbell_commands[] = {
 	{"hook", "hook set HOST:PORT/PATH | test | ring | motion | (show)", cli_hook_cmd},
 	{"ota", "ota URL (download app_pack.rbl over HTTP, then reboot)", cli_ota_cmd},
 	{"tok", "tok set SECRET | clear (token for the TCP command channel, port 2323)", cli_tok_cmd},
-	{"led", "led white|ring on|off (white fill LED GPIO 44 / blue button ring GPIO 45)", cli_led_cmd},
+	{"led", "led white|ring on|off|auto (white fill LED GPIO 44 / blue button ring GPIO 45)", cli_led_cmd},
+	{"night", "night auto on|off | ring on|off | hyst MV | status (night light, ring indicator)", night_cli_cmd},
+	{"sys", "sys info (fw, uptime, ip, heap, reset reason, light/battery mV)", sys_cli_cmd},
 #if (CONFIG_SYS_CPU0)
 	{"ring", "ring test | dark MV | fx on|off (local chime, ring LEDs, light when dark)", cli_ring_cmd},
 #endif
@@ -1916,6 +1938,25 @@ void user_app_main(void)
 	kv_get_str(KV_PASS, s_pass, sizeof(s_pass));
 	if (!kv_get_str(KV_HOOK, s_hook, sizeof(s_hook)))
 		os_strlcpy(s_hook, HOOK_DEFAULT, sizeof(s_hook));
+	{
+		/* night.c: LED arbiter + night light + ring indicator; before inputs_init() so a press
+		 * (ringfx -> night_white_set) never runs ahead of it */
+		static const night_env_t env = {
+			.fw_version = FW_VERSION,
+			.ip = s_ip,
+			.got_ip = &s_got_ip,
+#if defined(DU7_AVDK)
+			.cam_open = &s_cam_open,
+#else
+			.cam_open = NULL,
+#endif
+			.fx_running = &s_fx_running,
+			.dark_mv = &s_dark_mv,
+			.light_read_mv = light_read_mv,
+			.adc_read_mv = adc_read_mv,
+		};
+		night_init(&env);
+	}
 	bk_event_register_cb(EVENT_MOD_NETIF, EVENT_ID_ALL, netif_event_cb, NULL);
 	bk_event_register_cb(EVENT_MOD_WIFI, EVENT_ID_ALL, wifi_event_cb, NULL);
 	inputs_init();
