@@ -63,7 +63,7 @@ void db_reply(const char *fmt, ...)
 	REPLY("%s", buf);
 }
 
-#define FW_VERSION "0.22.2"
+#define FW_VERSION "0.22.3"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -1656,8 +1656,12 @@ static int cam_open_locked(uint32_t w, uint32_t h, bool h264)
 	dev.info.fps = FPS15;
 	s_cam_h264_frames = 0;
 	ret = media_app_camera_open(&dev);
-	if (ret != BK_OK)
+	if (ret != BK_OK) {
+#if CONFIG_DVP_CAMERA
+		cam_power(0);   /* undetected cold sensor: make the retry a real power cycle */
+#endif
 		return ret;
+	}
 	/* one registration at a time: the format selects which CPU1 frame queue is forwarded */
 	ret = media_app_register_read_frame_callback(dev.fmt, cam_frame_cb);
 	s_cam_open = (ret == BK_OK);
