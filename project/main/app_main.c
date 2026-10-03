@@ -26,6 +26,7 @@
 #include <driver/flash.h>
 #include <driver/dma.h>
 #include "pir.h"
+#include "power.h"   /* feat/power: battery, charger, deep sleep */
 #endif
 #ifdef DU7_AVDK   /* all cores: media_service_init() runs on CPU0/1/2 */
 #include "media_service.h"
@@ -49,10 +50,10 @@ static bool s_reply_on;
 #define REPLY(...) do { os_printf(__VA_ARGS__); if (s_reply_on) { size_t _l = os_strlen(s_reply); \
 	if (_l < sizeof(s_reply) - 1) snprintf(s_reply + _l, sizeof(s_reply) - _l, __VA_ARGS__); } } while (0)
 
-/* REPLY() for other source files (night.c) */
+/* REPLY() for other source files (night.c, power.c) */
 void db_reply(const char *fmt, ...)
 {
-	char buf[256];
+	char buf[300];
 	va_list ap;
 
 	va_start(ap, fmt);
@@ -61,7 +62,7 @@ void db_reply(const char *fmt, ...)
 	REPLY("%s", buf);
 }
 
-#define FW_VERSION "0.20.2"
+#define FW_VERSION "0.21.0"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -362,7 +363,7 @@ static uint32_t adc_read_mv(uint32_t chan)
 /* Minimal HTTP/1.1 POST over a blocking lwIP socket. Returns the HTTP status or -errno. */
 static int http_post_json(const char *hook, const char *json)
 {
-	char host[64], path[96], req[512], resp[64];
+	char host[64], path[96], req[768], resp[64];
 	const char *colon = os_strchr(hook, ':'), *slash = colon ? os_strchr(colon, '/') : NULL;
 	int port, sock, n, status = -1, hl;
 	struct sockaddr_in sa = {0};
@@ -403,21 +404,28 @@ static int http_post_json(const char *hook, const char *json)
 	return status;
 }
 
-static int report(const char *event)
+/* extra: NULL or more JSON members starting with a comma (e.g. ",\"reason\":\"rtc\"") */
+static int report_ex(const char *event, const char *extra)
 {
-	char json[256];
+	char json[384], pwr[96];
 	int st;
 
 	if (!s_got_ip)
 		return -ENOTCONN;
+	power_json(pwr, sizeof(pwr));   /* ,"batt_mv":..,"batt_pct":..,"usb":..,"charging":.. */
 	snprintf(json, sizeof(json),
 		 "{\"event\":\"%s\",\"fw\":\"" FW_VERSION "\",\"ip\":\"%s\",\"mv\":%u,\"light_mv\":%u,"
-		 "\"uptime_s\":%u,\"motion_count\":%u,\"ring_count\":%u,\"pir_on\":%u,\"pir_sens\":%u}",
+		 "\"uptime_s\":%u,\"motion_count\":%u,\"ring_count\":%u,\"pir_on\":%u,\"pir_sens\":%u%s%s}",
 		 event, s_ip, adc_read_mv(9), light_read_mv(), rtos_get_time() / 1000, s_motion_count, s_ring_count,
-		 pir_is_on() ? 1u : 0u, pir_sens_get());
+		 pir_is_on() ? 1u : 0u, pir_sens_get(), pwr, extra ? extra : "");
 	st = http_post_json(s_hook, json);
 	os_printf("[hook] %s -> %d\r\n", event, st);
 	return st;
+}
+
+static int report(const char *event)
+{
+	return report_ex(event, NULL);
 }
 
 /* ISR context (from pir.c, after its cooldown/warm-up filter): flag the reporter task. */
@@ -426,6 +434,7 @@ static void motion_cb(void)
 	s_last_motion_ms = rtos_get_time();
 	s_motion_count++;
 	s_pend_motion = true;
+	power_activity();
 }
 
 static volatile uint32_t s_last_ring_report_ms;
@@ -437,6 +446,7 @@ static void button_isr(gpio_id_t id)
 	if (now - s_last_ring_ms > 800) {
 		s_last_ring_ms = now;
 		s_ring_count++;
+		power_activity();
 		s_pend_fx = true;   /* local feedback on every press: chime, ring LEDs, light when dark */
 		if (now - s_last_ring_report_ms > 10000) {   /* one notification per 10 s */
 			s_last_ring_report_ms = now;
@@ -496,14 +506,20 @@ static void reporter_task(beken_thread_arg_t arg)
 			s_pend_fx = false;
 			ringfx_start();
 		}
-		if (s_pend_ring) {
+		if (s_got_ip && s_pend_ring) {   /* wait for Wi-Fi: a press that woke us from deep sleep arrives before the IP */
 			s_pend_ring = false;
 			report("ring");
 		}
-		if (s_pend_motion) {
+		if (s_got_ip && s_pend_motion) {
 			s_pend_motion = false;
 			night_on_motion();   /* white light for 20 s when dark, before the snapshot HA will take */
 			report("motion");
+		}
+		if (s_got_ip && power_wake_pending()) {
+			char reason[12], extra[32];
+			power_take_wake_event(reason, sizeof(reason));
+			snprintf(extra, sizeof(extra), ",\"reason\":\"%s\"", reason);
+			report_ex("wake", extra);
 		}
 		if (s_pend_test) {
 			s_pend_test = false;
@@ -1208,6 +1224,7 @@ static void tcp_cmd_task(beken_thread_arg_t arg)
 			} else {
 				cmd++;
 				os_printf("[tcp] %s\r\n", cmd);
+				power_activity();
 				s_reply[0] = 0;
 				s_reply_on = true;
 				if (run_line(cmd) == 0)
@@ -1684,6 +1701,7 @@ static void cam_http_task(beken_thread_arg_t arg)
 			continue;
 		}
 		s_cam_http_clients++;
+		power_activity();
 		if (rtos_create_thread(&t, BEKEN_APPLICATION_PRIORITY, "camhttp", cam_http_client_task, 4096, (beken_thread_arg_t)(intptr_t)c) != BK_OK) {
 			s_cam_http_clients--;
 			close(c);
@@ -1874,6 +1892,81 @@ static void cli_ring_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, cha
 		REPLY("ring test | dark MV | chan ADC | fx on|off   (light now %u mV, dark > %u, fx %d)\r\n", light_read_mv(), s_dark_mv, s_fx_enabled);
 	}
 }
+
+/* ---- hooks for power.c (feat/power): thin wrappers so power.c stays a separate file ---- */
+int db_kv_get(const char *key, char *out, int cap) { return kv_get_str(key, out, cap); }
+void db_kv_set(const char *key, const char *val) { kv_set_str(key, val); }
+uint32_t db_adc_mv(uint32_t chan) { return adc_read_mv(chan); }
+int db_pin_cfg(uint32_t pin, int io_mode, int pull_mode)
+{
+	return pin_configure(pin, (gpio_io_mode_t)io_mode, (gpio_pull_mode_t)pull_mode);
+}
+
+bool app_power_got_ip(void)
+{
+	return s_got_ip;
+}
+
+/* anything that must finish before the device may sleep */
+bool app_power_busy(void)
+{
+	bool busy = s_spk_busy || s_mic_busy || s_fx_running || ota_thread != NULL;
+
+#if defined(DU7_AVDK)
+	busy = busy || s_cam_http_clients > 0;   /* a snapshot or MJPEG stream client (HA) */
+#endif
+	if (s_got_ip && (s_pend_boot || s_pend_ring || s_pend_motion || s_pend_test || s_pend_fx))
+		busy = true;
+	return busy;
+}
+
+/* amp off, LEDs off, camera closed, sensor rails low: everything we switched on */
+void app_power_prepare_sleep(void)
+{
+	static const uint8_t rails[] = {28, 5, 6, 9};
+	unsigned i;
+
+	pa_set(0);
+	pin_configure(PIN_LED_WHITE, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+	bk_gpio_set_output_low(PIN_LED_WHITE);
+	pin_configure(PIN_LED_RING, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+	bk_gpio_set_output_low(PIN_LED_RING);
+#if defined(DU7_AVDK)
+	if (s_cam_open) {
+		media_app_unregister_read_frame_callback();
+		os_printf("[pwr] camera close -> %d\r\n", media_app_camera_close(DVP_CAMERA));
+		s_cam_open = false;
+		rtos_delay_milliseconds(200);
+	}
+#endif
+	for (i = 0; i < sizeof(rails); i++) {
+		pin_configure(rails[i], GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+		bk_gpio_set_output_low(rails[i]);
+	}
+}
+
+/* called from power_init() when the SoC was woken from deep sleep by a GPIO */
+void app_power_wake_input(uint32_t pin)
+{
+	uint32_t now = rtos_get_time();
+
+	if (pin == PIN_BUTTON) {
+		s_ring_count++;
+		s_last_ring_ms = now;
+		s_last_ring_report_ms = now;
+		s_pend_fx = true;    /* chime + ring LEDs from flash, before Wi-Fi is up */
+		s_pend_ring = true;  /* reported once the IP arrives */
+	} else if (pin == PIN_PIR) {
+		s_motion_count++;
+		s_last_motion_ms = now;
+		s_pend_motion = true;
+	}
+}
+
+void app_wifi_reconnect(void)
+{
+	wifi_connect();
+}
 #endif /* CONFIG_SYS_CPU0 */
 
 static const struct cli_command s_doorbell_commands[] = {
@@ -1892,6 +1985,7 @@ static const struct cli_command s_doorbell_commands[] = {
 	{"sys", "sys info (fw, uptime, ip, heap, reset reason, light/battery mV)", sys_cli_cmd},
 #if (CONFIG_SYS_CPU0)
 	{"ring", "ring test | dark MV | fx on|off (local chime, ring LEDs, light when dark)", cli_ring_cmd},
+	{"pwr", "pwr status | sleep on|off | idle S | wake_pir on|off | snap_min M | sleepnow (battery, charger, deep sleep)", cli_pwr_cmd},
 #endif
 #if defined(DU7_AVDK) && (CONFIG_SYS_CPU0)
 	{"cam", "cam open [W H] | close | stat | snap HOST PORT (AVDK build)", cli_cam_cmd},
@@ -1975,6 +2069,7 @@ void user_app_main(void)
 	bk_event_register_cb(EVENT_MOD_NETIF, EVENT_ID_ALL, netif_event_cb, NULL);
 	bk_event_register_cb(EVENT_MOD_WIFI, EVENT_ID_ALL, wifi_event_cb, NULL);
 	inputs_init();
+	power_init();   /* before the reporter: a button wake from deep sleep must chime at once, before Wi-Fi */
 	rtos_create_thread(&reporter, BEKEN_APPLICATION_PRIORITY, "reporter",
 			   reporter_task, 4096, NULL);
 	kv_get_str(KV_TOKEN, s_token, sizeof(s_token));

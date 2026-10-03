@@ -3,6 +3,7 @@ set(srcs
     app_main.c
     night.c
     pir.c
+    power.c
     )
 
 if (CONFIG_OVERRIDE_FLASH_PARTITION)

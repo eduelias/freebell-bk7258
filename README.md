@@ -343,6 +343,18 @@ Measured with the Mac as ear/voice on 2026-10-03 (`tools/mac_ear.py`, `tools/mic
   Mac mic 40 cm away (no transient above the room floor within 200 ms of PA on/off on either
   build), so the by-ear check is still the owner's.
 
+## Battery, charger and deep sleep (v0.19.0, `project/main/power.c`)
+
+From the stock `tuya_battery.c`: **GPIO 19 = USB present (high)**, **GPIO 15 = charging (high, with
+19 high)**, **battery = ADC15 on GPIO 13, x2 divider** (2012 mV -> 4024 mV measured; ADC9 is a
+regulated rail). `pwr status` prints battery mV / %, usb and charging; every report JSON carries
+`batt_mv`, `batt_pct`, `usb`, `charging`. Deep sleep (SDK pm v2, SoC reset on wake) is **off by
+default**: `pwr sleep on|off`, `pwr sleep force on|off` (also on USB), `pwr idle S` (60),
+`pwr wake_pir on|off` (off), `pwr snap_min M` (RTC wake for a scheduled snapshot, 0 = 6 h keepalive),
+`pwr sleepnow` (test, 10 s grace). Wake sources: button (53), USB plug (19), console RX (10), PIR (24,
+optional), RTC. After every boot the device stays awake 120 s; a button wake chimes before Wi-Fi is up
+and then posts `wake` (`reason`) + `ring`. Full procedure and HA snippets: `TESTPLAN-power.md`.
+
 ## SDK patches
 
 - `0001-psram-use-configured-chip-id.patch`: with no cached PSRAM id, the stock driver probes the
