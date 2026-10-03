@@ -220,11 +220,12 @@ sessions (before that worked) are noise, except the ADC readings.
 | 44 | **white fill LED enable (2026-10-03, camera-verified)**: high = white LED on (big flare), low/hi-Z = off | white LED, active high (`led white on`) |
 | 45 (ADC11) | **blue button-ring LEDs (2026-10-03, camera-verified, user-identified)**: high = the four blue LEDs around the button light up (night locator light), low/hi-Z = off. Not infrared: the IR LED sits above the camera lens and is still unmapped. The 2026-10-02 "kills the white LED" reading was a coincidence | ring LEDs, active high (`led ring on`) |
 | 46 | **speaker amplifier enable, confirmed 2026-10-03** (active-high; GPIO sweep with the Mac mic listening: 1 kHz tone at 108 with 46 high vs <1 for the other pins; left floating it leaks a faint output) | PA enable, firmware default `spk pa 46` |
+| 12 (ADC14) | **light sensor** (3-pin part by the camera flex, powered from GPIO 28): ~700 mV lit room, ~2100 mV covered, higher = darker; `ring dark MV` sets the night threshold | light sensor |
 | 0, 1 | I2C1 SCL/SDA to the camera sensor (SDK default pins; the stock firmware uses them too) | camera I2C |
 | 28 | camera power enable, active high (stock `.data`: pin 28, level 1) | camera power |
 | 52 | sensor PWDN/RESET: stock pulses it low, 100 ms high, low before probing | camera reset |
-| 54, 55 | IR-cut filter coil (stock `tuya_dn_switch.c`: ircut1/ircut2) | IR-cut, to be exercised |
-| 44 | **IR illuminator LED** per the stock firmware ("ir led gpio") — the bright flare the Mac camera saw | IR LED, active high (`led white on` still drives it) |
+| 54, 55 | IR-cut filter coil: stock pulses 55 high 300 ms for night, 54 high 300 ms for day (plus sensor B/W registers) | IR-cut, unused with the white night light |
+| 44 | **white fill LED** on the LED board (stock calls it "ir led"; Mac camera shows pure white, no IR) — used as the night light | white LED, active high (`led white on`) |
 | 50, 25, 26 | PIR enable and sensitivity set0/set1 (stock `tuya_pir.c`) | PIR control |
 | 15, 19 | battery/charger status lines (stock `tuya_battery.c`; 15 is externally low) | battery |
 | 6 | SD card (stock `ty_app_sdcard.c`) | SD card |

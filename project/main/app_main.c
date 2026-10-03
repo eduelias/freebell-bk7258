@@ -40,7 +40,13 @@
 #endif
 
 #define FW_NAME "doorbell-bk7258-fw"
-#define FW_VERSION "0.18.1"
+/* ---- reply buffer: command output for the TCP channel (UART still gets everything) ---- */
+static char s_reply[320];
+static bool s_reply_on;
+#define REPLY(...) do { os_printf(__VA_ARGS__); if (s_reply_on) { size_t _l = os_strlen(s_reply); \
+	if (_l < sizeof(s_reply) - 1) snprintf(s_reply + _l, sizeof(s_reply) - _l, __VA_ARGS__); } } while (0)
+
+#define FW_VERSION "0.18.5"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -249,20 +255,15 @@ static void cli_adc_read_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc,
 	if (err == BK_OK)
 		err = bk_adc_read(&raw, 1000);
 	if (err == BK_OK)
-		os_printf("ADC%u raw=%u mv=%u\r\n", chan, raw, (uint32_t)(saradc_calculate(raw) * 1000));
+		REPLY("ADC%u raw=%u mv=%u\r\n", chan, raw, (uint32_t)(saradc_calculate(raw) * 1000));
 	else
-		os_printf("ADC%u: failed %d (-0x%x)\r\n", chan, err, -err);
+		REPLY("ADC%u: failed %d (-0x%x)\r\n", chan, err, -err);
 	bk_adc_stop();
 	bk_adc_deinit(chan);
 	bk_adc_release();
 }
 
 #if (CONFIG_SYS_CPU0)
-/* ---- reply buffer: command output for the TCP channel (UART still gets everything) ---- */
-static char s_reply[320];
-static bool s_reply_on;
-#define REPLY(...) do { os_printf(__VA_ARGS__); if (s_reply_on) { size_t _l = os_strlen(s_reply); \
-	if (_l < sizeof(s_reply) - 1) snprintf(s_reply + _l, sizeof(s_reply) - _l, __VA_ARGS__); } } while (0)
 
 /* ---- doorbell prototype: Wi-Fi + Home Assistant webhook ---- */
 #define PIN_PIR 24      /* active-high motion output, 2-4 s pulses */
@@ -276,13 +277,20 @@ static bool s_reply_on;
 static char s_ssid[WIFI_SSID_STR_LEN], s_pass[WIFI_PASSWORD_LEN], s_hook[128];
 static volatile bool s_got_ip, s_pend_motion, s_pend_ring, s_pend_boot, s_pend_test;
 static volatile bool s_pend_fx;
-static uint32_t s_dark_mv = 400;      /* light sensor (ADC10, GPIO 8) below this = dark -> white light on ring */
+static uint32_t s_dark_mv = 1000;     /* light sensor mV ABOVE this = dark (LDR pulls up in the dark; stock threshold ~2000/4095 raw) */
 static bool s_fx_enabled = true;
 #define KV_DARK "db_dark_mv"
 #define KV_FX "db_fx"
-#define LIGHT_ADC_CHAN 10
+static uint32_t s_light_chan = 14;   /* LDR on GPIO 12 = ADC14 (stock), powered by GPIO 28; higher = darker */
+#define LIGHT_ADC_CHAN s_light_chan
+#define KV_LIGHT_CHAN "db_light_chan"
 #define WHITE_LIGHT_MS 30000
 static void ringfx_start(void);
+static uint32_t light_read_mv(void);
+#if defined(DU7_AVDK) && (CONFIG_SYS_CPU0)
+static bool s_cam_open;   /* camera state, used by the light reading too */
+#endif
+
 static volatile uint32_t s_last_motion_ms, s_last_ring_ms, s_motion_count, s_ring_count;
 static char s_ip[16] = "0.0.0.0";
 
@@ -390,7 +398,7 @@ static int report(const char *event)
 	snprintf(json, sizeof(json),
 		 "{\"event\":\"%s\",\"fw\":\"" FW_VERSION "\",\"ip\":\"%s\",\"mv\":%u,\"light_mv\":%u,"
 		 "\"uptime_s\":%u,\"motion_count\":%u,\"ring_count\":%u}",
-		 event, s_ip, adc_read_mv(9), adc_read_mv(LIGHT_ADC_CHAN), rtos_get_time() / 1000, s_motion_count, s_ring_count);
+		 event, s_ip, adc_read_mv(9), light_read_mv(), rtos_get_time() / 1000, s_motion_count, s_ring_count);
 	st = http_post_json(s_hook, json);
 	os_printf("[hook] %s -> %d\r\n", event, st);
 	return st;
@@ -1186,7 +1194,6 @@ static void tcp_cmd_task(beken_thread_arg_t arg)
 static uint8_t *s_cam_buf;
 static volatile uint32_t s_cam_len, s_cam_frames, s_cam_seq, s_cam_w, s_cam_h, s_cam_drop, s_cam_last_ms;
 static beken_mutex_t s_cam_mutex;
-static bool s_cam_open;
 
 static void cam_frame_cb(frame_buffer_t *frame)
 {
@@ -1748,10 +1755,32 @@ static void cli_reboot_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, c
 /* ---- ring effects: what the doorbell itself does on a press, independent of Wi-Fi ---- */
 static volatile bool s_fx_running;
 
+/* the LDR divider is powered by the camera supply (GPIO 28): raise it for the reading when the camera is off */
+static uint32_t light_read_mv(void)
+{
+	uint32_t mv;
+#if defined(DU7_AVDK) && (CONFIG_SYS_CPU0)
+	bool cam = s_cam_open;   /* camera open = GPIO 28 already high and must stay high */
+#else
+	bool cam = false;
+#endif
+
+	if (!cam) {
+		pin_configure(28, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+		bk_gpio_set_output_high(28);
+		rtos_delay_milliseconds(80);
+	}
+	mv = adc_read_mv(LIGHT_ADC_CHAN);
+	if (!cam)
+		bk_gpio_set_output_low(28);
+	return mv;
+}
+
 static void ringfx_task(beken_thread_arg_t arg)
 {
-	uint32_t light = adc_read_mv(LIGHT_ADC_CHAN);
-	bool dark = light < s_dark_mv;
+	uint32_t light = light_read_mv();
+	bool dark = light > s_dark_mv;
+	rtos_delay_milliseconds(20);
 
 	os_printf("[fx] ring: light %u mV (%s)\r\n", light, dark ? "dark" : "day");
 	if (!s_spk_busy)
@@ -1791,19 +1820,25 @@ static void cli_ring_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, cha
 	char buf[16];
 
 	if (argc >= 2 && os_strcmp(argv[1], "test") == 0) {
+		uint32_t mv = light_read_mv();   /* read before the effects thread touches GPIO 28 */
 		ringfx_start();
-		REPLY("[ring] effects started (light %u mV, dark below %u)\r\n", adc_read_mv(LIGHT_ADC_CHAN), s_dark_mv);
+		REPLY("[ring] effects started (light %u mV, dark above %u -> %s)\r\n", mv, s_dark_mv, mv > s_dark_mv ? "white light on" : "day, no light");
 	} else if (argc >= 3 && os_strcmp(argv[1], "dark") == 0) {
 		s_dark_mv = os_strtoul(argv[2], NULL, 10);
 		snprintf(buf, sizeof(buf), "%u", s_dark_mv);
 		kv_set_str(KV_DARK, buf);
 		REPLY("[ring] dark threshold %u mV\r\n", s_dark_mv);
+	} else if (argc >= 3 && os_strcmp(argv[1], "chan") == 0) {   /* ring chan N : ADC channel of the light sensor */
+		s_light_chan = os_strtoul(argv[2], NULL, 10);
+		snprintf(buf, sizeof(buf), "%u", s_light_chan);
+		kv_set_str(KV_LIGHT_CHAN, buf);
+		REPLY("[ring] light sensor on ADC%u, now %u mV\r\n", s_light_chan, light_read_mv());
 	} else if (argc >= 3 && os_strcmp(argv[1], "fx") == 0) {
 		s_fx_enabled = os_strcmp(argv[2], "on") == 0;
 		kv_set_str(KV_FX, s_fx_enabled ? "1" : "0");
 		REPLY("[ring] local effects %s\r\n", s_fx_enabled ? "on" : "off");
 	} else {
-		REPLY("ring test | dark MV | fx on|off   (light now %u mV, dark < %u, fx %d)\r\n", adc_read_mv(LIGHT_ADC_CHAN), s_dark_mv, s_fx_enabled);
+		REPLY("ring test | dark MV | chan ADC | fx on|off   (light now %u mV, dark > %u, fx %d)\r\n", light_read_mv(), s_dark_mv, s_fx_enabled);
 	}
 }
 #endif /* CONFIG_SYS_CPU0 */
@@ -1875,6 +1910,8 @@ void user_app_main(void)
 			s_dark_mv = os_strtoul(v, NULL, 10);
 		if (kv_get_str(KV_FX, v, sizeof(v)))
 			s_fx_enabled = v[0] != '0';
+		if (kv_get_str(KV_LIGHT_CHAN, v, sizeof(v)))
+			s_light_chan = os_strtoul(v, NULL, 10);
 	}
 	kv_get_str(KV_PASS, s_pass, sizeof(s_pass));
 	if (!kv_get_str(KV_HOOK, s_hook, sizeof(s_hook)))
