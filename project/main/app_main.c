@@ -20,7 +20,7 @@
 #endif
 
 #define FW_NAME "doorbell-bk7258-fw"
-#define FW_VERSION "0.7.0"
+#define FW_VERSION "0.8.1"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -372,6 +372,8 @@ static void pir_isr(gpio_id_t id)
 	}
 }
 
+static volatile uint32_t s_last_ring_report_ms;
+
 static void button_isr(gpio_id_t id)
 {
 	uint32_t now = rtos_get_time();
@@ -379,7 +381,10 @@ static void button_isr(gpio_id_t id)
 	if (now - s_last_ring_ms > 800) {
 		s_last_ring_ms = now;
 		s_ring_count++;
-		s_pend_ring = true;
+		if (now - s_last_ring_report_ms > 10000) {   /* one notification per 10 s */
+			s_last_ring_report_ms = now;
+			s_pend_ring = true;
+		}
 	}
 }
 
@@ -489,6 +494,25 @@ static void cli_wifi_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, cha
 	}
 }
 
+extern int bk_http_ota_download(const char *url);
+
+static void cli_ota_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
+{
+	int ret;
+
+	if (argc < 2) {
+		os_printf("ota http://HOST:PORT/app_pack.rbl\r\n");
+		return;
+	}
+	if (!s_got_ip) {
+		os_printf("[ota] no network\r\n");
+		return;
+	}
+	os_printf("[ota] downloading %s\r\n", argv[1]);
+	ret = bk_http_ota_download(argv[1]);
+	os_printf("[ota] result %d%s\r\n", ret, ret == 0 ? " (reboot to apply)" : "");
+}
+
 static void cli_hook_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
 {
 	if (argc >= 3 && os_strcmp(argv[1], "set") == 0) {
@@ -537,6 +561,7 @@ static const struct cli_command s_doorbell_commands[] = {
 #if (CONFIG_SYS_CPU0)
 	{"wifi", "wifi set SSID PASS | clear | connect | (status)", cli_wifi_cmd},
 	{"hook", "hook set HOST:PORT/PATH | test | ring | motion | (show)", cli_hook_cmd},
+	{"ota", "ota URL (download app_pack.rbl over HTTP, then reboot)", cli_ota_cmd},
 #endif
 };
 

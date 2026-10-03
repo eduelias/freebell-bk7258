@@ -104,6 +104,25 @@ persistent notification; `motion` -> persistent notification; `boot` -> logbook 
 
 From the Mac: `python3 tools/shell.py wifi set <ssid> <password>` (see `tools/shell.py -i`).
 
+## OTA over Wi-Fi (firmware v0.8.0+)
+
+Each build also produces an OTA image, `build/app/bk7258/encrypt/app_pack.rbl` (compressed +
+encrypted app, ~0.9 MB; `scripts/build.sh` copies it next to the flash images). The firmware's
+`ota URL` command uses the SDK's HTTP OTA client: it streams the file into the `ota` partition
+(0x286000, 1428 KB) and reboots; the bootloader then installs it. Serve the file from any HTTP
+server the doorbell can reach, e.g. on the Mac:
+
+```bash
+cd ~/data/doorbell-bk7258/firmware && python3 -m http.server 8765 --bind <mac-lan-ip>
+python3 tools/shell.py -w 60 ota http://<mac-lan-ip>:8765/doorbell-fw_0.8.1_app_pack.rbl
+```
+
+Recovery if an OTA image is bad: the bootloader keeps the old app unless the download completed
+and verified; worst case the UART + ROM path (`scripts/flash.sh`) still works.
+
+Ring reports are rate-limited to one per 10 s (button debounce stays 0.8 s; `ring_count` counts
+every press).
+
 ## Our shell commands
 
 The SDK's `gpio`/`adc_test` commands print through `CLI_LOGI`, which is compiled out in this
@@ -142,7 +161,7 @@ sessions (before that worked) are noise, except the ADC readings.
 | 9 | active-high enable: high = light sensor alive (303 mV), low/hi-Z = dead (24 mV) | sensor / LED rail power enable |
 | 5, 8 | boot as plain GPIO like 9, no effect on the sensor rail | LED or other plain GPIO |
 | 24 | idle low; 8 isolated high pulses of 2-4 s in 8 min at irregular intervals with nobody at the device (`pinmap_watch10/11_passive.txt`) | **PIR motion output**, active-high, 2-4 s hold (one wave in front of it will confirm) |
-| 53 | externally held high; one 0.2 s low pulse seen | button (active-low) or sensor interrupt |
+| 53 | **doorbell button, confirmed 2026-10-03** (active-low, ~0.3 s presses; 46 edges / 13 `ring` posts in a 45 s press test) | button |
 | 45 (ADC11) | externally low; driving it **high once switched the white fill LED off**, and it stayed off whatever 45 did afterwards (camera-verified, `led_by_camera3.txt`) | white-LED driver kill/toggle input, to be confirmed from a fresh power-on |
 | 10, 11 | UART0 console | never touch |
 | others | see the latest `pinmap_session*.txt` (v0.4.0 reclaim) | |

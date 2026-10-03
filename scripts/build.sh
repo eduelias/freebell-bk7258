@@ -38,4 +38,8 @@ rev=$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo nogit)
 dst="$FW_DIR/doorbell-fw_${stamp}_${rev}.bin"
 cp "$OUT/app/bk7258/all-app.bin" "$dst"
 ln -sf "$(basename "$dst")" "$FW_DIR/doorbell-fw_latest.bin"
+ver=$(sed -nE 's/^#define FW_VERSION "([^"]+)"/\1/p' "$HERE/project/main/app_main.c")
+cp "$OUT/app/bk7258/encrypt/app_pack.rbl" "$FW_DIR/doorbell-fw_${ver}_app_pack.rbl"
+ln -sf "doorbell-fw_${ver}_app_pack.rbl" "$FW_DIR/doorbell-fw_latest_app_pack.rbl"
+echo "ota image: $FW_DIR/doorbell-fw_${ver}_app_pack.rbl"
 echo "image: $dst ($(stat -f %z "$dst") bytes)"
