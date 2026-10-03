@@ -277,7 +277,17 @@ Measured with the Mac as ear/voice on 2026-10-03 (`tools/mac_ear.py`, `tools/mic
 - **Amplifier pop**: the DAC + DMA now start on zeros (buffer zeroed) 50 ms before the PA
   (GPIO 46) is enabled, and the PA is disabled on zeros 50 ms before the DAC stops.
 - `night status` (all of the above in one line) and `sys info` (fw, uptime, ip, free heap, reset
-  reason, light and battery mV).
+  reason, light and battery mV). Note `http://192.168.2.89:8080/` answers `503 camera not open`
+  until the first snapshot/stream request; use `sys info` to read the running version.
+- Testing without touching the sensor: `ring dark 800` makes a lit room (~900 mV) count as dark,
+  `ring dark 1400` restores the default. Verified on hardware 2026-10-03 (v0.19.0,
+  `TESTPLAN-polish.md` sections 2-8): camera night light on at the next 20 s sample, released
+  exactly 60 s after it came on once the light is back, off at once on `cam close`; motion light
+  20 s and extended by a second motion; press light 30 s; the LED's own reflection lowers the
+  sensor by only ~40 mV in a lit room (hysteresis 400 mV is ample); heap flat at ~126-129 KB; the
+  boot blink is visible on the Mac camera. The amp pop could not be measured either way with the
+  Mac mic 40 cm away (no transient above the room floor within 200 ms of PA on/off on either
+  build), so the by-ear check is still the owner's.
 
 ## SDK patches
 
