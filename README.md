@@ -261,11 +261,13 @@ CPU0's edges first (the button on GPIO 53 was exposed to the same theft). Patch 
 GPIO ISR and enables the interrupt on CPU0 only; verified on v0.20.1 with the camera streaming:
 every GPIO 24 pulse counted, `missed=0`. The poller stays as a safety net.
 
-**PIR behaviour on the bench.** The bare board (no lens/housing, lying on the desk, nobody in the
-room per the Mac camera) pulses on its own every 5-30 s at `sens 1`; see the sweep in NOTES.md
-2026-10-03 for the per-setting rates. The cooldown is the only thing standing between that and a
-phone push with a picture every 10 s, so raise `pir cooldown` (stock: 30 s) or `pir off` while the
-device sits open on the desk.
+**PIR behaviour on the bench (2026-10-03, bare board on the desk, Mac camera as witness).**
+Self-triggering with nobody in the room, camera closed, 150 s per setting: `sens 0` 0 pulses,
+`sens 1` 2, `sens 3` 12, `sens 2` 15 (with the camera open `sens 1` went up to 10 per 2 min), so
+0 is the least and 2 the most sensitive; stock exposed 0/1/2. `sens 0` still detects a person: the
+owner waving over the board at ~50 cm gave 4 edges in a minute (each a push with a picture). The
+device is left at `pir sens 0` while it lies open on the desk (code default stays 1 = stock); the
+only thing between `sens 1` and a picture push every cooldown is the cooldown itself.
 
 HA side (applied 2026-10-03, `automations.yaml` automation `doorbell_bk7258_webhook`, backup
 `automations.yaml.bak-20261003-motionsnap`): `ring` -> persistent notification + text push
@@ -275,6 +277,17 @@ persistent notification (light_mv, pir_sens), snapshot to `last_motion.jpg`, one
 image (channel/tag `doorbell_motion`). All snapshot/notify steps have `continue_on_error`.
 Measured: snapshot written 1.6 s after the webhook (5.7 s for the first one after a boot),
 notify step done at +1.9 s. Full procedure and tests in `TESTPLAN-motion.md`.
+
+**Do not `cam close` while Home Assistant polls the camera (found 2026-10-03, open issue).** HA's
+generic camera re-opens the camera within seconds of a close; a close followed by a quick reopen
+leaves the pipeline wedged: `cam stat` says open but the frame counter never moves (stale JPEG
+served), later `media_app_camera_open` returns -1, every HTTP request (even `/`) gets an instant
+connection close (`psram_malloc` in the client task fails, or the client slots are eaten by
+threads stuck in the open), and `cam close` itself blocks the command task for ~15 s. Heap is
+unaffected. Only a reboot clears it. A reopen 7 s after the close worked once, 1-5 s did not.
+Suspect: PSRAM frame buffers / CPU1 teardown still in flight when the next open arrives. Fix
+candidates: serialise open/close, wait for the close to settle before reopening, reset
+`s_cam_len` on close so a stale frame is never served.
 
 ## Audio (v0.13.x: DMA engine, both directions working)
 
