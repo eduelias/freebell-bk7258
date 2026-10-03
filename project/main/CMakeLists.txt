@@ -4,6 +4,7 @@ set(srcs
     night.c
     pir.c
     power.c
+    rtsp.c
     )
 
 if (CONFIG_OVERRIDE_FLASH_PARTITION)

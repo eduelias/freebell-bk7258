@@ -68,6 +68,23 @@ fails on it, which is why the driver has its own `ov9650_sccb_read`.
   then ~9 fps of ~33 KB JPEGs. CPU1 info logs are compiled out (log level 2): use `BK_LOGW` to see
   driver prints.
 
+### H.264 live stream over RTSP (v0.19.0, `rtsp.c`)
+
+`rtsp://192.168.2.89:554/live`: our own RTSP/1.0 server with RFC 6184 packetization (TCP
+interleaved and UDP unicast), fed by the BK7258 hardware H.264 encoder (1280x720, 15 fps, IDR with
+SPS/PPS every 2 s = `CONFIG_H264_P_FRAME_CNT=29` on CPU1). The DVP pipeline runs one encoder at a
+time, so the camera has a mode: JPEG (HTTP) or H.264 (RTSP), chosen by `cam mode auto|jpeg|h264`
+(default `auto`: an RTSP client switches to H.264, an HTTP request switches back to JPEG unless an
+RTSP client is playing; then `/snapshot.jpg` is the last JPEG and `/stream` answers 503).
+
+- `rtsp on|off` (KV, default **off**), `rtsp status` (clients, fps, kbps, drops),
+  `rtsp port N`, `rtsp q IMB PMB` (bits per macroblock for I/P frames, default 120/24 =
+  ~1.5 Mbit/s nominal), `rtsp idr`.
+- Test: `ffplay -rtsp_transport tcp rtsp://192.168.2.89:554/live`; HA generic camera with
+  `stream_source` = that URL (stills from the stream). Details and the full plan: `TESTPLAN-rtsp.md`.
+- Kconfig changes on CPU1 (`project-avdk/config/bk7258_cp1/config`): after switching to/from this
+  version in an existing build dir, delete `$OUT/du7/bk7258_cp1`, `_cp2` and `bk7258` first.
+
 ## Flash
 
 ```bash
