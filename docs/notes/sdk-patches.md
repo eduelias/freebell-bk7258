@@ -34,7 +34,7 @@ them are derivative works of Beken's Apache-2.0 code (see `NOTICE`).
 - `0008-fatfs-weak-get-fattime.patch`: `components/fatfs/ff.c` returns a fixed 2017-05-01 for every
   FAT timestamp; the patch only adds `__attribute__((weak))` so `sdcard.c` can supply the SNTP time.
 
-(There is no 0005; it was folded into another change before release.)
+`0005-dvp-camera-mclk-settle.patch` was only captured on 2026-10-03 (it had lived as an uncommitted change in the author's SDK tree): a 600 ms settle after MCLK starts in `bk_dvp_camera_enumerate()`, which the OV9650 needs before it answers on SCCB.
 
 ## bk_avdk (`patches-avdk/` and `avdk-overlay/`)
 

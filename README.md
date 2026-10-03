@@ -84,7 +84,7 @@ at `release/v2.0.1` (`git clone --depth 1 --branch release/v2.0.1 ...`); Python 
 adapter.
 
 ```bash
-cp scripts/env.example ~/.config/doorbell-bk7258/env   # then edit: SDK, AVDK, FW_DIR, DOORBELL_HOST, HA_URL, OTA_*
+mkdir -p ~/.config/doorbell-bk7258 && cp scripts/env.example ~/.config/doorbell-bk7258/env   # then edit: SDK, AVDK, FW_DIR, DOORBELL_HOST, HA_URL, OTA_*
 scripts/build-avdk.sh                                   # camera-capable build (~11 min emulated); scripts/build.sh = bare SDK flavour
 ```
 
