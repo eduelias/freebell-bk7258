@@ -262,6 +262,23 @@ Measured with the Mac as ear/voice on 2026-10-03 (`tools/mac_ear.py`, `tools/mic
   microphone permission), `afplay` plays tones/markers; `tools/mac_ear.py rec.wav --labels ...`
   analyses a recording that has a 500 Hz marker beep before every test.
 
+## Night light, ring indicator, amp pop (v0.19, `project/main/night.c`)
+
+- **White LED (GPIO 44) arbiter**: the LED is on while any source holds it: `CAM` (camera open and
+  the light sensor reads dark, sampled every 20 s, hysteresis `night hyst` = 400 mV and a 60 s
+  minimum on-time so the LED's own reflection cannot make it flap; released when light returns or
+  the camera closes), `MOTION` (20 s after a motion event in the dark, so HA's snapshot is usable),
+  `FX` (30 s on a press in the dark, as before). `led white on|off` is a manual override,
+  `led white auto` releases it. `night auto on|off` (KV `db_night_auto`, default on) turns the
+  automatic sources off.
+- **Blue ring (GPIO 45)**: one short blink at boot, a slow double blink every 3 s while there is
+  no IP, off once connected. The 8 blinks of a press always win. `led ring on|off|auto` overrides
+  / releases; `night ring on|off` (KV `db_night_ring`, default on) silences the pattern.
+- **Amplifier pop**: the DAC + DMA now start on zeros (buffer zeroed) 50 ms before the PA
+  (GPIO 46) is enabled, and the PA is disabled on zeros 50 ms before the DAC stops.
+- `night status` (all of the above in one line) and `sys info` (fw, uptime, ip, free heap, reset
+  reason, light and battery mV).
+
 ## SDK patches
 
 - `0001-psram-use-configured-chip-id.patch`: with no cached PSRAM id, the stock driver probes the
