@@ -21,3 +21,6 @@ CONFIG_YUV_BUF=y
 CONFIG_H264=y
 CONFIG_DVP_CAMERA=y
 CONFIG_DVP_CAMERA_TEST=n
+# microSD (feature sd): the SDK's power-GPIO helper would drive GPIO 13 (SDCARD_LDO_CTRL_GPIO) and
+# power the card down from a timer after 10 s idle; sdcard.c drives the real power pin (GPIO 6) itself
+CONFIG_SDCARD_POWER_GPIO_CTRL=n
