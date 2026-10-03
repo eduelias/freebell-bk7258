@@ -1956,7 +1956,7 @@ void app_power_wake_input(uint32_t pin)
 		s_last_ring_report_ms = now;
 		s_pend_fx = true;    /* chime + ring LEDs from flash, before Wi-Fi is up */
 		s_pend_ring = true;  /* reported once the IP arrives */
-	} else if (pin == PIN_PIR) {
+	} else if (pin == 24) {   /* PIR output (pir.c owns the pin; here only the wake reason) */
 		s_motion_count++;
 		s_last_motion_ms = now;
 		s_pend_motion = true;
