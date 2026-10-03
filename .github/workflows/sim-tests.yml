@@ -1,0 +1,32 @@
+name: sim-tests
+
+on:
+  push:
+    paths:
+      - "sim/**"
+      - "tools/dbcmd.py"
+      - "project/main/*.c"
+      - ".github/workflows/sim-tests.yml"
+  pull_request:
+    paths:
+      - "sim/**"
+      - "tools/dbcmd.py"
+      - "project/main/*.c"
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pillow pytest
+      - name: virtual doorbell test-suite (with Pillow)
+        run: python -m pytest sim/tests -q
+      - name: pure-stdlib frames (no Pillow)
+        run: |
+          pip uninstall -y pillow
+          python -m pytest sim/tests/test_http.py -q -k "snapshot or stream"
