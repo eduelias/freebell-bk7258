@@ -1,0 +1,109 @@
+# Doorbell BK7258 (custom firmware): Home Assistant package.
+# Copy to /config/packages/doorbell_bk7258.yaml (configuration.yaml: homeassistant: packages: !include_dir_named packages).
+# Replace <your_phone>, <device-ip> and <ha-ip>, then check the configuration and restart once (shell_command).
+#
+# Notification group: add/remove phones here (the webhook automation and the low-battery automation use it).
+notify:
+  - platform: group
+    name: doorbell_family
+    services:
+      - action: mobile_app_<your_phone>
+      - action: mobile_app_<your_second_phone>
+
+# feat/power (fw 0.21.0): trigger-based sensors fed by event doorbell_bk7258_report (fan-out from the webhook automation)
+template:
+  - trigger:
+      - trigger: event
+        event_type: doorbell_bk7258_report
+    sensor:
+      - name: Doorbell BK7258 battery
+        unique_id: doorbell_bk7258_battery_pct
+        unit_of_measurement: "%"
+        device_class: battery
+        state_class: measurement
+        state: "{{ trigger.event.data.batt_pct if trigger.event.data.batt_pct is not none else this.state }}"
+      - name: Doorbell BK7258 battery voltage
+        unique_id: doorbell_bk7258_battery_mv
+        unit_of_measurement: mV
+        device_class: voltage
+        state_class: measurement
+        state: "{{ trigger.event.data.batt_mv if trigger.event.data.batt_mv is not none else this.state }}"
+      - name: Doorbell BK7258 light level
+        unique_id: doorbell_bk7258_light_mv
+        unit_of_measurement: mV
+        state_class: measurement
+        state: "{{ trigger.event.data.light_mv }}"
+      - name: Doorbell BK7258 last event
+        unique_id: doorbell_bk7258_last_event
+        state: "{{ trigger.event.data.event }}"
+        attributes:
+          reason: "{{ trigger.event.data.reason }}"
+          fw: "{{ trigger.event.data.fw }}"
+          ip: "{{ trigger.event.data.ip }}"
+          uptime_s: "{{ trigger.event.data.uptime_s }}"
+    binary_sensor:
+      - name: Doorbell BK7258 USB power
+        unique_id: doorbell_bk7258_usb
+        device_class: plug
+        state: "{{ (trigger.event.data.usb | int(0)) == 1 if trigger.event.data.usb is not none else this.state == 'on' }}"
+      - name: Doorbell BK7258 charging
+        unique_id: doorbell_bk7258_charging
+        device_class: battery_charging
+        state: "{{ (trigger.event.data.charging | int(0)) == 1 if trigger.event.data.charging is not none else this.state == 'on' }}"
+
+automation:
+  - id: doorbell_bk7258_low_battery
+    alias: "Doorbell BK7258: low battery"
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.doorbell_bk7258_battery
+        below: 15
+        for: "00:10:00"
+    conditions:
+      - condition: state
+        entity_id: binary_sensor.doorbell_bk7258_usb_power
+        state: "off"
+    actions:
+      - action: notify.doorbell_family
+        data:
+          title: Doorbell
+          message: "Doorbell battery {{ states('sensor.doorbell_bk7258_battery') }} % - charge it"
+    mode: single
+
+# ---- talk (fw 0.23.0): speaker via the device's HTTP /speak, TTS through HA ----
+rest_command:
+  doorbell_speak_url:
+    # the device pulls the WAV itself and replies after playback: allow the clip length
+    url: "http://<device-ip>:8080/speak?url={{ url | urlencode }}"
+    method: get
+    timeout: 60
+  doorbell_tone:
+    url: "http://<device-ip>:8080/speak?tone={{ hz | default(1000) }}&ms={{ ms | default(500) }}"
+    method: get
+    timeout: 20
+
+shell_command:
+  # message -> TTS mp3 (HA's own TTS API) -> 16 kHz mono WAV in /config/www/doorbell/<name>.wav
+  doorbell_tts_wav: >-
+    python3 /config/doorbell_tts_wav.py "{{ message }}" "{{ lang | default('en') }}" "{{ name | default('say') }}"
+
+script:
+  doorbell_say:
+    alias: "Doorbell: say (TTS through the doorbell speaker)"
+    mode: queued
+    fields:
+      message: {description: "Text to speak", example: "Please leave the parcel at the door", required: true}
+      lang: {description: "TTS language", example: "nl", default: "en"}
+    sequence:
+      - action: shell_command.doorbell_tts_wav
+        data: {message: "{{ message }}", lang: "{{ lang | default('en') }}", name: "say"}
+      - action: rest_command.doorbell_speak_url
+        data: {url: "http://<ha-ip>:8123/local/doorbell/say.wav"}
+
+  doorbell_play:
+    alias: "Doorbell: play a prerecorded WAV"
+    fields:
+      file: {description: "file name under /config/www/doorbell/", example: "leave_parcel.wav", required: true}
+    sequence:
+      - action: rest_command.doorbell_speak_url
+        data: {url: "http://<ha-ip>:8123/local/doorbell/{{ file }}"}
