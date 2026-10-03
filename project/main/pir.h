@@ -26,6 +26,11 @@ uint32_t pir_sens_get(void);      /* 0..3 */
 uint32_t pir_cooldown_ms(void);
 uint32_t pir_count(void);         /* accepted motion edges since boot (hardware + simulated) */
 
+/* Call every ~50 ms from a CPU0 task: level-polling safety net for the GPIO ISR. A rising edge on
+ * GPIO 24 that the ISR did not report goes through the same handler and bumps `missed`. */
+void pir_poll(void);
+uint32_t pir_missed(void);
+
 /* Simulated PIR edge through the same handler as the ISR (`motion test`). */
 enum pir_edge_result pir_trigger(void);
 

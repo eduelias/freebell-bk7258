@@ -1,0 +1,25 @@
+diff --git a/middleware/driver/gpio/gpio_driver_base.c b/middleware/driver/gpio/gpio_driver_base.c
+index e3eded90..94400ab5 100644
+--- a/middleware/driver/gpio/gpio_driver_base.c
++++ b/middleware/driver/gpio/gpio_driver_base.c
+@@ -157,6 +157,12 @@ bk_err_t bk_gpio_driver_init(void)
+ 
+ 	//Move ISR to last to avoid other resouce doesn't finish but isr has came.
+ 	//F.E:GPIO wakeup deepsleep.
++	/* doorbell-bk7258-fw patch 0007: the GPIO interrupt status is one shared register set. On a
++	 * multi-core build every core used to enable the GPIO interrupt towards itself and run this
++	 * gpio_isr(), which clears every pending bit even when that core has no handler for the pin,
++	 * so a CPU1 (media) that is up steals CPU0's edges (PIR on GPIO 24, button on GPIO 53).
++	 * Only CPU0 handles GPIO interrupts in this firmware. */
++#if (CONFIG_SYS_CPU0)
+ #if CONFIG_TZ && (!CONFIG_SPE)
+ 	bk_int_isr_register(INT_SRC_GPIO_NS, gpio_isr, NULL);
+ #else
+@@ -169,6 +175,7 @@ bk_err_t bk_gpio_driver_init(void)
+ #else
+ 	icu_enable_gpio_interrupt();
+ #endif
++#endif /* CONFIG_SYS_CPU0 */
+ 
+ 	s_gpio_is_init = true;
+ 	return BK_OK;

@@ -127,7 +127,7 @@ POSTs JSON to a Home Assistant webhook (`local_only`, no token) on boot, ring, m
 | `hook set HOST:PORT/PATH` | change the target (saved to KV) |
 | `hook test` / `hook ring` / `hook motion` | fire a report without touching the hardware |
 
-Inputs: PIR on GPIO 24 (rising edge, 3 s debounce) and button on GPIO 53 (falling edge, pull-up,
+Inputs: PIR on GPIO 24 (rising edge; since v0.20 `pir.c` with cooldown/enable/sensitivity) and button on GPIO 53 (falling edge, pull-up,
 0.8 s debounce). `reboot` now restores the pristine boot GPIO config first so the ROM download
 window stays reachable.
 
@@ -235,7 +235,7 @@ sessions (before that worked) are noise, except the ADC readings.
 Open: which pin is the button, the PIR, the LEDs (`pin blink` on 5/8/9 first), the chime, the
 charger status, and the power-hold line.
 
-## PIR motion (v0.19.0, `project/main/pir.c`)
+## PIR motion (v0.20.0, `project/main/pir.c`)
 
 Pins from the stock `tuya_pir.c` (disassembled 2026-10-03): GPIO 24 = PIR output (rising-edge ISR),
 GPIO 50 = PIR enable (stock drives it high and never lowers it), GPIO 25 = sensitivity bit 0,
@@ -249,9 +249,32 @@ GPIO 26 = sensitivity bit 1 (stock `set_sens(n)`: 25 = n&1, 26 = n>>1&1; stock d
 | `pir cooldown MS` | minimum gap between accepted motions, enforced in the ISR (stock: 30 s) | `db_pir_cd`, 10000 |
 | `motion test` | simulated edge through the ISR handler: counts, cooldown, `motion` report to HA | |
 
-Reports carry `"pir_on"` and `"pir_sens"` next to `light_mv`. The HA side (snapshot to
-`/config/www/doorbell/last_{motion,ring}.jpg` + phone notification with the image) is in
-`TESTPLAN-motion.md`.
+`pir status` also prints `missed=N`: edges that the 50 ms level poller (`pir_poll()` from the
+reporter task) caught because the GPIO ISR did not. Reports carry `"pir_on"` and `"pir_sens"`
+next to `light_mv`.
+
+**GPIO interrupts and the camera (found 2026-10-03, fixed by SDK patch 0007).** With the camera
+open (CPU1 up) not a single PIR pulse reached the ISR on v0.20.0: every core runs
+`bk_gpio_driver_init()`, which enables the one shared GPIO interrupt towards *its own* CPU and
+installs a `gpio_isr()` that clears every pending status bit, handler or not, so CPU1 cleared
+CPU0's edges first (the button on GPIO 53 was exposed to the same theft). Patch 0007 registers the
+GPIO ISR and enables the interrupt on CPU0 only; verified on v0.20.1 with the camera streaming:
+every GPIO 24 pulse counted, `missed=0`. The poller stays as a safety net.
+
+**PIR behaviour on the bench.** The bare board (no lens/housing, lying on the desk, nobody in the
+room per the Mac camera) pulses on its own every 5-30 s at `sens 1`; see the sweep in NOTES.md
+2026-10-03 for the per-setting rates. The cooldown is the only thing standing between that and a
+phone push with a picture every 10 s, so raise `pir cooldown` (stock: 30 s) or `pir off` while the
+device sits open on the desk.
+
+HA side (applied 2026-10-03, `automations.yaml` automation `doorbell_bk7258_webhook`, backup
+`automations.yaml.bak-20261003-motionsnap`): `ring` -> persistent notification + text push
+(tag `doorbell_ring`), then `camera.snapshot` to `/config/www/doorbell/last_ring.jpg` and a second
+push with `image: /local/doorbell/last_ring.jpg?v=<ts>` (tag `doorbell_ring_photo`); `motion` ->
+persistent notification (light_mv, pir_sens), snapshot to `last_motion.jpg`, one push with the
+image (channel/tag `doorbell_motion`). All snapshot/notify steps have `continue_on_error`.
+Measured: snapshot written 1.6 s after the webhook (5.7 s for the first one after a boot),
+notify step done at +1.9 s. Full procedure and tests in `TESTPLAN-motion.md`.
 
 ## Audio (v0.13.x: DMA engine, both directions working)
 
@@ -323,6 +346,11 @@ Measured with the Mac as ear/voice on 2026-10-03 (`tools/mac_ear.py`, `tools/mic
   that compile to nothing, because `hal_config.h` tests the flag before `sdkconfig.h` is in
   scope, and the link fails. So instead this patch registers just `cli_gpio_init()` and
   `cli_adc_init()` unconditionally when `CONFIG_DEBUG_FIRMWARE` is off.
+
+- `0007-gpio-irq-cpu0-only.patch`: `bk_gpio_driver_init()` registers the GPIO ISR and enables
+  the GPIO interrupt towards the CPU only when built for CPU0. The GPIO interrupt status is one
+  shared register set; on CPU1/CPU2 the stock init made those cores clear CPU0's pending edges
+  (PIR, button) whenever they were up, i.e. whenever the camera was open.
 
 ## Status
 

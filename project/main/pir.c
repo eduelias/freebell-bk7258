@@ -57,7 +57,8 @@ static uint32_t s_sens = PIR_SENS_DEFAULT;
 static uint32_t s_cd_ms = PIR_CD_DEFAULT_MS;
 static pir_motion_cb_t s_cb;
 /* touched from the ISR */
-static volatile uint32_t s_count, s_edges, s_ignored, s_last_ms, s_armed_at_ms;
+static volatile uint32_t s_count, s_edges, s_ignored, s_last_ms, s_armed_at_ms, s_missed;
+static int s_en_level = -1;   /* what we drive on GPIO 50 (an output with its input buffer off reads back 1) */
 
 /* ---- KV helpers (private copies: app_main's are static) ---- */
 
@@ -111,11 +112,13 @@ static void pir_apply_enable(void)
 	s_armed_at_ms = rtos_get_time();
 	if (s_on) {
 		pin_out(PIR_PIN_EN, 1);
+		s_en_level = 1;
 		pir_apply_sens();
 		bk_gpio_enable_interrupt(PIR_PIN_OUT);
 	} else {
 		bk_gpio_disable_interrupt(PIR_PIN_OUT);
 		pin_out(PIR_PIN_EN, 0);
+		s_en_level = 0;
 	}
 }
 
@@ -203,6 +206,36 @@ enum pir_edge_result pir_trigger(void)
 	return pir_handle_edge();
 }
 
+/* Found 2026-10-03 on v0.20.0: with the camera open (CPU1 up) not one PIR pulse reached the ISR,
+ * because every core enabled the shared GPIO interrupt towards itself and CPU1's gpio_isr()
+ * cleared the status first (SDK patch 0007 restricts GPIO interrupts to CPU0). This poller is the
+ * belt to that brace: a 0->1 transition that did not move s_edges since the previous poll is fed
+ * through the same handler and counted in `missed` (PIR pulses last 2-4 s, so 50 ms is plenty). */
+void pir_poll(void)
+{
+	static int last_level = -1;
+	static uint32_t edges_seen;
+	int level;
+
+	if (!s_on) {
+		last_level = -1;
+		edges_seen = s_edges;
+		return;
+	}
+	level = bk_gpio_get_input(PIR_PIN_OUT) ? 1 : 0;
+	if (last_level == 0 && level == 1 && s_edges == edges_seen) {
+		s_missed++;
+		pir_handle_edge();
+	}
+	last_level = level;
+	edges_seen = s_edges;
+}
+
+uint32_t pir_missed(void)
+{
+	return s_missed;
+}
+
 /* ---- commands ---- */
 
 static void pir_status(char *out, size_t cap)
@@ -212,10 +245,9 @@ static void pir_status(char *out, size_t cap)
 
 	snprintf(out, cap,
 		 "[pir] %s sens=%u (GPIO25=%u GPIO26=%u) cooldown=%u ms count=%u last=%u ms ago "
-		 "(cooldown left %u ms) edges=%u ignored=%u GPIO24=%d GPIO50=%d\r\n",
+		 "(cooldown left %u ms) edges=%u ignored=%u missed=%u GPIO24=%d GPIO50=%d\r\n",
 		 s_on ? "on" : "off", s_sens, s_sens & 1, (s_sens >> 1) & 1, s_cd_ms, s_count, ago, left,
-		 s_edges, s_ignored, bk_gpio_get_input(PIR_PIN_OUT) ? 1 : 0,
-		 bk_gpio_get_input(PIR_PIN_EN) ? 1 : 0);
+		 s_edges, s_ignored, s_missed, bk_gpio_get_input(PIR_PIN_OUT) ? 1 : 0, s_en_level);
 }
 
 void pir_command(int argc, char **argv, char *out, size_t cap)

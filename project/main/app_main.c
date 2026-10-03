@@ -61,7 +61,7 @@ void db_reply(const char *fmt, ...)
 	REPLY("%s", buf);
 }
 
-#define FW_VERSION "0.20.0"
+#define FW_VERSION "0.20.2"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -513,6 +513,7 @@ static void reporter_task(beken_thread_arg_t arg)
 			last_hb = rtos_get_time();
 			report("heartbeat");
 		}
+		pir_poll();   /* GPIO 24 level poll: catches edges the ISR missed (see pir.c) */
 		rtos_delay_milliseconds(50);
 	}
 }
