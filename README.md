@@ -343,17 +343,49 @@ Measured with the Mac as ear/voice on 2026-10-03 (`tools/mac_ear.py`, `tools/mic
   Mac mic 40 cm away (no transient above the room floor within 200 ms of PA on/off on either
   build), so the by-ear check is still the owner's.
 
-## Battery, charger and deep sleep (v0.19.0, `project/main/power.c`)
+## Battery, charger and deep sleep (v0.21, `project/main/power.c`)
 
 From the stock `tuya_battery.c`: **GPIO 19 = USB present (high)**, **GPIO 15 = charging (high, with
-19 high)**, **battery = ADC15 on GPIO 13, x2 divider** (2012 mV -> 4024 mV measured; ADC9 is a
-regulated rail). `pwr status` prints battery mV / %, usb and charging; every report JSON carries
-`batt_mv`, `batt_pct`, `usb`, `charging`. Deep sleep (SDK pm v2, SoC reset on wake) is **off by
-default**: `pwr sleep on|off`, `pwr sleep force on|off` (also on USB), `pwr idle S` (60),
-`pwr wake_pir on|off` (off), `pwr snap_min M` (RTC wake for a scheduled snapshot, 0 = 6 h keepalive),
-`pwr sleepnow` (test, 10 s grace). Wake sources: button (53), USB plug (19), console RX (10), PIR (24,
-optional), RTC. After every boot the device stays awake 120 s; a button wake chimes before Wi-Fi is up
-and then posts `wake` (`reason`) + `ring`. Full procedure and HA snippets: `TESTPLAN-power.md`.
+19 high)**, **battery = ADC15 on GPIO 13, x2 divider** (ADC9 is a regulated rail). Deep sleep (SDK pm
+v2, SoC reset on wake) is **off by default**.
+
+| Command | What it does | KV, default |
+|---|---|---|
+| `pwr status` | batt mV / % (raw ADC x ratio), usb, chg, all settings, uptime, boot-hold left, idle s, busy, boot/wake reason | |
+| `pwr sleep on\|off` | automatic sleep when on battery and idle; `off` also cancels a pending `sleepnow` | `db_pwr_sleep`, off |
+| `pwr sleep force on\|off` | also sleep while USB is present | `db_pwr_force`, off |
+| `pwr idle S` | idle seconds before sleeping (min 20) | `db_pwr_idle`, 60 |
+| `pwr wake_pir on\|off` | PIR (GPIO 24 rising) wakes; GPIO 50/25/26 held through the sleep | `db_pwr_wpir`, off |
+| `pwr snap_min M` | RTC wake every M min (0 = 360 min keepalive) | `db_pwr_snap`, 0 |
+| `pwr sleepnow` | sleep in 10 s regardless of USB/idle/boot hold (test) | |
+| `pwr chan N` / `pwr ratio PCT` | battery ADC channel / divider x0.01 | `db_pwr_bchan` 15, `db_pwr_bratio` 200 |
+
+Report JSON carries `batt_mv`, `batt_pct`, `usb`, `charging`; a new event `wake` with `reason`
+(`button|pir|usb|uart|rtc|gpioNN`) follows every deep-sleep wake. Wake sources: button (53, falling),
+USB plug (19, rising), console RX (10, SDK static map), PIR (24, rising, optional), RTC alarm. Policy
+for automatic sleep: never before 120 s uptime, never on USB unless `force`, never while busy (HTTP
+client incl. HA's stream, spk/mic, ring fx, OTA, pending report), only after `idle` seconds without a
+command/HTTP request/press/motion. Before sleeping: amp off, LEDs off, camera closed, GPIO 28/5/6/9
+low, `bk_wifi_sta_stop`. A crash/watchdog boot inhibits automatic sleep; a sleep that does not happen
+backs out with a 10 min backoff. Full procedure and HA snippets: `TESTPLAN-power.md`.
+
+**Verified on hardware 2026-10-03 (v0.21.0/0.21.1):** `pwr sleepnow` + `snap_min 1`: off the LAN
+12 s after the command, back 60 s later, boot reason `deepsleep rtc`, Wi-Fi + IP within ~2 s of the
+reset, HA received `boot` and `wake reason rtc` 140 ms apart and wrote `wake_latest.jpg` 5 s after the
+wake. Settings survive a reboot. HA sensors (`sensor.doorbell_bk7258_battery`, `_battery_voltage`,
+`_light_level`, `_last_event`, `binary_sensor.doorbell_bk7258_usb_power`, `_charging`) follow every
+report through the `doorbell_bk7258_report` event. Automatic (idle) sleep tested with `force on`
+(see TESTPLAN results). **Caveats:** (1) the ADC readings are bimodal: `mv` (ADC9) alternates between
+~2994 and ~3069 and `batt_mv` between ~3886 and ~3982 (2.5 %, same direction, within one report
+sequence), most likely a ratiometric ADC following supply sag under Wi-Fi/camera load - calibrate
+`pwr ratio` against a multimeter before trusting the percent; (2) GPIO 19 follows the internal pull
+(`pin in 19 down` -> usb 0, `up`/`none` -> 1), so "usb 1" on the bench may be a floating pin, not a
+charger - the polarity is unconfirmed until the device is seen with and without USB; (3) PIR wake:
+the PIR keeps pulsing with GPIO 9, 28, 5, 6 low (so it is powered through the sleep) and the wake
+source registration succeeds, but a 2 min sleep at `pir sens 2` produced no PIR wake although the
+bare board "self-triggers" every ~10 s while awake - that noise is probably EMI from the running
+board, so a real PIR wake needs a person in front of the sensor; (4) GPIO 50 is owned by `pir.c`
+(`pir off` keeps it low), power.c only holds it high through the sleep when `wake_pir` is on.
 
 ## SDK patches
 

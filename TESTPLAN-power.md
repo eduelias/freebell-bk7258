@@ -233,3 +233,20 @@ default `allowlist_external_dirs`, so `camera.snapshot` can write there.
   Either accept (USB-powered install) or let HA fetch stills only.
 - `pwr sleepnow` during a speaker/mic session leaves the audio domain on -> sleep fails -> 10 min backoff.
 - UART RX is a wake source: a floating console header could cause spurious wakes (the SDK pulls it up).
+
+## Results 2026-10-03 (integrator, fw 0.21.0 -> 0.21.1 on main, UART0 dead so everything via dbcmd/HA)
+
+| Step | Result |
+|---|---|
+| 1 battery/charger readout | `pwr status`: `batt 3886 mV 72% (adc15 1943 mV x2.00) usb 1 chg 0`; `hook test` -> HA last report had `batt_mv 3888, batt_pct 72, usb 1, charging 0`; HA sensors populated through the event fan-out. **But** GPIO 19 follows the internal pull (`pin in 19 down` -> usb 0, `up`/`none` -> usb 1): the pin may be floating, i.e. USB may not be plugged at all. GPIO 15 reads 0 with pull-down, none and pull-up = externally driven low (consistent with "not charging"). The pack read 4024 mV at 16:00 (implementer) and 3886 mV at 19:20 after 3 h of HA camera streaming, then flat for 20 min with the camera closed. `adc 15` on its own printed 2006 mV while `pwr status` (median of 3, back-to-back) printed 1943: the readings are bimodal (see caveat in README). Charging polarity still unobserved. |
+| 2 persist | `pwr idle 45`, `pwr snap_min 1`, `reboot` -> both values back after the reboot. OK |
+| 3 RTC wake 1 min | `pwr sleepnow` 19:21:41 -> off the LAN 19:21:54 (+12 s), back 19:22:54 (+72 s = 60 s sleep + ~2 s boot-to-IP), `pwr status`: `boot deepsleep rtc wake=rtc`. HA: `boot` 17:22:53.658Z, `wake reason rtc` .798Z (140 ms later), logbook "woke up (rtc), battery 72 % / 3886 mV", `wake_latest.jpg` (74 KB) written 19:22:58. **PASS** |
+| 4 button wake + chime | needs the owner (asked by WhatsApp 19:36, device left cycling, see below) |
+| 5 USB-plug / console wake | needs the owner (USB); console RX wire is dead |
+| 6 automatic sleep | tested with `pwr sleep force on`, `idle 20`, `snap_min 10` (HA camera idle, `busy 0`): see the timeline below |
+| 7 PIR wake | `wake_pir on`, `pir sens 2` (bare board self-triggers ~6/min awake), `snap_min 2`, `sleepnow` 19:24:08 -> off 19:24:20, back **19:26:22 by RTC**, `wake=rtc`, GPIO24 already pulsing again 5 s after boot. Rail check while awake: edges/min with GPIO 9 low 4, GPIO 28 low 5, GPIO 5+6 low 5 (baseline 6) -> the PIR stays powered through the sleep; `bk_gpio_register_wakeup_source` cannot fail here (4 slots, 3 used). Conclusion: the awake "self-triggering" is most likely EMI from the running board and the PIR is quiet while the SoC sleeps; a human wave is needed. v0.21.1 additionally holds GPIO 25/26 (sensitivity bits) through the sleep. **UNPROVEN** |
+| 8 scheduled snapshot | HA half proven in step 3 (`wake_latest.jpg` +5 s). Device half = step 6 cycle. |
+| 9 battery curve | not started (needs hours on battery + a drained pack for `charging 1`) |
+
+Timeline of the unattended cycle (`sleep on`, `force on`, `idle 20`, `snap_min 10`, `wake_pir on`,
+hook on HA, started 19:36:39): filled in below.
