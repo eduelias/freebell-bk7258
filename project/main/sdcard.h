@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* doorbell-bk7258-fw: microSD storage interface. */
 /* sdcard.h — optional microSD storage for the doorbell (CPU0 only).
  *
  * SD host = the BK7258 SDIO host in 1-bit mode on GPIO 2 (CLK) / 3 (CMD) / 4 (DAT0) (the SDK

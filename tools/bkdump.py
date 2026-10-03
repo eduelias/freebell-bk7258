@@ -1,11 +1,18 @@
 """Wait for the Beken ROM, identify, then dump flash 4K at a time (read-only).
-Resumable: keeps a sparse image + a done-map; rerun to continue."""
-import sys, os, time, struct, json, zlib
+Resumable: keeps a sparse image + a done-map; rerun to continue.
+
+  bkdump.py [SIZE] [--port DEV]    SIZE overrides the flash size read from the JEDEC id (e.g. 0x800000)
+"""
+import argparse, sys, os, time, struct, json, zlib
 from bkread import BK
 IMG, MAP = "doorbell_flash.bin", "doorbell_flash.done.json"
-size_override = int(sys.argv[1], 0) if len(sys.argv) > 1 else None
+ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+ap.add_argument("size", nargs="?", type=lambda s: int(s, 0), help="flash size override")
+ap.add_argument("--port", help="UART adapter (default: SERIAL_PORT or the first USB serial device)")
+args = ap.parse_args()
+size_override = args.size
 done = set(json.load(open(MAP))) if os.path.exists(MAP) else set()
-bk = BK()
+bk = BK(port=args.port)
 print(time.strftime("%T"), "waiting for ROM (replug battery now)...", flush=True)
 t0 = time.time()
 while not bk.link(seconds=1.0):

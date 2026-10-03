@@ -5,12 +5,14 @@
   pinmap_session.py watch 60   device-side edge watch for N seconds (press button / wave at PIR)
   pinmap_session.py pull       classify every safe pin: ext HIGH / ext LOW / floating
   pinmap_session.py adc        read every ADC channel that maps to a safe GPIO
+  --port DEV                   UART adapter (default: SERIAL_PORT or the first USB serial device)
 
 Safe pins = everything except the console UART, ATE strap, QSPI0 and camera DVP pins
 (the EXCLUDE set in pinscan.py).
 """
-import glob, re, sys, time
+import argparse, re, sys, time
 import serial
+import dbenv
 from pinscan import EXCLUDE, NUM_GPIO
 
 RE_PINS = re.compile(r"PINS ([01]{56})")
@@ -21,8 +23,8 @@ SAFE = [p for p in range(NUM_GPIO) if p not in EXCLUDE]
 
 
 class Shell:
-    def __init__(self):
-        self.s = serial.Serial(glob.glob("/dev/cu.usbserial-*")[0], 115200, timeout=0.05)
+    def __init__(self, port=None):
+        self.s = serial.Serial(dbenv.serial_port(port), 115200, timeout=0.05)
         self.read(0.3)
 
     def read(self, sec):
@@ -156,12 +158,17 @@ def adc(sh):
 
 
 def main():
-    mode = sys.argv[1] if len(sys.argv) > 1 else "all"
-    sh = Shell()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("mode", nargs="?", default="all", choices=["all", "scan", "watch", "pull", "mux", "adc"])
+    ap.add_argument("arg", nargs="*", help="watch: seconds (default 40)")
+    ap.add_argument("--port", help="UART adapter")
+    a = ap.parse_args()
+    mode = a.mode
+    sh = Shell(a.port)
     if mode == "scan":
         prep(sh); scan(sh)
     elif mode == "watch":
-        prep(sh); watch(sh, int(sys.argv[2]) if len(sys.argv) > 2 else 40)
+        prep(sh); watch(sh, int(a.arg[0]) if a.arg else 40)
     elif mode == "pull":
         pull(sh)
     elif mode == "mux":

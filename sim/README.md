@@ -114,7 +114,9 @@ works for local tests but not for HA).
    frame rate 5, no authentication. Or from a host with an HA token in `~/.ha_token`:
    `python3 tools/ha_generic_camera.py add --name "Virtual doorbell" --still http://<host>:8080/snapshot.jpg --stream http://<host>:8080/stream`
 2. **Webhook**: point the simulator at your automation's webhook id
-   (`python3 tools/dbcmd.py hook set <ha-ip>:8123/api/webhook/<id>` or `--hook`) and reuse the
+   (`python3 tools/dbcmd.py hook set <ha-ip>:8123/api/webhook/<id>` or `--hook`); like the
+   firmware it starts with no target and skips every report (one `hook not set` log line) until
+   one is set. Then reuse the
    automation / template sensors from the top-level README ("Prototype: Wi-Fi + Home Assistant
    webhook" and "Battery, charger and deep sleep"). `sim press` then produces the ring
    notification and the `camera.snapshot`, `sim batt 3500` moves `sensor.doorbell_bk7258_battery`.

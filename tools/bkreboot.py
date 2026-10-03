@@ -6,21 +6,26 @@ The ROM's CMD_Reboot (0x0E, payload 0xA5) resets the chip so it boots the flashe
 
   bkreboot.py            reboot, then print 30 s of boot log
   bkreboot.py --quiet    reboot only
+  --port DEV selects the UART adapter (default: SERIAL_PORT or the first USB serial device).
 """
-import sys, time
+import argparse, sys, time
 from bkread import BK
 
 REBOOT = bytes.fromhex("01e0fc020ea5")   # 01 E0 FC <len> CMD_Reboot 0xA5
 
 
 def main():
-    bk = BK()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--quiet", action="store_true", help="reboot only, do not print the boot log")
+    ap.add_argument("--port", help="UART adapter")
+    a = ap.parse_args()
+    bk = BK(port=a.port)
     if not bk.link(seconds=5):
         sys.exit("chip is not in ROM download mode (nothing to reboot from)")
     bk.s.reset_input_buffer()
     bk.s.write(REBOOT)
     print(time.strftime("%T"), "reboot sent")
-    if "--quiet" in sys.argv:
+    if a.quiet:
         return
     bk.s.timeout = 0.2
     end = time.time() + 30

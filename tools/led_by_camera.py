@@ -1,10 +1,10 @@
 """LED hunt with a webcam as the eyes.
 
 A capture loop (run in Terminal.app, which macOS lets use the camera) keeps rewriting
-~/data/doorbell-bk7258/cam/latest.jpg every ~1.5 s, e.g.
+CAM_DIR/latest.jpg every ~1.5 s, e.g. with CAM_DIR=/tmp/doorbell-cam:
 
-  while true; do imagesnap -q -w 0.5 ~/data/doorbell-bk7258/cam/new.jpg && \
-    mv -f ~/data/doorbell-bk7258/cam/new.jpg ~/data/doorbell-bk7258/cam/latest.jpg; sleep 0.5; done
+  while true; do imagesnap -q -w 0.5 $CAM_DIR/new.jpg && \
+    mv -f $CAM_DIR/new.jpg $CAM_DIR/latest.jpg; sleep 0.5; done
 
 Metric: percentage of bright pixels in the lower part of the frame (where the board sits), so a
 person walking through the background or a small camera shift does not count as a change. For
@@ -12,25 +12,29 @@ each candidate pin: drive it (low and/or high), grab a fresh frame, park it hi-Z
 with the baseline taken at the start. The white fill LED saturates the sensor, so a pin that
 turns it OFF shows as a large drop; the dim blue ring LEDs need `--region` tuned to them.
 
-  led_by_camera.py [--low] [--high] [--pins 5 8 9 ...] [--keep 9] [--region 0.6]
+  led_by_camera.py --cam-dir DIR [--low] [--high] [--pins 5 8 9 ...] [--keep 9] [--region 0.6]
+                   [--box x0 y0 x1 y1] [--port DEV]
+     --cam-dir DIR the directory the capture loop writes latest.jpg to; frames that show a change
+                   are saved under DIR/hunt/ (required)
      --low/--high  which levels to drive (default both)
-     --keep N      drive GPIO N high first and skip it (power-enable lines)
+     --keep N      drive GPIO N high first and skip it (power-enable lines; default 9)
      --region F    use the bottom (1-F) fraction of the frame (default 0.6 = lower 40 %)
+     --box ...     instead of --region: a frame-fraction box, e.g. the white LED flare 0.48 0.80 0.75 1.0
+     --port DEV    UART adapter (default: SERIAL_PORT or the first USB serial device)
 """
-import glob, os, sys, time
+import argparse, os, sys, time
 import serial
 from PIL import Image
+import dbenv
 
-CAM = os.path.expanduser("~/data/doorbell-bk7258/cam")
-LATEST = os.path.join(CAM, "latest.jpg")
-OUT = os.path.join(CAM, "hunt")
+LATEST = OUT = None   # set from --cam-dir in main()
 CONSOLE = {10, 11}
 NO_SINK = {0, 3, 4, 12, 15, 24, 27, 44, 45, 53} | set(range(29, 40))
 
 
 class Shell:
-    def __init__(self):
-        self.s = serial.Serial(glob.glob("/dev/cu.usbserial-*")[0], 115200, timeout=0.05)
+    def __init__(self, port=None):
+        self.s = serial.Serial(dbenv.serial_port(port), 115200, timeout=0.05)
         self.cmd("", 0.3)
 
     def cmd(self, line, wait=0.3):
@@ -69,20 +73,25 @@ def bright(im, region):
 
 
 def main():
-    a = sys.argv[1:]
-    levels = [lv for lv, f in ((0, "--low"), (1, "--high")) if f in a] or [0, 1]
-    keep = {int(a[i + 1]) for i, x in enumerate(a) if x == "--keep"} or {9}
-    region = float(a[a.index("--region") + 1]) if "--region" in a else 0.6
-    if "--box" in a:   # --box x0 y0 x1 y1 (frame fractions), e.g. the white LED flare: 0.48 0.80 0.75 1.0
-        i = a.index("--box")
-        region = tuple(float(x) for x in a[i + 1:i + 5])
-    if "--pins" in a:
-        i = a.index("--pins")
-        pins = [int(x) for x in a[i + 1:] if x.isdigit()]
-    else:
-        pins = [p for p in range(56) if p not in CONSOLE | keep | NO_SINK]
+    global LATEST, OUT
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--cam-dir", required=True, help="directory the capture loop writes latest.jpg to")
+    ap.add_argument("--low", action="store_true")
+    ap.add_argument("--high", action="store_true")
+    ap.add_argument("--pins", type=int, nargs="+")
+    ap.add_argument("--keep", type=int, action="append")
+    ap.add_argument("--region", type=float, default=0.6)
+    ap.add_argument("--box", type=float, nargs=4, metavar=("X0", "Y0", "X1", "Y1"))
+    ap.add_argument("--port")
+    a = ap.parse_args()
+    cam = os.path.expanduser(a.cam_dir)
+    LATEST, OUT = os.path.join(cam, "latest.jpg"), os.path.join(cam, "hunt")
+    levels = [lv for lv, f in ((0, a.low), (1, a.high)) if f] or [0, 1]
+    keep = set(a.keep) if a.keep else {9}
+    region = tuple(a.box) if a.box else a.region
+    pins = a.pins or [p for p in range(56) if p not in CONSOLE | keep | NO_SINK]
     os.makedirs(OUT, exist_ok=True)
-    sh = Shell()
+    sh = Shell(a.port)
     for k in keep:
         sh.cmd(f"pin out {k} 1")
     for p in pins:

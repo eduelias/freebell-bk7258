@@ -1,20 +1,29 @@
 """Read-only Beken BootROM client (BK7258): link check, read register, flash MID, flash read 4K.
-Implements ONLY read commands; no erase/write/register-write codes exist in this file."""
-import serial, glob, time, struct, sys, zlib
+Implements ONLY read commands; no erase/write/register-write codes exist in this file.
+
+  bkread.py [--port DEV]      link check + identify; the port falls back to SERIAL_PORT / the first
+                              /dev/cu.usbserial-*, /dev/ttyUSB*, /dev/ttyACM* (tools/dbenv.py)
+"""
+import argparse, serial, time, struct, sys, zlib
+import dbenv
 
 class BK:
-    def __init__(self, baud=115200):
-        self.baud = baud; self.s = None; self.reopen()
+    def __init__(self, baud=115200, port=None):
+        self.baud = baud; self.port = port; self.s = None; self.reopen()
     def reopen(self):
+        """(Re)open the adapter, waiting for it to appear (it drops out when the board resets)."""
         while True:
             try:
                 if self.s:
                     try: self.s.close()
                     except Exception: pass
-                self.s = serial.Serial(glob.glob("/dev/cu.usbserial-*")[0], self.baud, timeout=0.05)
-                return
+                dev = dbenv.serial_port(self.port, required=False)
+                if dev:
+                    self.s = serial.Serial(dev, self.baud, timeout=0.05)
+                    return
             except Exception:
-                time.sleep(0.1)
+                pass
+            time.sleep(0.1)
     def xfer(self, tx, rxlen, timeout=1.0):
         self.s.reset_input_buffer(); self.s.write(tx)
         buf = b""; end = time.time() + timeout
@@ -54,7 +63,9 @@ class BK:
         return None
 
 if __name__ == "__main__":
-    bk = BK()
+    ap = argparse.ArgumentParser(description="Beken BootROM read-only probe")
+    ap.add_argument("--port", help="UART adapter (default: SERIAL_PORT or the first USB serial device)")
+    bk = BK(port=ap.parse_args().port)
     print("link:", bk.link())
     for name, a in (("SYS_VERSION", 0x44010004), ("SCTRL_CHIP_ID", 0x800000)):
         v = bk.read_reg(a); print(name, hex(v) if isinstance(v, int) else v)

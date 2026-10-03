@@ -69,7 +69,7 @@ RING_REPORT_MS = 10000
 WHITE_LIGHT_MS = 30000
 REPLY_MAX = 319                  # s_reply[320]
 TCP_LINE_MAX = 191               # char line[192]
-HOOK_DEFAULT = "192.168.2.80:8123/api/webhook/doorbell_bk7258_9f3c"
+HOOK_DEFAULT = ""   # like the firmware (v0.24.1+): no webhook target until `hook set HOST:PORT/PATH`
 
 PIR_SENS_MAX = 3
 PIR_CD_MIN_MS = 500
@@ -450,6 +450,7 @@ class Device:
         self.charging = int(env.get("charging", 0))
         self.token = args.token
         self.hook = store.kv_get("db_hook", args.hook or HOOK_DEFAULT) if not args.hook else args.hook
+        self.hook_unset_logged = False   # "hook not set" is logged once per boot, like report_ex()
         if args.hook:
             store.kv_set("db_hook", args.hook)
         self.ssid = store.kv_get("db_ssid", "virtual-lan") or ""
@@ -595,6 +596,11 @@ class Device:
 
     def report(self, event: str, extra: str = "") -> int:
         body = self.report_json(event, extra)
+        if not self.hook:   # report_ex(): no target configured -> skip the POST, say so once, -ENOENT
+            if not self.hook_unset_logged:
+                self.hook_unset_logged = True
+                log.info("[hook] %s skipped: hook not set (hook set HOST:PORT/PATH)", event)
+            return -2
         status = self.http_post_json(self.hook, body)
         log.info("[hook] %s -> %d", event, status)
         with self.lock:
@@ -908,7 +914,7 @@ class Device:
             elif wake_reason == "pir":
                 self.motion_count += 1
                 self.pend_motion = True
-            log.info("[cfg] ssid '%s' hook %s", self.ssid, self.hook)
+            log.info("[cfg] ssid '%s' hook %s", self.ssid, self.hook or "not set")
         self.net.up()
         log.info("[tcp] command channel on port %d", self.args.tcp_port)
         log.info("[cam] http server on port %d", self.args.http_port)
@@ -1050,7 +1056,7 @@ class Device:
         elif len(argv) >= 2 and argv[1] == "motion":
             self.motion_count += 1
             self.pend_motion = True
-        r.add("[hook] %s  (hook set HOST:PORT/PATH | test | ring | motion)\r\n" % self.hook)
+        r.add("[hook] %s  (hook set HOST:PORT/PATH | test | ring | motion)\r\n" % (self.hook or "not set"))
 
     def cmd_ota(self, argv: list[str], r: Reply) -> None:
         if len(argv) < 2:
@@ -1604,7 +1610,7 @@ class Device:
             r.add("[sim] %s fw %s up %u s speed x%g | light %u mV batt %u mV usb %d chg %d | cam %d frames %u | ring %u motion %u"
                   " | hook %s | last report %s -> %s | ports tcp %d http %d ctl %d rtsp %d%s | %s frames\r\n" % (
                       self.state, self.fw, self.uptime_ms() // 1000, self.clock.speed, self.light_mv, self.batt_mv, self.usb,
-                      self.charging, int(self.cam.open), self.cam.frames, self.ring_count, self.motion_count, self.hook,
+                      self.charging, int(self.cam.open), self.cam.frames, self.ring_count, self.motion_count, self.hook or "not set",
                       last["json"]["event"] if last else "-", last["status"] if last else "-", self.args.tcp_port,
                       self.args.http_port, self.args.sim_port, self.rtsp_port, " (ffmpeg)" if self.rtsp.running() else "",
                       "Pillow" if HAVE_PIL else "mosaic"))
@@ -2210,7 +2216,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if sys.stdin.isatty() or os.environ.get("VDB_STDIN") == "1":   # interactive `sim` commands on stdin
         threading.Thread(target=stdin_loop, args=(dev,), name="stdin", daemon=True).start()
     log.info("virtual doorbell fw %s: tcp %d http %d ctl %d | token '%s' | state %s | hook %s | frames: %s%s",
-             dev.fw, args.tcp_port, args.http_port, args.sim_port, dev.token, store.path, dev.hook,
+             dev.fw, args.tcp_port, args.http_port, args.sim_port, dev.token, store.path, dev.hook or "not set",
              "Pillow" if HAVE_PIL else "pure-python mosaic", " | rtsp stand-in on %d" % args.rtsp_port if args.rtsp else "")
     log.info("try: DOORBELL_HOST=127.0.0.1 DOORBELL_TOKEN=%s python3 tools/dbcmd.py --port %d sys info   |   curl http://127.0.0.1:%d/sim/press",
              dev.token, args.tcp_port, args.http_port)

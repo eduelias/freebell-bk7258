@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* doorbell-bk7258-fw: optional microSD storage: mount, snapshots on events, SNTP time for FAT timestamps. */
 /* sdcard.c — optional microSD storage (doorbell-bk7258-fw, feature "sd").
  *
  * Hardware (stock firmware + SDK defaults, see TESTPLAN-sd.md for the verification steps):
@@ -482,7 +484,7 @@ static int sd_do_save(const char *event, bool automatic)
 		sd_set_result("save: no PSRAM for the frame");
 		return -1;
 	}
-#ifdef DU7_AVDK
+#ifdef DOORBELL_AVDK
 	n = app_cam_grab(s_jpg, SD_JPG_MAX, automatic ? 3000 : 4000);
 #else
 	n = -100;   /* bare SDK build: no camera pipeline */

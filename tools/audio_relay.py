@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """One-shot TCP audio relay for the doorbell's `mic rec` / `spk net` commands (firmware v0.12.0+).
 
-The doorbell always connects OUT, so this runs on a LAN host it can reach (du7; the Mac's firewall
-blocks incoming connections). Each invocation serves exactly one connection, then exits.
+The doorbell always connects OUT, so this runs on a LAN host it can reach (a Linux box or Pi works
+well; a laptop firewall may block incoming connections). Each invocation serves exactly one
+connection, then exits.
 
   audio_relay.py recv PORT FILE [TIMEOUT]   # accept one connection, write everything it sends to FILE
   audio_relay.py send PORT FILE [TIMEOUT]   # accept one connection, send FILE (s16le mono 8 kHz), close
 
-On du7 run it detached:  systemd-run --user --unit=relay-recv python3 ~/audio_relay.py recv 5100 /tmp/mic.raw
-Then on the doorbell:    mic rec 4000 192.168.2.68 5100      (raw 32-bit ADC FIFO words)
-                         spk net 192.168.2.68 5101            (plays the file the relay serves)
+On the relay host, detached:  systemd-run --user --unit=relay-recv python3 ~/audio_relay.py recv 5100 /tmp/mic.raw
+Then on the doorbell:         mic rec 4000 <relay-host-ip> 5100   (raw 32-bit ADC FIFO words)
+                              spk net <relay-host-ip> 5101         (plays the file the relay serves)
 """
 import socket, sys, time
 

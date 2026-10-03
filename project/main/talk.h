@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* doorbell-bk7258-fw: two-way audio over HTTP interface. */
 /* talk.h — half-duplex two-way audio over HTTP (feature "talk", see TESTPLAN-talk.md).
  *
  * Served by the camera HTTP server on port 8080 (cam_http_client_task in app_main.c calls

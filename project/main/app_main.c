@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* doorbell-bk7258-fw: main application: Wi-Fi, webhook reports, TCP command channel, camera HTTP server, audio engine, OTA, CLI. */
 #include "bk_private/bk_init.h"
 #include "bk_private/bk_cli.h"
 #include <components/system.h>
@@ -31,7 +33,7 @@
 #include "talk.h"         /* two-way audio over HTTP (/speak, /mic.wav) */
 #include "sdcard.h"   /* optional microSD storage (feature "sd") */
 #endif
-#ifdef DU7_AVDK   /* all cores: media_service_init() runs on CPU0/1/2 */
+#ifdef DOORBELL_AVDK   /* all cores: media_service_init() runs on CPU0/1/2 */
 #include "media_service.h"
 #if (CONFIG_SYS_CPU0)   /* the multimedia component (media_app) is only linked into the CPU0 image */
 #include "media_app.h"
@@ -66,7 +68,7 @@ void db_reply(const char *fmt, ...)
 	REPLY("%s", buf);
 }
 
-#define FW_VERSION "0.24.0"
+#define FW_VERSION "0.24.1"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -316,9 +318,10 @@ static void cli_adc_read_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc,
 #define KV_SSID "db_ssid"
 #define KV_PASS "db_pass"
 #define KV_HOOK "db_hook"   /* "host:port/path" */
-#define HOOK_DEFAULT "192.168.2.80:8123/api/webhook/doorbell_bk7258_9f3c"
+#define HOOK_DEFAULT ""   /* no webhook until `hook set HOST:PORT/PATH` (stored in KV) */
 
 static char s_ssid[WIFI_SSID_STR_LEN], s_pass[WIFI_PASSWORD_LEN], s_hook[128];
+static bool s_hook_unset_logged;   /* "hook not set" is logged once per boot, not per report */
 static volatile bool s_got_ip, s_pend_motion, s_pend_ring, s_pend_boot, s_pend_test;
 static volatile bool s_pend_fx;
 static uint32_t s_dark_mv = 1000;     /* light sensor mV ABOVE this = dark (LDR pulls up in the dark; stock threshold ~2000/4095 raw) */
@@ -331,7 +334,7 @@ static uint32_t s_light_chan = 14;   /* LDR on GPIO 12 = ADC14 (stock), powered 
 #define WHITE_LIGHT_MS 30000
 static void ringfx_start(void);
 static uint32_t light_read_mv(void);
-#if defined(DU7_AVDK) && (CONFIG_SYS_CPU0)
+#if defined(DOORBELL_AVDK) && (CONFIG_SYS_CPU0)
 static bool s_cam_open;   /* camera state, used by the light reading too */
 #endif
 
@@ -457,6 +460,13 @@ static int report_ex(const char *event, const char *extra)
 
 	if (!s_got_ip)
 		return -ENOTCONN;
+	if (!s_hook[0]) {   /* no target configured: skip the POST, say so once */
+		if (!s_hook_unset_logged) {
+			s_hook_unset_logged = true;
+			os_printf("[hook] %s skipped: hook not set (hook set HOST:PORT/PATH)\r\n", event);
+		}
+		return -ENOENT;
+	}
 	power_json(pwr, sizeof(pwr));   /* ,"batt_mv":..,"batt_pct":..,"usb":..,"charging":.. */
 	snprintf(json, sizeof(json),
 		 "{\"event\":\"%s\",\"fw\":\"" FW_VERSION "\",\"ip\":\"%s\",\"mv\":%u,\"light_mv\":%u,"
@@ -663,7 +673,7 @@ static void cli_hook_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, cha
 		s_motion_count++;
 		s_pend_motion = true;
 	}
-	REPLY("[hook] %s  (hook set HOST:PORT/PATH | test | ring | motion)\r\n", s_hook);
+	REPLY("[hook] %s  (hook set HOST:PORT/PATH | test | ring | motion)\r\n", s_hook[0] ? s_hook : "not set");
 }
 
 /* ---- PIR (pir.c): settings + simulated motion edge; the text comes back here for REPLY ---- */
@@ -705,7 +715,7 @@ static uint32_t s_dac_rate = AUDIO_RATE, s_adc_rate = AUDIO_RATE;
 static aud_clk_t s_dac_clk = AUD_CLK_XTAL, s_adc_clk = AUD_CLK_APLL;   /* SDK defaults; both measured off (DAC 3x, ADC 2x) */   /* configured rates; the hardware may run at another (measure!) */
 
 /* ---- network audio (test rig): mic -> TCP as raw 32-bit FIFO words, TCP -> speaker as s16le 8 kHz mono.
- * The peer is a plain TCP listener (tools/audio_relay.py on du7); the device always connects out. */
+ * The peer is a plain TCP listener (tools/audio_relay.py on a LAN host); the device always connects out. */
 static char s_net_host[32];
 static uint16_t s_net_port, s_spk_net_port;
 static uint32_t s_net_ms;
@@ -1424,7 +1434,7 @@ static void tcp_cmd_task(beken_thread_arg_t arg)
 	}
 }
 
-#if defined(DU7_AVDK) && (CONFIG_SYS_CPU0)
+#if defined(DOORBELL_AVDK) && (CONFIG_SYS_CPU0)
 /* ---- camera (AVDK build only): DVP sensor -> hardware JPEG on CPU1, frames delivered here by the
  * media transfer task; we keep the latest JPEG in PSRAM and can push it to a TCP peer ---- */
 /* CPU1 never emits a JPEG larger than its own frame buffer (CONFIG_JPEG_FRAME_SIZE = 150 KB). The
@@ -2245,7 +2255,7 @@ static void cli_rtsp_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, cha
 		      rtsp_running() ? "running" : "stopped", s_rtsp_port, s_h264_imb, s_h264_pmb, s_cam_pref);
 	}
 }
-#endif /* DU7_AVDK */
+#endif /* DOORBELL_AVDK */
 
 /* ---- LEDs (found 2026-10-03 with the Mac camera): GPIO 44 = white fill LED, GPIO 45 = the four blue
  * button-ring LEDs (night locator light), both active high. The IR LED above the camera is still unmapped. ---- */
@@ -2315,7 +2325,7 @@ static volatile bool s_fx_running;
 static uint32_t light_read_mv(void)
 {
 	uint32_t mv;
-#if defined(DU7_AVDK) && (CONFIG_SYS_CPU0)
+#if defined(DOORBELL_AVDK) && (CONFIG_SYS_CPU0)
 	bool cam = s_cam_open;   /* camera open = GPIO 28 already high and must stay high */
 #else
 	bool cam = false;
@@ -2416,7 +2426,7 @@ bool app_power_busy(void)
 {
 	bool busy = s_spk_busy || s_mic_busy || s_fx_running || ota_thread != NULL;
 
-#if defined(DU7_AVDK)
+#if defined(DOORBELL_AVDK)
 	busy = busy || s_cam_http_clients > 0;   /* a snapshot or MJPEG stream client (HA) */
 #endif
 	if (s_got_ip && (s_pend_boot || s_pend_ring || s_pend_motion || s_pend_test || s_pend_fx))
@@ -2435,7 +2445,7 @@ void app_power_prepare_sleep(void)
 	bk_gpio_set_output_low(PIN_LED_WHITE);
 	pin_configure(PIN_LED_RING, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
 	bk_gpio_set_output_low(PIN_LED_RING);
-#if defined(DU7_AVDK)
+#if defined(DOORBELL_AVDK)
 	if (s_cam_open) {
 		/* through the camera owner's lock so an RTSP acquire in flight cannot reopen it half-way */
 		rtos_lock_mutex(&s_cam_ctl);
@@ -2499,7 +2509,7 @@ static const struct cli_command s_doorbell_commands[] = {
 	{"pwr", "pwr status | sleep on|off | idle S | wake_pir on|off | snap_min M | sleepnow (battery, charger, deep sleep)", cli_pwr_cmd},
 	{"sd", "sd status | mount | umount | format | ls [DIR] | save [EVENT] | auto on|off (microSD)", cli_sd_cmd},
 #endif
-#if defined(DU7_AVDK) && (CONFIG_SYS_CPU0)
+#if defined(DOORBELL_AVDK) && (CONFIG_SYS_CPU0)
 	{"cam", "cam open [W H] [h264] | close | stat | mode auto|jpeg|h264 | snap HOST PORT (AVDK build)", cli_cam_cmd},
 	{"rtsp", "rtsp on|off | status | port N | q IMB PMB | idr (H.264 live stream rtsp://IP:554/live)", cli_rtsp_cmd},
 #endif
@@ -2538,7 +2548,7 @@ void user_app_main(void)
 	pa_set(0);   /* amplifier enable floats at boot and half-turns the speaker on: park it low */
 	pin_configure(9, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);   /* sensor rail: light sensor (ADC10) reads ~25 mV dead without it */
 	bk_gpio_set_output_high(9);
-#if defined(DU7_AVDK)
+#if defined(DOORBELL_AVDK)
 	{
 		beken_thread_t http;
 		char v[24], *e;
@@ -2587,7 +2597,7 @@ void user_app_main(void)
 			.fw_version = FW_VERSION,
 			.ip = s_ip,
 			.got_ip = &s_got_ip,
-#if defined(DU7_AVDK)
+#if defined(DOORBELL_AVDK)
 			.cam_open = &s_cam_open,
 #else
 			.cam_open = NULL,
@@ -2612,7 +2622,7 @@ void user_app_main(void)
 				   tcp_cmd_task, 4096, NULL);
 	else
 		os_printf("[tcp] disabled (no token: `tok set SECRET`)\r\n");
-	os_printf("[cfg] ssid '%s' hook %s\r\n", s_ssid, s_hook);
+	os_printf("[cfg] ssid '%s' hook %s\r\n", s_ssid, s_hook[0] ? s_hook : "not set");
 	if (s_ssid[0])
 		wifi_connect();
 	else
@@ -2629,7 +2639,7 @@ int main(void)
 	rtos_set_user_app_entry((beken_thread_function_t)user_app_main);
 #endif
 	bk_init();
-#ifdef DU7_AVDK
+#ifdef DOORBELL_AVDK
 	media_service_init();   /* CPU0: media app (mailbox client); CPU1: media major (camera/JPEG); CPU2: minor */
 #endif
 

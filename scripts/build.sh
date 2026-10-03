@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Build doorbell-bk7258-fw with Beken's armino-idk container (podman, x86-64 via Rosetta).
 # Our project is mounted over the SDK's projects/app slot so the stock build flow applies.
+# Settings (SDK, OUT, FW_DIR) come from the environment or ~/.config/doorbell-bk7258/env
+# (see scripts/env.example). This is the camera-less flavour; scripts/build-avdk.sh is the
+# one the device runs.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)
+. "$HERE/scripts/env.sh"
 SDK=${SDK:-$HOME/reps/oss/bk_idk}
 OUT=${OUT:-$HOME/data/bk_idk-build}
 FW_DIR=${FW_DIR:-$HOME/data/doorbell-bk7258/firmware}

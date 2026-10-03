@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* doorbell-bk7258-fw: half-duplex two-way audio over HTTP (/speak, /mic.wav, /talk). */
 /* talk.c — half-duplex two-way audio over HTTP for the doorbell (feature "talk").
  *
  * Runs inside the camera HTTP server's per-client thread (4 KB stack: every buffer here is on the
@@ -898,7 +900,7 @@ static const char s_talk_page[] =
 	"<p><button onclick=\"go('/speak?tone=1000&ms=500')\">tone 1 kHz</button> "
 	"<button onclick=\"go('/speak?tone=440&ms=1500')\">tone 440 Hz</button></p>"
 	"<p>Play a WAV/raw file: <input type=file id=f> <button onclick=\"send()\">send</button></p>"
-	"<p>Fetch and play: <input id=u size=50 value='http://192.168.2.80:8123/local/doorbell/say.wav'> "
+	"<p>Fetch and play: <input id=u size=50 value='' placeholder='http://<ha-ip>:8123/local/doorbell/say.wav'> "
 	"<button onclick=\"go('/speak?url='+encodeURIComponent(u.value))\">play url</button></p>"
 	"<pre id=o></pre><script>"
 	"function show(r){r.text().then(t=>o.textContent=r.status+' '+t)}"

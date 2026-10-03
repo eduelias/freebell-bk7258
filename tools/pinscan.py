@@ -10,8 +10,9 @@ Modes:
 Pins never touched (see README): 0 (ATE strap), 10/11 (UART0 console), 12/13 (UART0 flow
 control), 22-27 (QSPI0), 27/29-39 (camera DVP). Use --allow N to override for one pin.
 """
-import argparse, glob, re, sys, time
+import argparse, re, sys, time
 import serial
+import dbenv
 
 NUM_GPIO = 56
 EXCLUDE = {0, 10, 11, 12, 13, 22, 23, 24, 25, 26, 27} | set(range(29, 40))
@@ -20,8 +21,7 @@ RE_IN = re.compile(r"gpio input value is\s*([0-9a-fA-F]+)")
 
 class Shell:
     def __init__(self, port=None, baud=115200):
-        port = port or glob.glob("/dev/cu.usbserial-*")[0]
-        self.s = serial.Serial(port, baud, timeout=0.05)
+        self.s = serial.Serial(dbenv.serial_port(port), baud, timeout=0.05)
         self.drain(0.3)
 
     def drain(self, sec):
@@ -66,7 +66,7 @@ def main():
     ap.add_argument("mode", choices=["scan", "diff", "watch", "blink", "pull"])
     ap.add_argument("arg", nargs="*")
     ap.add_argument("--allow", type=int, action="append", help="also touch this normally excluded pin")
-    ap.add_argument("--port")
+    ap.add_argument("--port", help="UART adapter (default: SERIAL_PORT or the first USB serial device)")
     a = ap.parse_args()
     sh = Shell(a.port)
     pins = allowed(a)

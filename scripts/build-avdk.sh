@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Build the AVDK flavour (camera-capable) of the firmware: same app sources, built in Beken's
-# bk_avdk tree (release/v2.0.1, ~/reps/oss/bk_avdk) with our bk_idk mounted as its SDK.
+# bk_avdk tree (release/v2.0.1) with our bk_idk mounted as its SDK. Settings (SDK, AVDK, OUT,
+# FW_DIR) come from the environment or ~/.config/doorbell-bk7258/env (see scripts/env.example).
+# The project is mounted as /avdk/projects/doorbell; output lands in $OUT/doorbell/...
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
+. "$HERE/scripts/env.sh"
 SDK=${SDK:-$HOME/reps/oss/bk_idk}
 AVDK=${AVDK:-$HOME/reps/oss/bk_avdk}
 OUT=${OUT:-$HOME/data/doorbell-bk7258/avdk-build}
@@ -30,14 +33,14 @@ start=$(date +%s)
 podman run --platform linux/amd64 --rm \
 	-v "$AVDK":/avdk \
 	-v "$SDK":/avdk/bk_idk \
-	-v "$HERE/project-avdk":/avdk/projects/du7 \
-	-v "$HERE/project/main":/avdk/projects/du7/shared \
+	-v "$HERE/project-avdk":/avdk/projects/doorbell \
+	-v "$HERE/project/main":/avdk/projects/doorbell/shared \
 	-v "$OUT":/avdk/build \
 	-w /avdk -u "$(id -u)" \
-	"$IMAGE" make bk7258 PROJECT=du7
+	"$IMAGE" make bk7258 PROJECT=doorbell
 echo "build took $(( $(date +%s) - start ))s"
 ver=$(sed -nE 's/^#define FW_VERSION "([^"]+)"/\1/p' "$HERE/project/main/app_main.c")
-cp "$OUT/du7/bk7258/all-app.bin" "$FW_DIR/doorbell-fw_${ver}_avdk_all-app.bin"
-cp "$OUT/du7/bk7258/encrypt/app_pack.rbl" "$FW_DIR/doorbell-fw_${ver}_app_pack.rbl"
+cp "$OUT/doorbell/bk7258/all-app.bin" "$FW_DIR/doorbell-fw_${ver}_avdk_all-app.bin"
+cp "$OUT/doorbell/bk7258/encrypt/app_pack.rbl" "$FW_DIR/doorbell-fw_${ver}_app_pack.rbl"
 ln -sf "doorbell-fw_${ver}_app_pack.rbl" "$FW_DIR/doorbell-fw_latest_app_pack.rbl"
 echo "ota image: $FW_DIR/doorbell-fw_${ver}_app_pack.rbl"

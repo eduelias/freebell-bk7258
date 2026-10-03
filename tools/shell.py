@@ -7,17 +7,28 @@
   python3 tools/shell.py -w 5 pin watch 4                # wait up to 5 s for the reply
 
 Heartbeat lines are filtered out. Use -i for an interactive session (Ctrl-C to leave).
+--port DEV picks the UART adapter (default: SERIAL_PORT or the first USB serial device).
 """
-import glob, re, sys, time
+import re, sys, time
 import serial
+import dbenv
 
 
 def main():
     args = sys.argv[1:]
-    wait = 1.0
-    if args[:1] == ["-w"]:
-        wait = float(args[1]); args = args[2:]
-    s = serial.Serial(glob.glob("/dev/cu.usbserial-*")[0], 115200, timeout=0.05)
+    wait, port, interactive = 1.0, None, False
+    while args and args[0] in ("-w", "-i", "--port") or (args and args[0].startswith("--port=")):
+        if args[0] == "-w":
+            wait = float(args[1]); args = args[2:]
+        elif args[0] == "-i":
+            interactive = True; args = args[1:]
+        elif args[0] == "--port":
+            port = args[1]; args = args[2:]
+        else:
+            port = args[0].split("=", 1)[1]; args = args[1:]
+    if not args and not interactive:
+        sys.exit(__doc__)
+    s = serial.Serial(dbenv.serial_port(port), 115200, timeout=0.05)
 
     def run(line, w):
         s.reset_input_buffer()
@@ -31,7 +42,7 @@ def main():
             if l.strip() and "] alive " not in l:
                 print(l)
 
-    if args[:1] == ["-i"]:
+    if interactive:
         print("interactive; Ctrl-C to quit")
         try:
             while True:

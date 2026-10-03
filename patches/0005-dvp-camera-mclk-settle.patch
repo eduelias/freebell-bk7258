@@ -1,0 +1,14 @@
+diff --git a/middleware/driver/camera/dvp_camera.c b/middleware/driver/camera/dvp_camera.c
+index 785e1c71..794d1fbb 100755
+--- a/middleware/driver/camera/dvp_camera.c
++++ b/middleware/driver/camera/dvp_camera.c
+@@ -1889,6 +1889,9 @@ const dvp_sensor_config_t *bk_dvp_camera_enumerate(void)
+ 
+ 	// step 3: enable mclk for i2c communicate with dvp
+ 	bk_video_dvp_mclk_enable(YUV_MODE);
++	/* doorbell-bk7258-fw: the vendor firmware waits 1 s here before probing the sensor; some sensors
++	 * need a long time after MCLK/power before their I2C answers (stock: 1000 ms) */
++	rtos_delay_milliseconds(600);
+ 
+ 	// step 4: init i2c
+ 	i2c_config.baud_rate = I2C_BAUD_RATE_100KHZ;

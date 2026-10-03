@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* doorbell-bk7258-fw: minimal RTSP/1.0 + RTP/H.264 (RFC 6184) server for the hardware encoder. */
 /* rtsp.c - minimal RTSP/1.0 + RTP/H.264 (RFC 6184) server. See rtsp.h for the overview.
  *
  * Threads:  "rtsp"  listener (select on the listening socket, 200 ms tick for housekeeping:
@@ -17,7 +19,7 @@
  * Only built for the AVDK CPU0 image (the camera lives there); empty otherwise. */
 #include <common/bk_include.h>
 
-#if defined(DU7_AVDK) && (CONFIG_SYS_CPU0)
+#if defined(DOORBELL_AVDK) && (CONFIG_SYS_CPU0)
 
 #include <os/os.h>
 #include <os/str.h>

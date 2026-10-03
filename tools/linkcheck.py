@@ -1,13 +1,21 @@
 # Beken ROM download-mode probe: spam LinkCheck (01 E0 FC 01 00) at 115200,
 # watch for the ROM's reply (04 0E 05 01 E0 FC 01 00). Read-only, writes nothing to flash.
-import serial, time, glob
+#   linkcheck.py [--port DEV] [--seconds N]   (port: SERIAL_PORT or the first USB serial device)
+import argparse, serial, time
+import dbenv
+ap = argparse.ArgumentParser()
+ap.add_argument("--port", help="UART adapter")
+ap.add_argument("--seconds", type=float, default=90)
+args = ap.parse_args()
 LINK = bytes.fromhex("01e0fc0100")
 REPLY = bytes.fromhex("040e0501e0fc01")
-secs = 90
+secs = args.seconds
 s = None
 while s is None:
     try:
-        p = glob.glob("/dev/cu.usbserial-*")[0]
+        p = dbenv.serial_port(args.port, required=False)
+        if not p:
+            raise FileNotFoundError("no serial adapter (set SERIAL_PORT or pass --port)")
         s = serial.Serial(p, 115200, timeout=0)
     except Exception as e:
         print(time.strftime("%T"), "open failed, retrying:", e, flush=True); time.sleep(0.5)

@@ -1,12 +1,21 @@
-import serial, sys, time, glob
-baud, secs, out = int(sys.argv[1]), float(sys.argv[2]), sys.argv[3]
+"""Capture raw UART bytes for a while, tolerating adapter drop-outs (board resets).
+
+  serial_capture.py BAUD SECONDS OUTFILE [--port DEV]   (port: SERIAL_PORT or the first USB serial device)
+"""
+import argparse, serial, sys, time
+import dbenv
+ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+ap.add_argument("baud", type=int); ap.add_argument("seconds", type=float); ap.add_argument("out")
+ap.add_argument("--port", help="UART adapter")
+args = ap.parse_args()
+baud, secs, out = args.baud, args.seconds, args.out
 end = time.time() + secs; buf = b""; s = None
 with open(out, "ab") as f:
     while time.time() < end:
         if s is None:
-            ports = glob.glob("/dev/cu.usbserial-*")
-            if not ports: time.sleep(0.3); continue
-            try: s = serial.Serial(ports[0], baud, timeout=0.2); print(f"{time.strftime('%T')} opened {ports[0]}", flush=True)
+            port = dbenv.serial_port(args.port, required=False)
+            if not port: time.sleep(0.3); continue
+            try: s = serial.Serial(port, baud, timeout=0.2); print(f"{time.strftime('%T')} opened {port}", flush=True)
             except Exception as e: time.sleep(0.3); continue
         try: d = s.read(4096)
         except Exception as e:
