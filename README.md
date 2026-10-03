@@ -489,6 +489,36 @@ bare board "self-triggers" every ~10 s while awake - that noise is probably EMI 
 board, so a real PIR wake needs a person in front of the sensor; (4) GPIO 50 is owned by `pir.c`
 (`pir off` keeps it low), power.c only holds it high through the sleep when `wake_pir` is on.
 
+## microSD storage (v0.24, `project/main/sdcard.c`)
+
+Optional: a FAT32/exFAT microSD card in the slot gets a JPEG per ring and motion
+(`/doorbell/YYYYMMDD-HHMMSS-<event>.jpg`, local time once SNTP has synced, `up<uptime>-...` before).
+SD host = the BK7258 SDIO host, 1-bit, **GPIO 2 = CLK, 3 = CMD, 4 = DAT0** (SDK default pin group,
+shared with the stock SDK build), card power **GPIO 6 active high** (stock `ty_app_sdcard.c`; also a
+camera LDO enable, so `cam_power(0)` leaves it high while a card is present). FatFs volume `1:`.
+One low-priority worker owns the card; ring/motion only enqueue a job (never block). The SDK's own
+power-GPIO helper is disabled (`CONFIG_SDCARD_POWER_GPIO_CTRL=n`: it would drive GPIO 13 and power the
+card down from a 10 s idle timer). Without a card the only activity is one probe 8 s after boot and
+every 10 min (a few CMD0 timeouts, ~100 ms).
+
+| Command | What it does | KV, default |
+|---|---|---|
+| `sd` / `sd status` | card present/mounted, capacity/free MB, auto, saved/fail/drop counts, last file; pins, power pin, time + source, NTP stats, BUSY, last worker result | |
+| `sd mount` / `sd umount [off]` | mount (power pin high, SDIO pins, `bk_sd_card_init`, `f_mount`, mkdir `/doorbell`) / unmount; `off` also lowers the power pin | |
+| `sd save [EVENT]` | write the latest camera JPEG (opens the camera on demand) as `/doorbell/<stamp>-EVENT.jpg` | |
+| `sd ls [DIR] [SKIP]` | list `1:/doorbell` (or DIR relative to `1:/`), 6 entries per reply, `SKIP` pages | |
+| `sd format` | prints a token; `sd format TOKEN` within 120 s runs `f_mkfs` (FAT32 <= 32 GB, exFAT above) in the background, then remounts | |
+| `sd auto on\|off` | auto-save on ring and motion (also remounts at most once a minute when a card appears) | `db_sd_auto`, on |
+| `sd pwr PIN\|none` / `sd pins 1\|0` | card power GPIO / SDIO pin group (1 = GPIO 2/3/4, 0 = GPIO 14/15/16); apply at the next mount | `db_sd_pwr` 6, `db_sd_pins` 1 |
+| `sd power on\|off` | drive the power pin directly (diagnostic) | |
+| `sd ntp HOST` / `sd sync` | SNTP server (UDP/123, needs DNS for names) / query now | `db_sd_ntp`, pool.ntp.org |
+| `sd tz MIN` / `sd time EPOCH` | minutes east of UTC for names and FAT timestamps (Amsterdam 120/60) / set the clock by hand | `db_sd_tz`, 0 |
+
+`ring test` queues an SD snapshot like a real press. FAT timestamps are real thanks to SDK patch
+`0008` (the SDK's fixed-2017 `get_fattime()` becomes weak). No HTTP listing of the card yet
+(follow-up: a `/sd/` endpoint on :8080) and no `sd` field in the report JSON. Test procedure and
+results: `TESTPLAN-sd.md`.
+
 ## SDK patches
 
 - `0001-psram-use-configured-chip-id.patch`: with no cached PSRAM id, the stock driver probes the
@@ -511,6 +541,8 @@ board, so a real PIR wake needs a person in front of the sensor; (4) GPIO 50 is 
   shared register set; on CPU1/CPU2 the stock init made those cores clear CPU0's pending edges
   (PIR, button) whenever they were up, i.e. whenever the camera was open.
 
+- `0008-fatfs-weak-get-fattime.patch`: `components/fatfs/ff.c` returns a fixed 2017-05-01 for every
+  FAT timestamp; the patch only adds `__attribute__((weak))` so `sdcard.c` can supply the SNTP time.
 ## Status
 
 - [x] Stock flash backed up and verified; read-only and write tools
