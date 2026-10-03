@@ -368,6 +368,56 @@ Measured with the Mac as ear/voice on 2026-10-03 (`tools/mac_ear.py`, `tools/mic
   microphone permission), `afplay` plays tones/markers; `tools/mac_ear.py rec.wav --labels ...`
   analyses a recording that has a 500 Hz marker beep before every test.
 
+## Two-way audio over HTTP (v0.23, `project/main/talk.c`)
+
+Half-duplex intercom on the camera HTTP server (port 8080). Nothing runs until a request arrives;
+the DAC/ADC engine from the Audio section is shared with `spk`/`mic`/the ring chime through the
+same `s_spk_busy`/`s_mic_busy` exclusion (`aud_engine.h`).
+
+| Route | What |
+|---|---|
+| `POST /speak` | body = raw s16le mono 8 kHz **or** a PCM 16-bit WAV (1-2 ch, any rate >= 8 kHz; 16/44.1/48 kHz are box-average resampled on the device, left channel of stereo). Content-Length or chunked. Replies **after playback**: `{"ok":true,"source":"post","ms":4239,"in_rate":16000,"underruns":0}`; 415 for 8-bit/non-PCM input. |
+| `GET /speak?tone=HZ&ms=MS` | test tone (-12 dBFS) |
+| `GET /speak?url=http://IP[:port]/file.wav` | the device fetches and plays the file (IPv4 literal, plain http; the Home Assistant path: HA serves `/config/www/doorbell/*.wav` at `/local/doorbell/`). 502 `fetch failed` on a 404. |
+| `GET /mic.wav[?seconds=N]` | 16 kHz mono s16le WAV from the mic: live (chunked, or until-close for HTTP/1.0) until the client disconnects, or N seconds with an exact Content-Length (N <= 600). The first 200 ms are silence (ADC start transient). |
+| `GET /talk` | tiny browser page: listen, tone buttons, upload a WAV, play a URL |
+
+Half duplex: while anything plays on the speaker (talk, chime, `spk`) `/mic.wav` emits silence,
+so a listener never hears the speaker (no feedback). One speaker user and one mic listener at a
+time, a second gets **503** (`speaker busy` / `microphone busy`); a `/speak` during the ring chime
+gets 503 and the chime is skipped during a `/speak`. `/speak` replies only when playback ends, so
+HTTP clients need a timeout >= the clip length. `/snapshot.jpg`, `/stream` and RTSP keep working
+alongside (one HTTP client slot per audio stream; the client thread stack is 6 KB).
+
+| Command | Default | Meaning |
+|---|---|---|
+| `talk status` | | state idle/speaking/listening, call counters, bytes, last HTTP status, settings |
+| `talk gain N\|auto` | `auto` (= `spk cfg gain`, 0x1c) | DAC gain for `/speak` only (KV `db_talk_gain`); above 0x1c the amplifier clips |
+| `talk micgain N` | `0x3f` | ADC gain for `/mic.wav` (KV `db_talk_micgain`); 0 = follow `mic cfg gain` |
+| `talk max S` | `30` (1..120) | max seconds per `/speak`, the rest of the body is discarded (KV `db_talk_max`) |
+| `talk stop` | | abort the running `/speak` and `/mic.wav` (`spk stop` also aborts a `/speak`) |
+
+Verified on the device 2026-10-03 (v0.23.0/0.23.1, Mac microphone as the ear, du7 as a
+listener): tone = clean 1 kHz with no amp click (DAC starts on zeros, PA 20 ms later, off before
+the DAC stops); 16 k/8 k raw/chunked/48 k-stereo POSTs all play 4239 ms for a 4.24 s clip with 0
+underruns and the right pitch (a 1200..3500 Hz tone ladder came out identical at all three
+rates); `url=` from HA 200/502; `/mic.wav?seconds=5` = exactly 5.000 s at 16 kHz, 1 kHz test tone
+pure, floor rms ~50; the stream is zeros while the device's own tone plays; both 503s; `talk stop`
+ends a 10.5 s POST in 4.3 s with a 200; `talk max 3` truncates to `ms:3000`; settings survive a
+reboot; snapshot 200 in 80 ms during a stream + tone. Quality is speech grade (mono, box-average
+resampling). Heap 111 KB idle on 0.23.1.
+
+Home Assistant (applied 2026-10-03 in `/config/packages/doorbell_bk7258.yaml`, exact YAML and
+the helper in `TESTPLAN-talk.md`): `rest_command.doorbell_speak_url` (GET `/speak?url=`, timeout
+60), `rest_command.doorbell_tone`, `shell_command.doorbell_tts_wav` (`/config/doorbell_tts_wav.py`:
+`POST /api/tts_get_url` with `tts.google_translate_en_com` and a long-lived token in
+`/config/.doorbell_ha_token`, then the core container's ffmpeg -> 16 kHz mono WAV under
+`/config/www/doorbell/`), `script.doorbell_say` (`message`, `lang`: TTS -> `say.wav` -> device
+pulls it) and `script.doorbell_play` (`file` under `/config/www/doorbell/`). `shell_command`
+needs a core restart the first time (no reload service); scripts/rest commands reload. Listening
+from HA: `http://192.168.2.89:8080/mic.wav` in VLC/ffplay, or an iframe card on `/talk` (the camera
+entity has no audio).
+
 ## Night light, ring indicator, amp pop (v0.19, `project/main/night.c`)
 
 - **White LED (GPIO 44) arbiter**: the LED is on while any source holds it: `CAM` (camera open and

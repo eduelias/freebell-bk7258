@@ -1,4 +1,4 @@
-# TESTPLAN — talk: two-way audio over HTTP (branch `feat/talk`, fw 0.19.0-talk)
+# TESTPLAN — talk: two-way audio over HTTP (branch `feat/talk`, integrated as fw 0.23.0 / 0.23.1)
 
 Half-duplex intercom on the existing camera HTTP server (port 8080). New file
 `project/main/talk.c` (+ `talk.h`, `aud_engine.h`); hooks in `app_main.c`: an engine API block
@@ -279,3 +279,26 @@ Optional: add buttons to the mobile dashboard:
   cases: 8/16/44.1/48 kHz WAVs, stereo, LIST chunks, raw, chunked uploads, 100-continue, 415,
   max truncation, tone, finite/infinite/HTTP-1.0 mic, half-duplex mute, busy 503 both ways, url
   200/404, 431. Not yet run on the device (rule: no device state changes from this branch).
+
+## Results 2026-10-03 (integrator, device at 192.168.2.89, fw 0.23.0 then 0.23.1)
+
+Merge `feat/talk` -> main as v0.23.0 (6ccbeed; conflicts in both CMakeLists, includes, FW_VERSION,
+the HTTP hook ahead of `cam_want_jpeg()`, 6 KB client stack + `power_activity()`), build 99 s clean,
+OTA 21:43:46 -> back ~21:44:30. UART0 was dead all along (FTDI replays a frozen buffer), so UART
+lines were not checked; everything below is HTTP/`talk status`/Mac-mic/du7 evidence.
+
+| Step | Result |
+|---|---|
+| 0 pre-flight | `talk status` idle, gain auto=0x1c micgain 0x3f max 30 s; index answers once the camera is open |
+| 1 tone | `{"ok":true,"ms":700,"dma_frames":13,"underruns":0}` in 0.97 s; Mac recording: both bursts a clean 991-1000 Hz dominant, silence floor rms 6, no transient at PA on/off |
+| 2 POST | 16 k WAV, 8 k raw, chunked 16 k, 48 k stereo: all `ms 4239` for the 4.24 s clip, 0 underruns, `in_rate` right; u8 WAV -> 415 with the hint. Pitch check: a 400..3500 Hz tone ladder POSTed at 16 k mono / 48 k stereo / 8 k came out identical (1195, 1600, 2006, 2389, 3001, 3513 Hz in order; the bare speaker + Mac mic lose the 400/800 steps) |
+| 2 limit / busy / abort | `talk max 3` + 10.5 s clip -> `ms:3000` (3.2 s); tone during a POST -> 503 `speaker busy`; `talk stop` 3 s into a 10.5 s POST -> POST 200 after 4.3 s |
+| 3 url | `/speak?url=http://192.168.2.80:8123/local/doorbell/test_hello.wav` -> 200 `ms 4239 in_rate 16000`; missing file -> 502 `fetch failed` in 27 ms |
+| 4 mic | `?seconds=5`: 160044 B, pcm_s16le 16000 Hz mono, exactly 5.000 s; a 1 kHz tone from the Mac is the dominant in every 250 ms bin, floor rms ~50, DC ~650. **Found**: the first ~170 ms were a full-scale pop (60 ms at +32767, then a DC settle) -> v0.23.1 sends the first 200 ms as silence (f4e7326); verified: 0-200 ms all zero, then a ~100-peak tail. Live: ffmpeg client 4 s of the chunked stream OK, HTTP/1.0 (`curl -0`) OK, `talk status` idle right after the client leaves; second listener -> 503 `microphone busy` |
+| 5 half duplex | du7 `curl` listener for 16 s: the Mac's 1 kHz tone is heard (8.75-13.0 s of stream), then pure zeros while the device played its own 2 s tone; no echo of the device tone in the stream |
+| 6 camera | snapshot 200 (34 KB) in 79 ms during the listener + tone; after everything RTSP `ffprobe` h264 1280x720 and snapshot still fine |
+| 7 persist | gain 0x18 / micgain 0x30 / max 20 survived the 0.23.1 OTA reboot; restored to auto / 0x3f / 30 |
+| HA | package appended (backup `.bak-20261003-talk`), `doorbell_tts_wav.py` + token file installed, `ha core check` OK, rest_command/script reload OK, `shell_command` has no reload service -> `ha core restart` (API back < 10 s). `shell_command.doorbell_tts_wav` with `return_response`: `say.wav 162894 B` = 16 kHz mono 5.09 s; `script.doorbell_say` 200 in 3.2 s, `rest_command.doorbell_tone` 200, `script.doorbell_play test_hello.wav` 200 in 4.5 s; the device counted the three `/speak` calls |
+
+Not done: listening by a human ear (quality judgement), the ring-button interplay (needs a press),
+UART log lines. Heap 115.5 KB (0.22.3) -> 111 KB (0.23.1) idle.
