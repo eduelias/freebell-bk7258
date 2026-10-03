@@ -24,10 +24,11 @@
 #include <driver/aud_dac_types.h>
 #include <driver/aud_adc_types.h>
 #include <driver/flash.h>
+#include <driver/dma.h>
 #endif
 
 #define FW_NAME "doorbell-bk7258-fw"
-#define FW_VERSION "0.12.0"
+#define FW_VERSION "0.13.3"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -570,11 +571,13 @@ static uint32_t s_spk_hz, s_spk_ms, s_spk_addr, s_spk_len;
 static int s_pa_pin = 46;   /* speaker amplifier enable, active high (found by sweep 2026-10-03) */
 static aud_dac_chl_t s_dac_chl = AUD_DAC_CHL_L;
 static aud_dac_work_mode_t s_dac_mode = AUD_DAC_WORK_MODE_DIFFEN;
-static uint16_t s_dac_gain = 0x2D;
+static uint16_t s_dac_gain = 0x1c;   /* 0x2d = 0 dB clips the amplifier hard; 0x1c is the loudest clean level measured 2026-10-03 */
 static aud_adc_chl_t s_adc_chl = AUD_ADC_CHL_L;
 static aud_adc_mode_t s_adc_mode = AUD_ADC_MODE_DIFFEN;
 static aud_mic_id_t s_mic_id = AUD_MIC_MIC1;
 static uint32_t s_adc_gain = 0x2d;
+static uint32_t s_dac_rate = AUDIO_RATE, s_adc_rate = AUDIO_RATE;
+static aud_clk_t s_dac_clk = AUD_CLK_XTAL, s_adc_clk = AUD_CLK_APLL;   /* SDK defaults; both measured off (DAC 3x, ADC 2x) */   /* configured rates; the hardware may run at another (measure!) */
 
 /* ---- network audio (test rig): mic -> TCP as raw 32-bit FIFO words, TCP -> speaker as s16le 8 kHz mono.
  * The peer is a plain TCP listener (tools/audio_relay.py on du7); the device always connects out. */
@@ -617,14 +620,148 @@ static void pa_set(int on)
 static const int16_t s_sine32[32] = {0,6393,12539,18204,23170,27245,30273,32137,32767,32137,30273,27245,23170,
 	18204,12539,6393,0,-6393,-12539,-18204,-23170,-27245,-30273,-32137,-32767,-32137,-30273,-27245,-23170,-18204,-12539,-6393};
 
-static void dac_push(int16_t sample)
-{
-	uint32_t st, w = ((uint32_t)(uint16_t)sample << 16) | (uint16_t)sample;   /* R | L, same value */
+/* ---- DMA audio engine (v0.13.0): the DAC and ADC FIFOs are served by DMA in repeat mode over a
+ * double buffer (2 x AUD_FRAME); the finish interrupt fires per half. Threads only touch the byte
+ * rings s_spk_ring / s_mic_ring, so Wi-Fi preemption no longer glitches the audio. ---- */
+#define AUD_FRAME 1024                 /* bytes per DMA half: 512 s16 samples = 64 ms at 8 kHz */
+#define SPK_RING (16 * 1024)
+#define MIC_RING (32 * 1024)
+static uint8_t *s_dac_dma_buf, *s_adc_dma_buf;
+static dma_id_t s_dac_dma = DMA_ID_MAX, s_adc_dma = DMA_ID_MAX;
+static uint8_t s_spk_ring[SPK_RING], s_mic_ring[MIC_RING];
+static volatile uint32_t s_spk_w, s_spk_r, s_mic_w, s_mic_r;   /* monotonic byte indices */
+static volatile uint32_t s_dac_half, s_adc_half, s_spk_underrun, s_mic_overrun, s_adc_frames, s_dac_frames;
+static volatile bool s_spk_feeding;
 
-	do {
-		bk_aud_dac_get_status(&st);
-	} while (!(st & AUD_DACL_NEAR_EMPTY_MASK) && !s_spk_stop);
-	bk_aud_dac_write(w);
+static void ring_copy_out(uint8_t *dst, const uint8_t *ring, uint32_t size, uint32_t idx, uint32_t n)
+{
+	uint32_t first = size - idx < n ? size - idx : n;
+	os_memcpy(dst, ring + idx, first);
+	if (n > first)
+		os_memcpy(dst + first, ring, n - first);
+}
+
+static void ring_copy_in(uint8_t *ring, uint32_t size, uint32_t idx, const uint8_t *src, uint32_t n)
+{
+	uint32_t first = size - idx < n ? size - idx : n;
+	os_memcpy(ring + idx, src, first);
+	if (n > first)
+		os_memcpy(ring, src + first, n - first);
+}
+
+static void dac_fill_half(uint32_t half)
+{
+	uint8_t *dst = s_dac_dma_buf + half * AUD_FRAME;
+	uint32_t avail = s_spk_w - s_spk_r, n = avail < AUD_FRAME ? avail : AUD_FRAME;
+
+	ring_copy_out(dst, s_spk_ring, SPK_RING, s_spk_r % SPK_RING, n);
+	s_spk_r += n;
+	if (n < AUD_FRAME) {
+		os_memset(dst + n, 0, AUD_FRAME - n);
+		if (s_spk_feeding)
+			s_spk_underrun++;
+	}
+}
+
+static void dac_dma_isr(dma_id_t id)
+{
+	dac_fill_half(s_dac_half);   /* the half the DMA just finished reading */
+	s_dac_half ^= 1;
+	s_dac_frames++;
+}
+
+static void adc_dma_isr(dma_id_t id)
+{
+	const uint8_t *src = s_adc_dma_buf + s_adc_half * AUD_FRAME;
+
+	if (MIC_RING - (s_mic_w - s_mic_r) >= AUD_FRAME) {
+		ring_copy_in(s_mic_ring, MIC_RING, s_mic_w % MIC_RING, src, AUD_FRAME);
+		s_mic_w += AUD_FRAME;
+	} else {
+		s_mic_overrun++;
+	}
+	s_adc_half ^= 1;
+	s_adc_frames++;
+}
+
+static void dma_port(dma_port_config_t *pc, dma_dev_t dev, dma_data_width_t w, uint32_t start, uint32_t end)
+{
+	pc->dev = dev;
+	pc->width = w;
+	pc->addr_inc_en = DMA_ADDR_INC_ENABLE;
+	pc->addr_loop_en = DMA_ADDR_LOOP_ENABLE;
+	pc->start_addr = start;
+	pc->end_addr = end;
+}
+
+/* dir 0 = DAC (memory -> DAC FIFO, 16-bit mono writes), 1 = ADC (ADC FIFO -> memory, 32-bit words) */
+static int aud_dma_start(int dir)
+{
+	dma_config_t c = {0};
+	uint32_t fifo;
+	uint8_t **buf = dir ? &s_adc_dma_buf : &s_dac_dma_buf;
+	dma_id_t *id = dir ? &s_adc_dma : &s_dac_dma;
+
+	if (!*buf)
+		*buf = os_malloc(2 * AUD_FRAME);
+	if (!*buf)
+		return -1;
+	bk_dma_driver_init();
+	*id = bk_dma_alloc(DMA_DEV_AUDIO);
+	if (*id >= DMA_ID_MAX)
+		return -2;
+	c.mode = DMA_WORK_MODE_REPEAT;
+	c.chan_prio = 1;
+	c.trans_type = DMA_TRANS_DEFAULT;
+	if (dir) {
+		bk_aud_adc_get_fifo_addr(&fifo);
+		dma_port(&c.src, DMA_DEV_AUDIO_RX, DMA_DATA_WIDTH_32BITS, fifo, fifo + 4);
+		dma_port(&c.dst, DMA_DEV_DTCM, DMA_DATA_WIDTH_32BITS, (uint32_t)*buf, (uint32_t)*buf + 2 * AUD_FRAME);
+	} else {
+		bk_aud_dac_get_fifo_addr(&fifo);
+		dma_port(&c.src, DMA_DEV_DTCM, DMA_DATA_WIDTH_32BITS, (uint32_t)*buf, (uint32_t)*buf + 2 * AUD_FRAME);
+		dma_port(&c.dst, DMA_DEV_AUDIO, DMA_DATA_WIDTH_16BITS, fifo, fifo + 2);
+	}
+	if (bk_dma_init(*id, &c) != BK_OK)
+		return -3;
+	bk_dma_set_transfer_len(*id, AUD_FRAME);
+#if (CONFIG_SPE)
+	bk_dma_set_dest_sec_attr(*id, DMA_ATTR_SEC);
+	bk_dma_set_src_sec_attr(*id, DMA_ATTR_SEC);
+#endif
+	bk_dma_register_isr(*id, NULL, dir ? adc_dma_isr : dac_dma_isr);
+	bk_dma_enable_finish_interrupt(*id);
+	return bk_dma_start(*id) == BK_OK ? 0 : -4;
+}
+
+static void aud_dma_stop(int dir)
+{
+	dma_id_t *id = dir ? &s_adc_dma : &s_dac_dma;
+
+	if (*id < DMA_ID_MAX) {
+		bk_dma_stop(*id);
+		bk_dma_disable_finish_interrupt(*id);
+		bk_dma_deinit(*id);
+		bk_dma_free(DMA_DEV_AUDIO, *id);
+		*id = DMA_ID_MAX;
+	}
+}
+
+/* producer side: append s16le bytes to the speaker ring, blocking while it is full */
+static void spk_ring_write(const uint8_t *p, uint32_t n)
+{
+	while (n && !s_spk_stop) {
+		uint32_t free = SPK_RING - (s_spk_w - s_spk_r), chunk;
+		if (!free) {
+			rtos_delay_milliseconds(5);
+			continue;
+		}
+		chunk = n < free ? n : free;
+		ring_copy_in(s_spk_ring, SPK_RING, s_spk_w % SPK_RING, p, chunk);
+		s_spk_w += chunk;
+		p += chunk;
+		n -= chunk;
+	}
 }
 
 static void spk_task(beken_thread_arg_t arg)
@@ -632,60 +769,71 @@ static void spk_task(beken_thread_arg_t arg)
 	aud_dac_config_t cfg = DEFAULT_AUD_DAC_CONFIG();
 	uint8_t buf[512];
 	uint32_t i, n, phase = 0, step, total = 0;
+	int rc;
 
-	cfg.samp_rate = AUDIO_RATE;
+	cfg.samp_rate = s_dac_rate;
+	cfg.clk_src = s_dac_clk;
 	cfg.dac_chl = s_dac_chl;
 	cfg.work_mode = s_dac_mode;
 	cfg.dac_gain = s_dac_gain;
+	s_spk_w = s_spk_r = 0;
+	s_dac_half = 0;
+	s_spk_underrun = s_dac_frames = 0;
+	s_spk_feeding = true;
+	if (bk_aud_dac_init(&cfg) != BK_OK) {
+		os_printf("[spk] dac init failed\r\n");
+		goto out;
+	}
 	pa_set(1);
-	if (bk_aud_dac_init(&cfg) != BK_OK || bk_aud_dac_start() != BK_OK) {
-		os_printf("[spk] dac init/start failed\r\n");
+	if ((rc = aud_dma_start(0)) != 0 || bk_aud_dac_start() != BK_OK) {
+		os_printf("[spk] dma/dac start failed (%d)\r\n", rc);
+		aud_dma_stop(0);
+		bk_aud_dac_deinit();
 		pa_set(0);
 		goto out;
 	}
-	if (s_spk_net_port) {   /* play s16le mono PCM streamed from a TCP peer */
-		int sock = tcp_connect(s_net_host, s_spk_net_port), r, carry = -1;
+	if (s_spk_net_port) {   /* s16le mono PCM streamed from a TCP peer */
+		int sock = tcp_connect(s_net_host, s_spk_net_port), r;
 		if (sock < 0)
 			os_printf("[spk] connect %s:%u failed\r\n", s_net_host, s_spk_net_port);
 		while (sock >= 0 && !s_spk_stop && (r = recv(sock, buf, sizeof(buf), 0)) > 0) {
-			uint32_t k = 0;
-			if (carry >= 0) {   /* odd byte left over from the previous chunk */
-				dac_push((int16_t)(carry | (buf[0] << 8)));
-				total++;
-				k = 1;
-				carry = -1;
-			}
-			for (; k + 1 < (uint32_t)r; k += 2)
-				dac_push((int16_t)(buf[k] | (buf[k + 1] << 8)));
-			if (k < (uint32_t)r)
-				carry = buf[k];
-			total += (r - (carry >= 0 ? 1 : 0)) / 2;
+			spk_ring_write(buf, r);
+			total += r / 2;
 		}
 		if (sock >= 0)
 			close(sock);
 		s_spk_net_port = 0;
-	} else if (s_spk_addr) {   /* play s16le mono PCM from flash */
+	} else if (s_spk_addr) {   /* s16le mono PCM from flash (stock chimes) */
 		for (i = 0; i < s_spk_len && !s_spk_stop; i += n) {
 			n = s_spk_len - i < sizeof(buf) ? s_spk_len - i : sizeof(buf);
 			bk_flash_read_bytes(s_spk_addr + i, buf, n);
-			for (uint32_t k = 0; k + 1 < n; k += 2)
-				dac_push((int16_t)(buf[k] | (buf[k + 1] << 8)));
+			spk_ring_write(buf, n);
 			total += n / 2;
 		}
-	} else {            /* tone: 32-step sine, 12-bit phase accumulator */
-		step = (s_spk_hz * 32u * 4096u) / AUDIO_RATE;
-		for (i = 0; i < s_spk_ms * (AUDIO_RATE / 1000) && !s_spk_stop; i++) {
-			dac_push(s_sine32[(phase >> 12) & 31] / 4);
-			phase += step;
-			total++;
+	} else {                   /* tone: 32-step sine, 12-bit phase accumulator */
+		step = (s_spk_hz * 32u * 4096u) / s_dac_rate;
+		for (i = 0; i < s_spk_ms * (s_dac_rate / 1000) && !s_spk_stop; i += n) {
+			n = 0;
+			while (n < sizeof(buf) / 2 && i + n < s_spk_ms * (s_dac_rate / 1000)) {
+				int16_t v = s_sine32[(phase >> 12) & 31] / 4;
+				buf[2 * n] = (uint8_t)v;
+				buf[2 * n + 1] = (uint8_t)(v >> 8);
+				phase += step;
+				n++;
+			}
+			spk_ring_write(buf, 2 * n);
+			total += n;
 		}
 	}
-	for (i = 0; i < 400; i++)
-		dac_push(0);   /* drain with silence before stopping */
+	s_spk_feeding = false;
+	for (i = 0; i < 100 && s_spk_w != s_spk_r && !s_spk_stop; i++)   /* let the DMA drain the ring */
+		rtos_delay_milliseconds(10);
+	rtos_delay_milliseconds(2 * AUD_FRAME / 2 * 1000 / s_dac_rate);   /* plus the two halves in flight */
+	aud_dma_stop(0);
 	bk_aud_dac_stop();
 	bk_aud_dac_deinit();
 	pa_set(0);
-	os_printf("[spk] done, %u samples\r\n", total);
+	os_printf("[spk] done, %u samples, %u dma frames, %u underruns\r\n", total, s_dac_frames, s_spk_underrun);
 out:
 	s_spk_busy = false;
 	s_spk_thread = NULL;
@@ -742,24 +890,29 @@ static void cli_spk_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 				s_dac_mode = !os_strcmp(argv[i + 1], "se") ? AUD_DAC_WORK_MODE_SIGNAL_END : AUD_DAC_WORK_MODE_DIFFEN;
 			else if (!os_strcmp(argv[i], "gain"))
 				s_dac_gain = os_strtoul(argv[i + 1], NULL, 0);
+			else if (!os_strcmp(argv[i], "rate"))
+				s_dac_rate = os_strtoul(argv[i + 1], NULL, 10);
+			else if (!os_strcmp(argv[i], "clk"))
+				s_dac_clk = !os_strcmp(argv[i + 1], "apll") ? AUD_CLK_APLL : AUD_CLK_XTAL;
 		}
-		REPLY("[spk] cfg chl %d mode %d gain 0x%x pa %d\r\n", s_dac_chl, s_dac_mode, s_dac_gain, s_pa_pin);
+		REPLY("[spk] cfg chl %d mode %d gain 0x%x rate %u clk %s pa %d\r\n", s_dac_chl, s_dac_mode, s_dac_gain, s_dac_rate, s_dac_clk == AUD_CLK_APLL ? "apll" : "xtal", s_pa_pin);
 	} else {
-		REPLY("spk tone [HZ] [MS] | play beepa|beepb|bell|ADDR LEN | net HOST PORT | stop | pa PIN|off | cfg [chl L|R|LR] [mode diff|se] [gain N]  (busy %d)\r\n", s_spk_busy);
+		REPLY("spk tone [HZ] [MS] | play beepa|beepb|bell|ADDR LEN | net HOST PORT | stop | pa PIN|off | cfg [chl L|R|LR] [mode diff|se] [gain N] [rate HZ] [clk xtal|apll]  (busy %d)\r\n", s_spk_busy);
 	}
 }
 
 static void micnet_task(beken_thread_arg_t arg)
 {
 	aud_adc_config_t cfg = DEFAULT_AUD_ADC_CONFIG();
-	uint32_t buf[256], st, n = 0, sent = 0, full = 0, t0;
-	int sock = tcp_connect(s_net_host, s_net_port);
+	uint32_t sent = 0, t0, t1 = 0, idx, n;
+	int sock = tcp_connect(s_net_host, s_net_port), rc;
 
 	if (sock < 0) {
 		os_printf("[mic] connect %s:%u failed\r\n", s_net_host, s_net_port);
 		goto out;
 	}
-	cfg.samp_rate = AUDIO_RATE;
+	cfg.samp_rate = s_adc_rate;
+	cfg.clk_src = s_adc_clk;
 	cfg.adc_chl = s_adc_chl;
 	cfg.adc_mode = s_adc_mode;
 	cfg.adc_gain = s_adc_gain;
@@ -769,35 +922,51 @@ static void micnet_task(beken_thread_arg_t arg)
 		goto out;
 	}
 	bk_aud_adc_set_mic_mode(s_mic_id, s_adc_mode);
-	if (bk_aud_adc_start() != BK_OK) {
-		os_printf("[mic] adc start failed\r\n");
+	s_mic_w = s_mic_r = 0;
+	s_adc_half = 0;
+	s_mic_overrun = s_adc_frames = 0;
+	if ((rc = aud_dma_start(1)) != 0 || bk_aud_adc_start() != BK_OK) {
+		os_printf("[mic] dma/adc start failed (%d)\r\n", rc);
+		aud_dma_stop(1);
 		bk_aud_adc_deinit();
 		close(sock);
 		goto out;
 	}
 	t0 = rtos_get_time();
-	while (rtos_get_time() - t0 < s_net_ms) {
-		bk_aud_adc_get_status(&st);
-		if (st & AUD_ADCL_FIFO_FULL_MASK)
-			full++;
-		if (st & AUD_ADCL_FIFO_EMPTY_MASK) {
-			rtos_delay_milliseconds(1);
+	for (;;) {
+		bool running = rtos_get_time() - t0 < s_net_ms;
+		if (!running && s_adc_dma < DMA_ID_MAX) {   /* time is up: stop capturing, then drain */
+			bk_aud_adc_stop();
+			aud_dma_stop(1);
+			t1 = rtos_get_time();
+		}
+		if (s_mic_w == s_mic_r) {
+			if (!running)
+				break;
+			rtos_delay_milliseconds(5);
 			continue;
 		}
-		bk_aud_adc_get_fifo_data(&buf[n++]);
-		if (n == sizeof(buf) / sizeof(buf[0])) {
-			if (send(sock, buf, sizeof(buf), 0) != (int)sizeof(buf))
-				break;
-			sent += n;
-			n = 0;
-		}
-	}
-	if (n && send(sock, buf, n * 4, 0) == (int)(n * 4))
+		idx = s_mic_r % MIC_RING;
+		n = s_mic_w - s_mic_r;
+		if (n > MIC_RING - idx)
+			n = MIC_RING - idx;
+		if (n > 4096)
+			n = 4096;
+		if (send(sock, &s_mic_ring[idx], n, 0) != (int)n)
+			break;
+		s_mic_r += n;
 		sent += n;
-	bk_aud_adc_stop();
+	}
+	if (s_adc_dma < DMA_ID_MAX) {
+		bk_aud_adc_stop();
+		aud_dma_stop(1);
+		t1 = rtos_get_time();
+	}
 	bk_aud_adc_deinit();
 	close(sock);
-	os_printf("[mic] streamed %u words to %s:%u (fifo-full seen %u times)\r\n", sent, s_net_host, s_net_port, full);
+	os_printf("[mic] streamed %u bytes to %s:%u: %u dma frames in %u ms = %u words/s, %u overruns\r\n",
+		  sent, s_net_host, s_net_port, s_adc_frames, t1 - t0,
+		  (t1 - t0) ? (uint32_t)((uint64_t)s_adc_frames * AUD_FRAME / 4 * 1000 / (t1 - t0)) : 0, s_mic_overrun);
 out:
 	s_mic_busy = false;
 	rtos_delete_thread(NULL);
@@ -824,8 +993,12 @@ static void cli_mic_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 				s_adc_gain = os_strtoul(argv[i + 1], NULL, 0);
 			else if (!os_strcmp(argv[i], "chl"))
 				s_adc_chl = !os_strcmp(argv[i + 1], "R") ? AUD_ADC_CHL_R : !os_strcmp(argv[i + 1], "LR") ? AUD_ADC_CHL_LR : AUD_ADC_CHL_L;
+			else if (!os_strcmp(argv[i], "rate"))
+				s_adc_rate = os_strtoul(argv[i + 1], NULL, 10);
+			else if (!os_strcmp(argv[i], "clk"))
+				s_adc_clk = !os_strcmp(argv[i + 1], "apll") ? AUD_CLK_APLL : AUD_CLK_XTAL;
 		}
-		REPLY("[mic] cfg mic %d mode %d gain 0x%x chl %d\r\n", s_mic_id, s_adc_mode, s_adc_gain, s_adc_chl);
+		REPLY("[mic] cfg mic %d mode %d gain 0x%x chl %d rate %u clk %s\r\n", s_mic_id, s_adc_mode, s_adc_gain, s_adc_chl, s_adc_rate, s_adc_clk == AUD_CLK_APLL ? "apll" : "xtal");
 		return;
 	}
 	if (argc >= 5 && os_strcmp(argv[1], "rec") == 0) {
@@ -844,12 +1017,13 @@ static void cli_mic_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 		return;
 	}
 	if (argc < 2 || os_strcmp(argv[1], "level") != 0) {
-		REPLY("mic rec MS HOST PORT | mic level [MS] [HZ] | cfg [mic 1|2|both] [mode diff|se] [gain N] [chl L|R|LR]\r\n");
+		REPLY("mic rec MS HOST PORT | mic level [MS] [HZ] | cfg [mic 1|2|both] [mode diff|se] [gain N] [chl L|R|LR] [rate HZ] [clk xtal|apll]\r\n");
 		return;
 	}
 	if (ms > 4000)
 		ms = 4000;
-	cfg.samp_rate = AUDIO_RATE;
+	cfg.samp_rate = s_adc_rate;
+	cfg.clk_src = s_adc_clk;
 	cfg.adc_chl = s_adc_chl;
 	cfg.adc_mode = s_adc_mode;
 	cfg.adc_gain = s_adc_gain;

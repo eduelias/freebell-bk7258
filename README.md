@@ -191,21 +191,32 @@ sessions (before that worked) are noise, except the ADC readings.
 Open: which pin is the button, the PIR, the LEDs (`pin blink` on 5/8/9 first), the chime, the
 charger status, and the power-hold line.
 
-## Audio test rig (v0.11.0+ / v0.12.0+)
+## Audio (v0.13.x: DMA engine, both directions working)
 
-- Speaker: DAC -> external amplifier, enable = **GPIO 46** (active high, parked low at boot). `spk tone`,
-  `spk play bell`, `spk cfg [chl L|R|LR] [mode diff|se] [gain N]` (gain 0x3f = loud, distorted).
-- Mic: `mic level [MS] [HZ]` prints peak/rms/dc and a Goertzel tone estimate at HZ for both 16-bit halves
-  of the ADC FIFO word; `mic cfg [chl L|R|LR] [mic 1|2|both] [mode diff|se] [gain N]`. Note the SDK only
-  powers MIC1 for `chl L` and MIC2 for `chl R`.
-- Streaming (v0.12.0): the device connects out to `tools/audio_relay.py` on du7 (the Mac firewall blocks
-  incoming connections):
-  `systemd-run --user --unit=relay-recv python3 ~/audio_relay.py recv 5100 /tmp/mic.raw` then
-  `mic rec 4000 192.168.2.68 5100` (raw 32-bit FIFO words, lo16 = L, hi16 = R);
-  `systemd-run --user --unit=relay-send python3 ~/audio_relay.py send 5101 /tmp/hello_mac_8k.raw` then
-  `spk net 192.168.2.68 5101` (s16le mono 8 kHz).
-- The Mac is the ear/voice: `ffmpeg -f avfoundation -i ":1"` records the Mac mic (must run in
-  Terminal.app for the microphone permission), `afplay` plays tones at the doorbell.
+Measured with the Mac as ear/voice on 2026-10-03 (`tools/mac_ear.py`, `tools/mic_raw.py`):
+
+- **Speaker**: DAC -> external amplifier, enable = **GPIO 46** (active high, parked low at boot).
+  DMA feeds the DAC FIFO (16-bit mono writes) from a 16 KB ring; 0 underruns. The amplifier clips
+  hard at the SDK default DAC gain (0x2d = 0 dB): a 1 kHz sine came out as 3 kHz (3rd harmonic 13x
+  the fundamental, the dangling speaker has no bass). **Default gain is now 0x1c**, the loudest level
+  that stays clean; raise with `spk cfg gain N` once the speaker is back in its enclosure.
+  Commands: `spk tone [HZ] [MS]`, `spk play beepa|beepb|bell|ADDR LEN`, `spk net HOST PORT`
+  (s16le mono 8 kHz from a TCP peer), `spk stop`, `spk pa PIN|off`,
+  `spk cfg [chl L|R|LR] [mode diff|se] [gain N] [rate HZ] [clk xtal|apll]`.
+- **Mic**: the electret capsule is MIC1 (left, lo16 of the FIFO word). Excellent: a 1 kHz tone from
+  the Mac is a pure sine (Goertzel/rms 0.71), floor rms ~90 at gain 0x3f with the amp off. The ADC
+  runs at **2x the configured rate** whatever you configure (8000 -> 16 kHz, 16000 -> 32 kHz, APLL or
+  XTAL): keep `rate 8000` and treat captures as **16 kHz**. Commands: `mic level [MS] [HZ]`
+  (peak/rms/dc + tone estimate for both halves), `mic rec MS HOST PORT` (raw 32-bit FIFO words to a
+  TCP peer, DMA, 0 overruns at 64 KB/s), `mic cfg [chl L|R|LR] [mic 1|2|both] [mode diff|se] [gain N]
+  [rate HZ] [clk xtal|apll]`. Use gain 0x3f for speech.
+- **Relay**: the device connects out; `tools/audio_relay.py` is the one-shot TCP peer, run on du7
+  (the Mac firewall blocks incoming): `systemd-run --user --unit=relay-recv python3 ~/audio_relay.py
+  recv 5100 /tmp/mic.raw` then `mic rec 4000 192.168.2.68 5100`; `... send 5101 /tmp/hello_8k.raw` then
+  `spk net 192.168.2.68 5101`. `tools/mic_raw.py cap.raw --seconds 4 --wav out.wav` exports a capture.
+- **Mac rig**: `ffmpeg -f avfoundation -i ":1"` records the Mac mic (run it in Terminal.app for the
+  microphone permission), `afplay` plays tones/markers; `tools/mac_ear.py rec.wav --labels ...`
+  analyses a recording that has a 500 Hz marker beep before every test.
 
 ## SDK patches
 
