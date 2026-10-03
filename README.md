@@ -34,6 +34,40 @@ This applies `patches/*.patch` to the SDK if needed, mounts `project/` over the 
 `projects/app`, runs `make bk7258` in `bekencorp/armino-idk:1.5`, and copies the image to
 `~/data/doorbell-bk7258/firmware/doorbell-fw_latest.bin`. A full build takes ~11 min under emulation.
 
+### Camera flavour (AVDK)
+
+The camera pipeline lives in Beken's audio/video kit, not in the bare SDK. Clone it next to the SDK
+(`git clone --depth 1 --branch release/v2.0.1 https://github.com/bekencorp/bk_avdk ~/reps/oss/bk_avdk`)
+and build with:
+
+```bash
+scripts/build-avdk.sh
+```
+
+Same app sources (`project/main`), built from `project-avdk/` inside the kit: CPU0 runs the app and
+the media client, CPU1 the camera/JPEG pipeline, CPU2 the media minor. The script copies
+`avdk-overlay/` (our OV9650 driver) into the kit and applies `patches-avdk/`. The packaging files in
+`project-avdk/config/bk7258/*.csv` mirror `vendor_flash.c`; after touching them delete
+`~/data/doorbell-bk7258/avdk-build/du7/bk7258_cp1` and `_cp2`, otherwise the CPU1 image keeps its
+old flash origin and never boots ("cp0 boot cp1 time out"). The OTA image carries all three cores.
+
+## Camera
+
+Sensor: OmniVision **OV9650** (1280x720, 15 fps) on I2C1 = GPIO 0/1 at 0x30, power GPIO 28 (active
+high), PWDN/RESET pulse on GPIO 52 (low, 100 ms high, low) before open, MCLK 24 MHz. Its register
+table was recovered from the stock firmware (`~/data/doorbell-bk7258/ov9650_init_table_stock.txt`).
+The sensor is SCCB: register reads must be write + STOP + read; the SDK's repeated-start helper
+fails on it, which is why the driver has its own `ov9650_sccb_read`.
+
+- `cam open [W H] | close | stat | snap HOST PORT | probe ...` over the shell or `tools/dbcmd.py`.
+- HTTP on port 8080 (v0.17.0): `http://192.168.2.89:8080/snapshot.jpg` and an MJPEG stream at
+  `/stream`. Both open the camera on first use (first frame after ~1 s).
+- Home Assistant: `tools/ha_generic_camera.py` (run on du7 with a long-lived token in `~/.ha_token`)
+  creates a *generic* camera entry from those two URLs.
+- First frame log on CPU1: `ov9650_detect, id: 0x9652`, `auto detect success, dvp camera name:ov9650`,
+  then ~9 fps of ~33 KB JPEGs. CPU1 info logs are compiled out (log level 2): use `BK_LOGW` to see
+  driver prints.
+
 ## Flash
 
 ```bash
@@ -186,6 +220,14 @@ sessions (before that worked) are noise, except the ADC readings.
 | 44 | **white fill LED enable (2026-10-03, camera-verified)**: high = white LED on (big flare), low/hi-Z = off | white LED, active high (`led white on`) |
 | 45 (ADC11) | **blue button-ring LEDs (2026-10-03, camera-verified, user-identified)**: high = the four blue LEDs around the button light up (night locator light), low/hi-Z = off. Not infrared: the IR LED sits above the camera lens and is still unmapped. The 2026-10-02 "kills the white LED" reading was a coincidence | ring LEDs, active high (`led ring on`) |
 | 46 | **speaker amplifier enable, confirmed 2026-10-03** (active-high; GPIO sweep with the Mac mic listening: 1 kHz tone at 108 with 46 high vs <1 for the other pins; left floating it leaks a faint output) | PA enable, firmware default `spk pa 46` |
+| 0, 1 | I2C1 SCL/SDA to the camera sensor (SDK default pins; the stock firmware uses them too) | camera I2C |
+| 28 | camera power enable, active high (stock `.data`: pin 28, level 1) | camera power |
+| 52 | sensor PWDN/RESET: stock pulses it low, 100 ms high, low before probing | camera reset |
+| 54, 55 | IR-cut filter coil (stock `tuya_dn_switch.c`: ircut1/ircut2) | IR-cut, to be exercised |
+| 44 | **IR illuminator LED** per the stock firmware ("ir led gpio") — the bright flare the Mac camera saw | IR LED, active high (`led white on` still drives it) |
+| 50, 25, 26 | PIR enable and sensitivity set0/set1 (stock `tuya_pir.c`) | PIR control |
+| 15, 19 | battery/charger status lines (stock `tuya_battery.c`; 15 is externally low) | battery |
+| 6 | SD card (stock `ty_app_sdcard.c`) | SD card |
 | 10, 11 | UART0 console | never touch |
 | others | see the latest `pinmap_session*.txt` (v0.4.0 reclaim) | |
 
