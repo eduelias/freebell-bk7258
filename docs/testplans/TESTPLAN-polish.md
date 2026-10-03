@@ -3,8 +3,8 @@
 Firmware: `project/main/night.c` + hooks in `app_main.c` (built as v0.19.0 on this branch; the
 integrator may renumber). Nothing here changes the partition table, Wi-Fi, OTA or the camera path.
 
-All commands below are `python3 tools/dbcmd.py <command>` from the repo on the Mac
-(`~/.pyenv/versions/3.11.13/bin/python3`), unless marked UART. Replies are the `REPLY()` text.
+All commands below are `python3 tools/dbcmd.py <command>` from the repo
+(Python 3.11+), unless marked UART. Replies are the `REPLY()` text.
 
 ## 0. What changed (for the reviewer)
 
@@ -43,11 +43,11 @@ Note: `light` toggles GPIO 28 for ~80 ms when the camera is closed (same as `rin
 
 ## 3. Amplifier pop
 
-Rig: Mac mic in Terminal.app (run_in_terminal), device ~30 cm from the Mac.
+Rig: laptop microphone (ffmpeg avfoundation), device ~30 cm from the laptop.
 
 ```bash
 # Terminal.app tab:
-ffmpeg -y -f avfoundation -i ':1' -t 8 -ac 1 -ar 16000 ~/data/doorbell-bk7258/audio/pop_v0190.wav
+ffmpeg -y -f avfoundation -i ':1' -t 8 -ac 1 -ar 16000 pop_v0190.wav
 # Mac, 1 s later:
 python3 tools/dbcmd.py spk play bell
 ```
@@ -67,7 +67,7 @@ PA-off, the amplifier needs its input muted earlier — try `bk_aud_dac_mute()` 
 
 ## 4. Ring indicator (Wi-Fi state)
 
-1. Watch the ring LEDs with the Mac camera (`imagesnap` loop, or by eye).
+1. Watch the ring LEDs with a camera (`imagesnap` loop, or by eye).
 2. `python3 tools/dbcmd.py night status` -> `... ring 1 ... ring manual -1 out 0 wifi 1 fx 0`.
 3. Simulate loss of Wi-Fi without touching credentials: power-cycle the access point, or on the
    device over **UART only** (the TCP channel dies with the link): `wifi connect` is harmless;

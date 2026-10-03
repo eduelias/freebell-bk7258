@@ -1,0 +1,124 @@
+# Doorbell BK7258: webhook automation. Append to automations.yaml (or paste into a new automation
+# in YAML mode). Replace <webhook-id> with your own random id, e.g.
+#   python3 -c "import secrets;print('doorbell_'+secrets.token_hex(8))"
+# and point the device at it: hook set <ha-ip>:8123/api/webhook/<webhook-id>
+# Needs: input_text.doorbell_bk7258_last_report (a Text helper, max 255), camera.doorbell_bk7258
+# (the generic camera entry) and notify.doorbell_family (packages/doorbell_bk7258.yaml).
+- id: doorbell_bk7258_webhook
+  alias: 'Doorbell BK7258: webhook events'
+  description: 'Receives JSON from the custom-firmware doorbell (local only). event: ring | motion | heartbeat | boot | wake (fans out as event doorbell_bk7258_report).'
+  triggers:
+  - trigger: webhook
+    webhook_id: "<webhook-id>"
+    allowed_methods:
+    - POST
+    local_only: true
+  conditions: []
+  actions:
+  - event: doorbell_bk7258_report
+    event_data:
+      event: "{{ trigger.json.event }}"
+      reason: "{{ trigger.json.reason | default('') }}"
+      fw: "{{ trigger.json.fw | default('') }}"
+      ip: "{{ trigger.json.ip | default('') }}"
+      uptime_s: "{{ trigger.json.uptime_s | default(0) }}"
+      light_mv: "{{ trigger.json.light_mv | default(0) }}"
+      batt_mv: "{{ trigger.json.batt_mv | default(none) }}"
+      batt_pct: "{{ trigger.json.batt_pct | default(none) }}"
+      usb: "{{ trigger.json.usb | default(none) }}"
+      charging: "{{ trigger.json.charging | default(none) }}"
+  - action: input_text.set_value
+    target:
+      entity_id: input_text.doorbell_bk7258_last_report
+    data:
+      value: '{{ (now().strftime("%H:%M:%S") ~ " " ~ (trigger.json | tojson))[:255] }}'
+  - choose:
+    - conditions:
+      - condition: template
+        value_template: '{{ trigger.json.event == "ring" }}'
+      sequence:
+      - action: persistent_notification.create
+        data:
+          notification_id: doorbell_ring
+          title: Doorbell
+          message: Ring at {{ now().strftime("%H:%M:%S") }} (battery {{ trigger.json.mv | default("?") }} mV)
+      - action: notify.doorbell_family
+        data:
+          title: Doorbell
+          message: Someone is at the door ({{ now().strftime("%H:%M") }})
+          data:
+            ttl: 0
+            priority: high
+            channel: doorbell
+            tag: doorbell_ring
+        continue_on_error: true
+      # second message with the picture, so the first push is not delayed by the camera (~2-4 s)
+      - action: camera.snapshot
+        target:
+          entity_id: camera.doorbell_bk7258
+        data:
+          filename: /config/www/doorbell/last_ring.jpg
+        continue_on_error: true
+      - action: notify.doorbell_family
+        data:
+          title: Doorbell
+          message: At the door, {{ now().strftime("%H:%M:%S") }}
+          data:
+            ttl: 0
+            priority: high
+            channel: doorbell
+            tag: doorbell_ring_photo
+            image: /local/doorbell/last_ring.jpg?v={{ now().timestamp() | int }}
+        continue_on_error: true
+    - conditions:
+      - condition: template
+        value_template: '{{ trigger.json.event == "motion" }}'
+      sequence:
+      - action: persistent_notification.create
+        data:
+          notification_id: doorbell_motion
+          title: Doorbell
+          message: Motion at {{ now().strftime("%H:%M:%S") }} (light {{ trigger.json.light_mv | default("?") }} mV, pir sens {{ trigger.json.pir_sens | default("?") }})
+      - action: camera.snapshot
+        target:
+          entity_id: camera.doorbell_bk7258
+        data:
+          filename: /config/www/doorbell/last_motion.jpg
+        continue_on_error: true
+      - action: notify.doorbell_family
+        data:
+          title: Doorbell motion
+          message: Motion at {{ now().strftime("%H:%M:%S") }}
+          data:
+            channel: doorbell_motion
+            tag: doorbell_motion
+            image: /local/doorbell/last_motion.jpg?v={{ now().timestamp() | int }}
+        continue_on_error: true
+    - conditions:
+      - condition: template
+        value_template: '{{ trigger.json.event == "boot" }}'
+      sequence:
+      - action: logbook.log
+        data:
+          name: Doorbell BK7258
+          message: booted, fw {{ trigger.json.fw | default("?") }}, ip {{ trigger.json.ip | default("?") }}
+    - conditions:
+      - condition: template
+        value_template: '{{ trigger.json.event == "wake" }}'
+      sequence:
+      - action: logbook.log
+        data:
+          name: Doorbell BK7258
+          message: woke up ({{ trigger.json.reason }}), battery {{ trigger.json.batt_pct | default("?") }} % / {{ trigger.json.batt_mv | default("?") }} mV
+      - if:
+        - condition: template
+          value_template: '{{ trigger.json.reason == "rtc" }}'
+        then:
+        - delay: "00:00:03"
+        - action: camera.snapshot
+          target:
+            entity_id: camera.doorbell_bk7258
+          data:
+            filename: /config/www/doorbell/wake_latest.jpg
+          continue_on_error: true
+  mode: queued

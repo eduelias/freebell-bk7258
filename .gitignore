@@ -1,4 +1,13 @@
 build/
 *.bin
+*.rbl
 *.log
 __pycache__/
+.pytest_cache/
+*.env
+!scripts/env.example
+.virtual_doorbell.json
+.DS_Store
+*.wav
+*.raw
+wt-*/
