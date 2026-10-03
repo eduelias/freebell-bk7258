@@ -184,11 +184,28 @@ sessions (before that worked) are noise, except the ADC readings.
 | 24 | idle low; 8 isolated high pulses of 2-4 s in 8 min at irregular intervals with nobody at the device (`pinmap_watch10/11_passive.txt`) | **PIR motion output**, active-high, 2-4 s hold (one wave in front of it will confirm) |
 | 53 | **doorbell button, confirmed 2026-10-03** (active-low, ~0.3 s presses; 46 edges / 13 `ring` posts in a 45 s press test) | button |
 | 45 (ADC11) | externally low; driving it **high once switched the white fill LED off**, and it stayed off whatever 45 did afterwards (camera-verified, `led_by_camera3.txt`) | white-LED driver kill/toggle input, to be confirmed from a fresh power-on |
+| 46 | **speaker amplifier enable, confirmed 2026-10-03** (active-high; GPIO sweep with the Mac mic listening: 1 kHz tone at 108 with 46 high vs <1 for the other pins; left floating it leaks a faint output) | PA enable, firmware default `spk pa 46` |
 | 10, 11 | UART0 console | never touch |
 | others | see the latest `pinmap_session*.txt` (v0.4.0 reclaim) | |
 
 Open: which pin is the button, the PIR, the LEDs (`pin blink` on 5/8/9 first), the chime, the
 charger status, and the power-hold line.
+
+## Audio test rig (v0.11.0+ / v0.12.0+)
+
+- Speaker: DAC -> external amplifier, enable = **GPIO 46** (active high, parked low at boot). `spk tone`,
+  `spk play bell`, `spk cfg [chl L|R|LR] [mode diff|se] [gain N]` (gain 0x3f = loud, distorted).
+- Mic: `mic level [MS] [HZ]` prints peak/rms/dc and a Goertzel tone estimate at HZ for both 16-bit halves
+  of the ADC FIFO word; `mic cfg [chl L|R|LR] [mic 1|2|both] [mode diff|se] [gain N]`. Note the SDK only
+  powers MIC1 for `chl L` and MIC2 for `chl R`.
+- Streaming (v0.12.0): the device connects out to `tools/audio_relay.py` on du7 (the Mac firewall blocks
+  incoming connections):
+  `systemd-run --user --unit=relay-recv python3 ~/audio_relay.py recv 5100 /tmp/mic.raw` then
+  `mic rec 4000 192.168.2.68 5100` (raw 32-bit FIFO words, lo16 = L, hi16 = R);
+  `systemd-run --user --unit=relay-send python3 ~/audio_relay.py send 5101 /tmp/hello_mac_8k.raw` then
+  `spk net 192.168.2.68 5101` (s16le mono 8 kHz).
+- The Mac is the ear/voice: `ffmpeg -f avfoundation -i ":1"` records the Mac mic (must run in
+  Terminal.app for the microphone permission), `afplay` plays tones at the doorbell.
 
 ## SDK patches
 

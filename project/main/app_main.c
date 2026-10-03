@@ -6,6 +6,7 @@
 #include <os/mem.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 #include <components/shell_task.h>
 #include <driver/gpio.h>
 #include <driver/adc.h>
@@ -18,10 +19,15 @@
 #include <components/netif_types.h>
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
+#include <driver/aud_dac.h>
+#include <driver/aud_adc.h>
+#include <driver/aud_dac_types.h>
+#include <driver/aud_adc_types.h>
+#include <driver/flash.h>
 #endif
 
 #define FW_NAME "doorbell-bk7258-fw"
-#define FW_VERSION "0.9.2"
+#define FW_VERSION "0.12.0"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -238,6 +244,12 @@ static void cli_adc_read_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc,
 }
 
 #if (CONFIG_SYS_CPU0)
+/* ---- reply buffer: command output for the TCP channel (UART still gets everything) ---- */
+static char s_reply[320];
+static bool s_reply_on;
+#define REPLY(...) do { os_printf(__VA_ARGS__); if (s_reply_on) { size_t _l = os_strlen(s_reply); \
+	if (_l < sizeof(s_reply) - 1) snprintf(s_reply + _l, sizeof(s_reply) - _l, __VA_ARGS__); } } while (0)
+
 /* ---- doorbell prototype: Wi-Fi + Home Assistant webhook ---- */
 #define PIN_PIR 24      /* active-high motion output, 2-4 s pulses */
 #define PIN_BUTTON 53   /* externally pulled high, expected to drop on press */
@@ -491,7 +503,7 @@ static void cli_wifi_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, cha
 		os_printf("[wifi] connect -> %d\r\n", wifi_connect());
 	} else {
 		bk_wifi_sta_get_link_status(&st);
-		os_printf("[wifi] ssid '%s' state %d rssi %d ip %s got_ip %d\r\n", s_ssid, st.state, st.rssi, s_ip, s_got_ip);
+		REPLY("[wifi] ssid '%s' state %d rssi %d ip %s got_ip %d\r\n", s_ssid, st.state, st.rssi, s_ip, s_got_ip);
 	}
 }
 
@@ -542,10 +554,352 @@ static void cli_hook_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, cha
 		s_motion_count++;
 		s_pend_motion = true;
 	}
-	os_printf("[hook] %s  (hook set HOST:PORT/PATH | test | ring | motion)\r\n", s_hook);
+	REPLY("[hook] %s  (hook set HOST:PORT/PATH | test | ring | motion)\r\n", s_hook);
 }
 
 
+
+
+
+/* ---- audio: speaker tone / stock chimes from flash, mic level ---- */
+#define AUDIO_RATE 8000
+static volatile bool s_spk_busy, s_spk_stop;
+static beken_thread_t s_spk_thread;
+static uint32_t s_spk_hz, s_spk_ms, s_spk_addr, s_spk_len;
+/* runtime audio config (spk cfg / mic cfg); PA = amplifier enable, SDK reference design uses GPIO 5 */
+static int s_pa_pin = 46;   /* speaker amplifier enable, active high (found by sweep 2026-10-03) */
+static aud_dac_chl_t s_dac_chl = AUD_DAC_CHL_L;
+static aud_dac_work_mode_t s_dac_mode = AUD_DAC_WORK_MODE_DIFFEN;
+static uint16_t s_dac_gain = 0x2D;
+static aud_adc_chl_t s_adc_chl = AUD_ADC_CHL_L;
+static aud_adc_mode_t s_adc_mode = AUD_ADC_MODE_DIFFEN;
+static aud_mic_id_t s_mic_id = AUD_MIC_MIC1;
+static uint32_t s_adc_gain = 0x2d;
+
+/* ---- network audio (test rig): mic -> TCP as raw 32-bit FIFO words, TCP -> speaker as s16le 8 kHz mono.
+ * The peer is a plain TCP listener (tools/audio_relay.py on du7); the device always connects out. */
+static char s_net_host[32];
+static uint16_t s_net_port, s_spk_net_port;
+static uint32_t s_net_ms;
+static volatile bool s_mic_busy;
+
+static int tcp_connect(const char *host, uint16_t port)
+{
+	struct sockaddr_in sa = {0};
+	struct timeval tv = {.tv_sec = 10, .tv_usec = 0};
+	int sock = socket(AF_INET, SOCK_STREAM, 0);
+
+	if (sock < 0)
+		return -1;
+	setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	sa.sin_family = AF_INET;
+	sa.sin_port = htons(port);
+	sa.sin_addr.s_addr = inet_addr(host);
+	if (connect(sock, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+		close(sock);
+		return -1;
+	}
+	return sock;
+}
+
+static void pa_set(int on)
+{
+	if (s_pa_pin < 0)
+		return;
+	pin_configure(s_pa_pin, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+	if (on)
+		bk_gpio_set_output_high(s_pa_pin);
+	else
+		bk_gpio_set_output_low(s_pa_pin);
+}
+
+static const int16_t s_sine32[32] = {0,6393,12539,18204,23170,27245,30273,32137,32767,32137,30273,27245,23170,
+	18204,12539,6393,0,-6393,-12539,-18204,-23170,-27245,-30273,-32137,-32767,-32137,-30273,-27245,-23170,-18204,-12539,-6393};
+
+static void dac_push(int16_t sample)
+{
+	uint32_t st, w = ((uint32_t)(uint16_t)sample << 16) | (uint16_t)sample;   /* R | L, same value */
+
+	do {
+		bk_aud_dac_get_status(&st);
+	} while (!(st & AUD_DACL_NEAR_EMPTY_MASK) && !s_spk_stop);
+	bk_aud_dac_write(w);
+}
+
+static void spk_task(beken_thread_arg_t arg)
+{
+	aud_dac_config_t cfg = DEFAULT_AUD_DAC_CONFIG();
+	uint8_t buf[512];
+	uint32_t i, n, phase = 0, step, total = 0;
+
+	cfg.samp_rate = AUDIO_RATE;
+	cfg.dac_chl = s_dac_chl;
+	cfg.work_mode = s_dac_mode;
+	cfg.dac_gain = s_dac_gain;
+	pa_set(1);
+	if (bk_aud_dac_init(&cfg) != BK_OK || bk_aud_dac_start() != BK_OK) {
+		os_printf("[spk] dac init/start failed\r\n");
+		pa_set(0);
+		goto out;
+	}
+	if (s_spk_net_port) {   /* play s16le mono PCM streamed from a TCP peer */
+		int sock = tcp_connect(s_net_host, s_spk_net_port), r, carry = -1;
+		if (sock < 0)
+			os_printf("[spk] connect %s:%u failed\r\n", s_net_host, s_spk_net_port);
+		while (sock >= 0 && !s_spk_stop && (r = recv(sock, buf, sizeof(buf), 0)) > 0) {
+			uint32_t k = 0;
+			if (carry >= 0) {   /* odd byte left over from the previous chunk */
+				dac_push((int16_t)(carry | (buf[0] << 8)));
+				total++;
+				k = 1;
+				carry = -1;
+			}
+			for (; k + 1 < (uint32_t)r; k += 2)
+				dac_push((int16_t)(buf[k] | (buf[k + 1] << 8)));
+			if (k < (uint32_t)r)
+				carry = buf[k];
+			total += (r - (carry >= 0 ? 1 : 0)) / 2;
+		}
+		if (sock >= 0)
+			close(sock);
+		s_spk_net_port = 0;
+	} else if (s_spk_addr) {   /* play s16le mono PCM from flash */
+		for (i = 0; i < s_spk_len && !s_spk_stop; i += n) {
+			n = s_spk_len - i < sizeof(buf) ? s_spk_len - i : sizeof(buf);
+			bk_flash_read_bytes(s_spk_addr + i, buf, n);
+			for (uint32_t k = 0; k + 1 < n; k += 2)
+				dac_push((int16_t)(buf[k] | (buf[k + 1] << 8)));
+			total += n / 2;
+		}
+	} else {            /* tone: 32-step sine, 12-bit phase accumulator */
+		step = (s_spk_hz * 32u * 4096u) / AUDIO_RATE;
+		for (i = 0; i < s_spk_ms * (AUDIO_RATE / 1000) && !s_spk_stop; i++) {
+			dac_push(s_sine32[(phase >> 12) & 31] / 4);
+			phase += step;
+			total++;
+		}
+	}
+	for (i = 0; i < 400; i++)
+		dac_push(0);   /* drain with silence before stopping */
+	bk_aud_dac_stop();
+	bk_aud_dac_deinit();
+	pa_set(0);
+	os_printf("[spk] done, %u samples\r\n", total);
+out:
+	s_spk_busy = false;
+	s_spk_thread = NULL;
+	rtos_delete_thread(NULL);
+}
+
+static void spk_start(uint32_t hz, uint32_t ms, uint32_t addr, uint32_t len)
+{
+	if (s_spk_busy) {
+		REPLY("[spk] busy\r\n");
+		return;
+	}
+	s_spk_hz = hz; s_spk_ms = ms; s_spk_addr = addr; s_spk_len = len; s_spk_stop = false; s_spk_busy = true;
+	if (rtos_create_thread(&s_spk_thread, BEKEN_APPLICATION_PRIORITY, "spk", spk_task, 4096, NULL) != BK_OK) {
+		s_spk_busy = false;
+		REPLY("[spk] thread failed\r\n");
+	}
+}
+
+static void cli_spk_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
+{
+	if (argc >= 2 && os_strcmp(argv[1], "tone") == 0) {
+		uint32_t hz = argc >= 3 ? os_strtoul(argv[2], NULL, 10) : 1000;
+		uint32_t ms = argc >= 4 ? os_strtoul(argv[3], NULL, 10) : 1000;
+		REPLY("[spk] tone %u Hz %u ms\r\n", hz, ms);
+		spk_start(hz, ms, 0, 0);
+	} else if (argc >= 3 && os_strcmp(argv[1], "play") == 0) {
+		/* stock Tuya chimes still in flash (resource FS at 0x600000): raw s16le 8 kHz mono */
+		uint32_t addr = 0, len = 0;
+		if (os_strcmp(argv[2], "beepa") == 0) { addr = 0x601000; len = 23180; }
+		else if (os_strcmp(argv[2], "beepb") == 0) { addr = 0x607000; len = 26104; }
+		else if (os_strcmp(argv[2], "bell") == 0) { addr = 0x60e000 + 16; len = 66450 - 16; }
+		else if (argc >= 4) { addr = os_strtoul(argv[2], NULL, 16); len = os_strtoul(argv[3], NULL, 10); }
+		if (!addr) { REPLY("spk play beepa|beepb|bell|HEXADDR LEN\r\n"); return; }
+		REPLY("[spk] play 0x%x len %u\r\n", addr, len);
+		spk_start(0, 0, addr, len);
+	} else if (argc >= 4 && os_strcmp(argv[1], "net") == 0) {
+		if (s_spk_busy) { REPLY("[spk] busy\r\n"); return; }
+		os_strncpy(s_net_host, argv[2], sizeof(s_net_host) - 1);
+		s_spk_net_port = os_strtoul(argv[3], NULL, 10);
+		REPLY("[spk] stream from %s:%u\r\n", s_net_host, s_spk_net_port);
+		spk_start(0, 0, 0, 0);
+	} else if (argc >= 2 && os_strcmp(argv[1], "stop") == 0) {
+		s_spk_stop = true;
+		REPLY("[spk] stop requested\r\n");
+	} else if (argc >= 3 && os_strcmp(argv[1], "pa") == 0) {
+		s_pa_pin = os_strcmp(argv[2], "off") == 0 ? -1 : (int)os_strtoul(argv[2], NULL, 10);
+		REPLY("[spk] pa pin %d\r\n", s_pa_pin);
+	} else if (argc >= 2 && os_strcmp(argv[1], "cfg") == 0) {
+		for (int i = 2; i + 1 < argc; i += 2) {
+			if (!os_strcmp(argv[i], "chl"))
+				s_dac_chl = !os_strcmp(argv[i + 1], "R") ? AUD_DAC_CHL_R : !os_strcmp(argv[i + 1], "LR") ? AUD_DAC_CHL_LR : AUD_DAC_CHL_L;
+			else if (!os_strcmp(argv[i], "mode"))
+				s_dac_mode = !os_strcmp(argv[i + 1], "se") ? AUD_DAC_WORK_MODE_SIGNAL_END : AUD_DAC_WORK_MODE_DIFFEN;
+			else if (!os_strcmp(argv[i], "gain"))
+				s_dac_gain = os_strtoul(argv[i + 1], NULL, 0);
+		}
+		REPLY("[spk] cfg chl %d mode %d gain 0x%x pa %d\r\n", s_dac_chl, s_dac_mode, s_dac_gain, s_pa_pin);
+	} else {
+		REPLY("spk tone [HZ] [MS] | play beepa|beepb|bell|ADDR LEN | net HOST PORT | stop | pa PIN|off | cfg [chl L|R|LR] [mode diff|se] [gain N]  (busy %d)\r\n", s_spk_busy);
+	}
+}
+
+static void micnet_task(beken_thread_arg_t arg)
+{
+	aud_adc_config_t cfg = DEFAULT_AUD_ADC_CONFIG();
+	uint32_t buf[256], st, n = 0, sent = 0, full = 0, t0;
+	int sock = tcp_connect(s_net_host, s_net_port);
+
+	if (sock < 0) {
+		os_printf("[mic] connect %s:%u failed\r\n", s_net_host, s_net_port);
+		goto out;
+	}
+	cfg.samp_rate = AUDIO_RATE;
+	cfg.adc_chl = s_adc_chl;
+	cfg.adc_mode = s_adc_mode;
+	cfg.adc_gain = s_adc_gain;
+	if (bk_aud_adc_init(&cfg) != BK_OK) {
+		os_printf("[mic] adc init failed\r\n");
+		close(sock);
+		goto out;
+	}
+	bk_aud_adc_set_mic_mode(s_mic_id, s_adc_mode);
+	if (bk_aud_adc_start() != BK_OK) {
+		os_printf("[mic] adc start failed\r\n");
+		bk_aud_adc_deinit();
+		close(sock);
+		goto out;
+	}
+	t0 = rtos_get_time();
+	while (rtos_get_time() - t0 < s_net_ms) {
+		bk_aud_adc_get_status(&st);
+		if (st & AUD_ADCL_FIFO_FULL_MASK)
+			full++;
+		if (st & AUD_ADCL_FIFO_EMPTY_MASK) {
+			rtos_delay_milliseconds(1);
+			continue;
+		}
+		bk_aud_adc_get_fifo_data(&buf[n++]);
+		if (n == sizeof(buf) / sizeof(buf[0])) {
+			if (send(sock, buf, sizeof(buf), 0) != (int)sizeof(buf))
+				break;
+			sent += n;
+			n = 0;
+		}
+	}
+	if (n && send(sock, buf, n * 4, 0) == (int)(n * 4))
+		sent += n;
+	bk_aud_adc_stop();
+	bk_aud_adc_deinit();
+	close(sock);
+	os_printf("[mic] streamed %u words to %s:%u (fifo-full seen %u times)\r\n", sent, s_net_host, s_net_port, full);
+out:
+	s_mic_busy = false;
+	rtos_delete_thread(NULL);
+}
+
+static void cli_mic_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
+{
+	aud_adc_config_t cfg = DEFAULT_AUD_ADC_CONFIG();
+	uint32_t ms = argc >= 3 ? os_strtoul(argv[2], NULL, 10) : 2000, st, w, n = 0, t0;
+	uint32_t hz = argc >= 4 ? os_strtoul(argv[3], NULL, 10) : 1000;
+	/* the FIFO word carries two 16-bit halves (L low, R high); report both, we don't know which
+	 * input the board's electret sits on */
+	struct { int32_t peak; uint64_t sq; int64_t sum; float g1, g2; } ch[2] = {{0}};
+	/* Goertzel at hz: how much of the signal is a tone (a Mac playing hz into the mic) vs noise */
+	float gc = 2.0f * cosf(2.0f * 3.14159265f * (float)hz / (float)AUDIO_RATE), g0;
+
+	if (argc >= 2 && os_strcmp(argv[1], "cfg") == 0) {
+		for (int i = 2; i + 1 < argc; i += 2) {
+			if (!os_strcmp(argv[i], "mic"))
+				s_mic_id = !os_strcmp(argv[i + 1], "2") ? AUD_MIC_MIC2 : !os_strcmp(argv[i + 1], "both") ? AUD_MIC_BOTH : AUD_MIC_MIC1;
+			else if (!os_strcmp(argv[i], "mode"))
+				s_adc_mode = !os_strcmp(argv[i + 1], "se") ? AUD_ADC_MODE_SIGNAL_END : AUD_ADC_MODE_DIFFEN;
+			else if (!os_strcmp(argv[i], "gain"))
+				s_adc_gain = os_strtoul(argv[i + 1], NULL, 0);
+			else if (!os_strcmp(argv[i], "chl"))
+				s_adc_chl = !os_strcmp(argv[i + 1], "R") ? AUD_ADC_CHL_R : !os_strcmp(argv[i + 1], "LR") ? AUD_ADC_CHL_LR : AUD_ADC_CHL_L;
+		}
+		REPLY("[mic] cfg mic %d mode %d gain 0x%x chl %d\r\n", s_mic_id, s_adc_mode, s_adc_gain, s_adc_chl);
+		return;
+	}
+	if (argc >= 5 && os_strcmp(argv[1], "rec") == 0) {
+		beken_thread_t t;
+		if (s_mic_busy) { REPLY("[mic] busy\r\n"); return; }
+		s_net_ms = os_strtoul(argv[2], NULL, 10);
+		if (s_net_ms > 60000) s_net_ms = 60000;
+		os_strncpy(s_net_host, argv[3], sizeof(s_net_host) - 1);
+		s_net_port = os_strtoul(argv[4], NULL, 10);
+		s_mic_busy = true;
+		REPLY("[mic] rec %u ms -> %s:%u (raw 32-bit FIFO words, lo16 = L, hi16 = R)\r\n", s_net_ms, s_net_host, s_net_port);
+		if (rtos_create_thread(&t, BEKEN_APPLICATION_PRIORITY, "micnet", micnet_task, 4096, NULL) != BK_OK) {
+			s_mic_busy = false;
+			REPLY("[mic] thread failed\r\n");
+		}
+		return;
+	}
+	if (argc < 2 || os_strcmp(argv[1], "level") != 0) {
+		REPLY("mic rec MS HOST PORT | mic level [MS] [HZ] | cfg [mic 1|2|both] [mode diff|se] [gain N] [chl L|R|LR]\r\n");
+		return;
+	}
+	if (ms > 4000)
+		ms = 4000;
+	cfg.samp_rate = AUDIO_RATE;
+	cfg.adc_chl = s_adc_chl;
+	cfg.adc_mode = s_adc_mode;
+	cfg.adc_gain = s_adc_gain;
+	if (bk_aud_adc_init(&cfg) != BK_OK) {
+		REPLY("[mic] adc init failed\r\n");
+		return;
+	}
+	bk_aud_adc_set_mic_mode(s_mic_id, s_adc_mode);
+	if (bk_aud_adc_start() != BK_OK) {
+		REPLY("[mic] adc start failed\r\n");
+		bk_aud_adc_deinit();
+		return;
+	}
+	t0 = rtos_get_time();
+	while (rtos_get_time() - t0 < ms) {
+		bk_aud_adc_get_status(&st);
+		if (st & AUD_ADCL_FIFO_EMPTY_MASK) {
+			rtos_delay_milliseconds(1);
+			continue;
+		}
+		bk_aud_adc_get_fifo_data(&w);
+		n++;
+		for (int c = 0; c < 2; c++) {
+			int16_t v = (int16_t)(c ? (w >> 16) : (w & 0xffff));
+			ch[c].sum += v;
+			ch[c].sq += (int64_t)v * v;
+			if (v > ch[c].peak) ch[c].peak = v;
+			if (-v > ch[c].peak) ch[c].peak = -v;
+			g0 = (float)v + gc * ch[c].g1 - ch[c].g2;
+			ch[c].g2 = ch[c].g1;
+			ch[c].g1 = g0;
+		}
+	}
+	bk_aud_adc_stop();
+	bk_aud_adc_deinit();
+	if (n) {
+		REPLY("[mic] %u samples in %u ms", n, ms);
+		for (int c = 0; c < 2; c++) {
+			int32_t mean = (int32_t)(ch[c].sum / (int64_t)n);
+			uint32_t rms = 0, x = (uint32_t)(ch[c].sq / n);
+			for (uint32_t b = 1u << 15; b; b >>= 1)   /* integer sqrt */
+				if ((rms + b) * (rms + b) <= x) rms += b;
+			float gm = sqrtf(ch[c].g1 * ch[c].g1 + ch[c].g2 * ch[c].g2 - gc * ch[c].g1 * ch[c].g2) / (float)n;
+			REPLY(" | %s: peak %d rms %u dc %d tone%u %d", c ? "hi16" : "lo16", ch[c].peak, rms, mean, hz, (int)gm);
+		}
+		REPLY("\r\n");
+	} else {
+		REPLY("[mic] no samples (FIFO never filled)\r\n");
+	}
+}
 
 /* ---- TCP command channel: the same commands as the UART shell, over the LAN ----
  * One line per connection: "<token> <command...>\n". The token is the KV string db_token
@@ -609,10 +963,15 @@ static void tcp_cmd_task(beken_thread_arg_t arg)
 			} else {
 				cmd++;
 				os_printf("[tcp] %s\r\n", cmd);
+				s_reply[0] = 0;
+				s_reply_on = true;
 				if (run_line(cmd) == 0)
 					send(cs, "ok\n", 3, 0);
 				else
 					send(cs, "unknown\n", 8, 0);
+				s_reply_on = false;
+				if (s_reply[0])
+					send(cs, s_reply, os_strlen(s_reply), 0);
 			}
 		}
 		rtos_delay_milliseconds(100);
@@ -666,6 +1025,8 @@ static const struct cli_command s_doorbell_commands[] = {
 	{"hook", "hook set HOST:PORT/PATH | test | ring | motion | (show)", cli_hook_cmd},
 	{"ota", "ota URL (download app_pack.rbl over HTTP, then reboot)", cli_ota_cmd},
 	{"tok", "tok set SECRET | clear (token for the TCP command channel, port 2323)", cli_tok_cmd},
+	{"spk", "spk tone [HZ] [MS] | play beepa|beepb|bell|ADDR LEN | net HOST PORT | stop", cli_spk_cmd},
+	{"mic", "mic level [MS] [HZ] | rec MS HOST PORT (on-board ADC mic)", cli_mic_cmd},
 #endif
 };
 #if (CONFIG_SYS_CPU0)
@@ -695,6 +1056,7 @@ void user_app_main(void)
 			   heartbeat_task, 2048, NULL);
 
 #if (CONFIG_SYS_CPU0)
+	pa_set(0);   /* amplifier enable floats at boot and half-turns the speaker on: park it low */
 	kv_get_str(KV_SSID, s_ssid, sizeof(s_ssid));
 	kv_get_str(KV_PASS, s_pass, sizeof(s_pass));
 	if (!kv_get_str(KV_HOOK, s_hook, sizeof(s_hook)))

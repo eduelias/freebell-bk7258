@@ -30,7 +30,16 @@ def send(cmd, host=None, timeout=8.0):
     try:
         with socket.create_connection((host, 2323), timeout=timeout) as s:
             s.sendall(f"{token()} {cmd}\n".encode())
-            return s.recv(64).decode(errors="replace").strip()
+            buf = b""
+            while True:          # "ok\n" first, then any REPLY() text; device closes after ~100 ms
+                try:
+                    chunk = s.recv(512)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+            return buf.decode(errors="replace").strip()
     except OSError as e:
         sys.exit(f"cannot reach {host}:2323 ({e.strerror or e}); is the device up and the token set?")
 
