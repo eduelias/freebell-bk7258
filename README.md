@@ -195,6 +195,25 @@ It is plain TCP on the home LAN with a shared secret: fine for a prototype, not 
 Ring reports are rate-limited to one per 10 s (button debounce stays 0.8 s; `ring_count` counts
 every press).
 
+## Virtual device (no hardware needed)
+
+`sim/virtual_doorbell.py` is a software stand-in for the board: it serves the same TCP command
+channel (2323), the same HTTP routes on 8080 (`/`, `/snapshot.jpg` with synthetic 720p frames,
+`/stream`, the talk endpoints) and POSTs the same webhook JSON on boot/ring/motion/wake/heartbeat,
+with the firmware's reply strings, PIR cooldown, night-light arbiter, deep-sleep/wake cycle, OTA
+version bump and KV persistence modelled. Python 3.11, standard library (Pillow optional).
+
+```bash
+python3 sim/virtual_doorbell.py                                # token "sim"
+DOORBELL_HOST=127.0.0.1 DOORBELL_TOKEN=sim python3 tools/dbcmd.py sys info
+python3 tools/dbcmd.py --host 127.0.0.1 --token sim sim press  # or: curl http://127.0.0.1:8080/sim/press
+python3 -m pytest sim/tests                                    # ~35 s, also runs in CI (sim-tests.yml)
+```
+
+Use it to try the Home Assistant generic camera + webhook automation before mounting the real
+device, to develop `tools/` on the train, or to demo the project. Details, the `sim ...` controls
+(button, PIR, light, battery, USB, time speed) and what is not simulated: [`sim/README.md`](sim/README.md).
+
 ## Our shell commands
 
 The SDK's `gpio`/`adc_test` commands print through `CLI_LOGI`, which is compiled out in this
