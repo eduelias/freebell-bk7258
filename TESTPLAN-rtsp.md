@@ -220,10 +220,11 @@ python3 tools/dbcmd.py rtsp on
   camera is back in JPEG in 2.4 s (the first snapshot is still the old JPEG); `cam mode jpeg` ->
   DESCRIBE 503; `cam mode h264` -> snapshot stale, `/stream` 503; back to `auto`. OK.
 - Step 4: `rtsp q 160 40` applied live, `drop big 0`; back to 120/24. OK.
-- Step 5: HA entry switched to stream-only (`stream_source` rtsp, `advanced.rtsp_transport tcp`) with
-  the fixed helper (`rtsp_transport` must sit inside `advanced`). `camera_proxy` still from the
-  stream: 200, 115-144 KB 1280x720 JPEG in ~7 s (one attempt timed out at 10 s with the camera
-  mid-switch). `camera_proxy_stream` gave 0 bytes in 15 s. Live view in the UI not clicked (owner).
+- Step 5: HA entry first switched to stream-only (option A) with the fixed helper (`rtsp_transport`
+  must sit inside `advanced`): `camera_proxy` still from the stream 200 / 115-144 KB in ~7 s twice,
+  500 at the 10 s timeout twice (go2rtc/ffmpeg probing at 3 fps), `camera_proxy_stream` 0 bytes in
+  15 s. **Final: option B** (still `/snapshot.jpg` + RTSP stream, TCP): still 2.4 s right after a
+  stream (mode switch) then 0.17 s, ffprobe on the RTSP URL still fine. Live view by eye: owner.
 - **Wedge**: the JPEG<->H.264 switch (close + immediate reopen) hit the pre-existing camera wedge
   (sensor silent, `open -> 0`, no frames) on the 8th switch; `cam probe rails off` + `on` cleared it
   without a reboot. v0.22.1 cuts GPIO 28/5/6 on every close (250 ms off / 60 ms settle: 7/8 ok ->

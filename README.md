@@ -80,7 +80,7 @@ is the last JPEG and `/stream` answers 503). The first `/snapshot.jpg` after a s
 be the previous JPEG (the handler does not wait for a new frame).
 
 - `rtsp on|off` (KV, default **off**; the house device has it **on** since 2026-10-03 because the
-  HA camera entry is stream-only), `rtsp status` (clients, fps, kbps, drops, SPS/PPS cached),
+  HA camera entry streams from it), `rtsp status` (clients, fps, kbps, drops, SPS/PPS cached),
   `rtsp port N`, `rtsp q IMB PMB` (bits per macroblock for I/P frames, default 120/24 =
   ~1.5 Mbit/s nominal, applied live), `rtsp idr`.
 - Test: `ffplay -rtsp_transport tcp rtsp://192.168.2.89:554/live` (TCP is the robust transport;
@@ -101,14 +101,17 @@ be the previous JPEG (the handler does not wait for a new frame).
   next use (`cam_stalled_locked()`), `rtsp_cam_acquire()` retries a silent open once, and a failed
   `media_app_camera_open` powers the sensor off so the retry is a real power cycle (0.22.3). A
   JPEG->H.264 switch now takes ~2.1 s.
-- Home Assistant: the generic camera entry `01M40YN6CC2SS5DFP8X8Y35ZRN` ("Doorbell BK7258") is
-  **stream-only** since 2026-10-03: `stream_source rtsp://192.168.2.89:554/live`, `advanced.rtsp_transport
-  tcp`, no still URL (stills come from the stream through go2rtc, ~7 s). Set with
-  `~/.venv-ha/bin/python ~/ha_generic_camera.py options ENTRY_ID --stream rtsp://192.168.2.89:554/live
-  --rtsp-transport tcp` on du7 (HA 2026.9 keeps `rtsp_transport` inside the `advanced` section).
-  Rollback = the same command with `--still http://192.168.2.89:8080/snapshot.jpg --stream
-  http://192.168.2.89:8080/stream` (what it was before). `/api/camera_proxy_stream` (HA's MJPEG
-  re-encode) produced nothing in 15 s at 3 fps; the UI live view uses go2rtc directly.
+- Home Assistant: the generic camera entry `01M40YN6CC2SS5DFP8X8Y35ZRN` ("Doorbell BK7258") keeps
+  **both URLs** since 2026-10-03: still `http://192.168.2.89:8080/snapshot.jpg`, `stream_source
+  rtsp://192.168.2.89:554/live`, `advanced.rtsp_transport tcp`, framerate 5 ("option B" of the test
+  plan). Stream-only was tried first and rejected: at ~3 fps HA's still-from-stream (go2rtc ->
+  ffmpeg) needs ~7 s and hit its 10 s timeout half the time, which would also break the
+  `camera.snapshot` ring/motion photos. With the still URL the thumbnail/snapshot is 45 ms (first
+  one after a live view ~2.4 s because the camera switches back to JPEG; while someone is watching
+  it is the last JPEG). Set with `~/.venv-ha/bin/python ~/ha_generic_camera.py options ENTRY_ID
+  --still http://192.168.2.89:8080/snapshot.jpg --stream rtsp://192.168.2.89:554/live
+  --rtsp-transport tcp --framerate 5` on du7 (HA 2026.9 keeps `rtsp_transport` inside `advanced`).
+  The UI live view uses go2rtc (WebRTC/HLS) and `rtsp status` shows 192.168.2.80 as a TCP client.
 - Kconfig changes on CPU1 (`project-avdk/config/bk7258_cp1/config`): after switching to/from this
   version in an existing build dir, delete `$OUT/du7/bk7258_cp1`, `_cp2` and `bk7258` first.
 - `mem HEXADDR [N]` reads raw 32-bit words (debug): CPU1's `media_debug_t` counters are reachable
