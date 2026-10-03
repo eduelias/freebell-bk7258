@@ -63,7 +63,7 @@ void db_reply(const char *fmt, ...)
 	REPLY("%s", buf);
 }
 
-#define FW_VERSION "0.22.1"
+#define FW_VERSION "0.22.2"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -1572,7 +1572,7 @@ static void cam_rails(int on)
  * a close followed by a reopen within a few seconds otherwise leaves the sensor silent (no
  * frames, "camera wedge", 2026-10-03) and only a rail cycle or a reboot brings it back. GPIO 9
  * (light sensor / LED rail) is left alone. */
-static uint32_t s_cam_off_ms;
+static uint32_t s_cam_off_ms, s_cam_open_ms;
 static void cam_power(int on)
 {
 	static const int pins[] = {28, 5, 6};
@@ -1632,13 +1632,13 @@ static int cam_open_locked(uint32_t w, uint32_t h, bool h264)
 	if (!s_cam_mutex)
 		rtos_init_mutex(&s_cam_mutex);
 #if CONFIG_DVP_CAMERA
-	if (s_cam_off_ms) {   /* at least 250 ms without power between a close and the next open */
+	if (s_cam_off_ms) {   /* a real power-off: 250 ms left 3/8 cold opens silent or undetected */
 		uint32_t off = rtos_get_time() - s_cam_off_ms;
-		if (off < 250)
-			rtos_delay_milliseconds(250 - off);
+		if (off < 800)
+			rtos_delay_milliseconds(800 - off);
 	}
 	cam_rails(1);   /* GPIO 9, 28 (camera power, active high per the stock firmware), 5, 6 */
-	rtos_delay_milliseconds(60);
+	rtos_delay_milliseconds(150);
 	/* stock bk_dvp_camera_enumerate: GPIO 52 low 100 ms, high 100 ms, low (sensor PWDN/RESET pulse) */
 	pin_configure(52, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
 	bk_gpio_set_output_low(52);
@@ -1663,6 +1663,8 @@ static int cam_open_locked(uint32_t w, uint32_t h, bool h264)
 	s_cam_open = (ret == BK_OK);
 	s_cam_h264 = s_cam_open && h264;
 	s_h264_q_pending = s_cam_h264;
+	s_cam_open_ms = rtos_get_time();
+	s_cam_last_ms = s_cam_open_ms;
 	os_printf("[cam] open %ux%u %s -> %d\r\n", w, h, h264 ? "h264" : "jpeg", ret);
 	return ret;
 }
@@ -1711,12 +1713,26 @@ static int cam_h264_apply_q(void)
 	return ret;
 }
 
+/* Caller holds s_cam_ctl. A cold OV9650 sometimes comes up silent (open -> 0, never a frame):
+ * treat "open for 4 s and no frame for 4 s" as stalled and power-cycle it before use. */
+static bool cam_stalled_locked(void)
+{
+	uint32_t now = rtos_get_time();
+
+	if (!s_cam_open || now - s_cam_open_ms < 4000 || now - s_cam_last_ms < 4000)
+		return false;
+	os_printf("[cam] stalled (%s, no frame for %u ms): power cycle\r\n", s_cam_h264 ? "h264" : "jpeg", (unsigned)(now - s_cam_last_ms));
+	cam_close_locked();
+	return true;
+}
+
 /* HTTP wants JPEG frames. 0 = the camera is (now) in JPEG mode, -1 = stay/503 (see cam mode). */
 static int cam_want_jpeg(void)
 {
 	int ret = 0, playing = 0;
 
 	rtos_lock_mutex(&s_cam_ctl);
+	cam_stalled_locked();
 	if (s_cam_open && !s_cam_h264)
 		goto out;
 	if (s_cam_pref == CAM_PREF_H264) {
@@ -1747,19 +1763,25 @@ int rtsp_cam_acquire(void)
 		ret = -1;
 		goto out;
 	}
-	if (s_cam_open && !s_cam_h264)
-		cam_close_locked();
-	if (!s_cam_open)
-		ret = cam_open_locked(1280, 720, true);
+	cam_stalled_locked();
+	for (int attempt = 0; attempt < 2; attempt++) {   /* a silent or undetected cold sensor gets one power cycle */
+		if (s_cam_open && !s_cam_h264)
+			cam_close_locked();
+		if (!s_cam_open)
+			ret = cam_open_locked(1280, 720, true);
+		if (ret == 0) {
+			for (w = 0; w < 300 && s_cam_h264_frames == 0; w++)   /* first access unit ~1 s after open */
+				rtos_delay_milliseconds(10);
+			if (s_cam_h264_frames)
+				break;
+			os_printf("[cam] h264: no frame within 3 s\r\n");
+			ret = -2;
+		}
+		if (s_cam_open)
+			cam_close_locked();
+	}
 	if (ret != 0)
 		goto out;
-	for (w = 0; w < 300 && s_cam_h264_frames == 0; w++)   /* first access unit ~1 s after open */
-		rtos_delay_milliseconds(10);
-	if (s_cam_h264_frames == 0) {
-		os_printf("[cam] h264: no frame within 3 s\r\n");
-		ret = -2;
-		goto out;
-	}
 	if (s_h264_q_pending) {
 		rtos_delay_milliseconds(100);   /* let the encoder ISR consume the SDK preset first */
 		if (cam_h264_apply_q() == BK_OK)
