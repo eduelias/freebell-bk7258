@@ -33,3 +33,4 @@ bool app_power_got_ip(void);
 void app_power_prepare_sleep(void);     /* amp off, LEDs off, camera closed, sensor rails low */
 void app_power_wake_input(uint32_t pin);/* the pin that woke us from deep sleep (53 = ring, 24 = motion) */
 void app_wifi_reconnect(void);          /* after a failed sleep attempt */
+uint32_t app_power_pir_sens(void);      /* PIR sensitivity bits (pir.c), held on GPIO 25/26 through the sleep */

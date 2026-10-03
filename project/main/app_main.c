@@ -62,7 +62,7 @@ void db_reply(const char *fmt, ...)
 	REPLY("%s", buf);
 }
 
-#define FW_VERSION "0.21.0"
+#define FW_VERSION "0.21.1"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -1966,6 +1966,11 @@ void app_power_wake_input(uint32_t pin)
 void app_wifi_reconnect(void)
 {
 	wifi_connect();
+}
+
+uint32_t app_power_pir_sens(void)
+{
+	return pir_sens_get();
 }
 #endif /* CONFIG_SYS_CPU0 */
 

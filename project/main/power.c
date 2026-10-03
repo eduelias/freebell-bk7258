@@ -32,6 +32,8 @@
 #define PIN_USB_PRESENT 19
 #define PIN_CHARGING    15
 #define PIN_PIR_ENABLE  50
+#define PIN_PIR_SENS0   25   /* pir.c: 25 = sens bit 0, 26 = bit 1 */
+#define PIN_PIR_SENS1   26
 #define PIN_PWR_BUTTON  53
 #define PIN_PWR_PIR     24
 #define PIN_PWR_AMP     46
@@ -249,8 +251,12 @@ static void power_do_sleep(const char *why)
 
 	/* 2. pins held through the sleep: amp enable low (floating leaks audio + current), PIR enabled */
 	keep_pin_in_sleep(PIN_PWR_AMP, false);
-	if (s_wake_pir)
+	if (s_wake_pir) {
+		uint32_t sens = app_power_pir_sens();
 		keep_pin_in_sleep(PIN_PIR_ENABLE, true);
+		keep_pin_in_sleep(PIN_PIR_SENS0, (sens & 1) != 0);   /* the stock keeps the sensitivity bits driven; floating = undefined sensitivity */
+		keep_pin_in_sleep(PIN_PIR_SENS1, (sens & 2) != 0);
+	}
 
 	/* 3. wake sources: GPIO (button falling, USB plug rising, PIR rising if enabled) + RTC */
 	bk_gpio_register_wakeup_source(PIN_PWR_BUTTON, GPIO_INT_TYPE_FALLING_EDGE);
