@@ -6,23 +6,31 @@ at a time and reads the light sensor after each: the pin whose release makes the
 the one that was sinking a visible LED. Phase 2 (from the all-hi-Z state) sinks each floating
 candidate for a moment and looks for the reading to rise. Everything is left hi-Z at the end.
 
-Usage: led_by_light.py [--phase2] [--keep N ...]   (firmware v0.5.0+)
+Usage: led_by_light.py [--phase2] [--keep N ...] [--adc N] [--port DEV]   (firmware v0.5.0+)
   --adc N    use SARADC channel N as the meter (default 10 = light sensor; 9 = supply sense)
   --keep N   drive GPIO N high first and leave it out of the sweeps (power-enable lines, e.g. 9)
+  --port DEV UART adapter (default: SERIAL_PORT or the first USB serial device)
 """
-import glob, re, statistics, sys, time
+import argparse, re, statistics, sys, time
 import serial
+import dbenv
 
 CONSOLE = {10, 11}
 # never sink these as outputs: externally held low/high in pinmap_session4 (contention risk)
 NO_SINK = {0, 3, 4, 12, 15, 24, 27, 44, 45, 53} | set(range(29, 40))
-ADC_CH = next((int(sys.argv[i + 1]) for i, a in enumerate(sys.argv) if a == "--adc"), 10)
+ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+ap.add_argument("--phase2", action="store_true")
+ap.add_argument("--keep", type=int, action="append", default=[])
+ap.add_argument("--adc", type=int, default=10)
+ap.add_argument("--port")
+ARGS = ap.parse_args()
+ADC_CH = ARGS.adc
 RE_ADC = re.compile(rf"ADC{ADC_CH} raw=(\d+) mv=(\d+)")
 
 
 class Shell:
-    def __init__(self):
-        self.s = serial.Serial(glob.glob("/dev/cu.usbserial-*")[0], 115200, timeout=0.05)
+    def __init__(self, port=None):
+        self.s = serial.Serial(dbenv.serial_port(port), 115200, timeout=0.05)
         self.read(0.3)
 
     def read(self, sec):
@@ -47,8 +55,8 @@ class Shell:
 
 
 def main():
-    sh = Shell()
-    keep = {int(sys.argv[i + 1]) for i, a in enumerate(sys.argv) if a == "--keep"}
+    sh = Shell(ARGS.port)
+    keep = set(ARGS.keep)
     for k in sorted(keep):
         sh.cmd(f"pin out {k} 1", 0.3)
         print(f"holding GPIO {k} high (power enable)")
@@ -76,7 +84,7 @@ def main():
     allhiz = sh.light(5)
     print(f"all pins hi-Z: {allhiz} mV   phase-1 hits: {hits}")
 
-    if "--phase2" in sys.argv or hits == []:
+    if ARGS.phase2 or hits == []:
         print("== phase 2: sink floating candidates one at a time (from all hi-Z) ==")
         cands = [p for p in pins if p not in NO_SINK]
         for p in cands:

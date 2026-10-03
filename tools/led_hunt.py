@@ -4,6 +4,7 @@ Run it in a terminal next to the doorbell (firmware v0.5.0+ on UART0):
 
     python3 tools/led_hunt.py            # all floating candidates
     python3 tools/led_hunt.py 5 8 2 6    # only these pins
+    --port DEV                           # UART adapter (default: SERIAL_PORT or the first USB serial device)
 
 For each pin it blinks 6 times (0.3 s on / 0.3 s off), then asks what you saw:
   w = white fill light, b = blue ring LED(s), o = other (IR, click, buzz...), n = nothing,
@@ -11,8 +12,9 @@ For each pin it blinks 6 times (0.3 s on / 0.3 s off), then asks what you saw:
 GPIO 9 (sensor-rail enable) is held high and skipped; the console pins and pins that are driven
 by something else on the board are skipped too.
 """
-import glob, re, sys, time
+import argparse, re, sys, time
 import serial
+import dbenv
 
 CONSOLE = {10, 11}
 KEEP_HIGH = {9}
@@ -20,7 +22,11 @@ NO_SINK = {0, 3, 4, 12, 15, 24, 27, 44, 45, 53} | set(range(29, 40))
 
 
 def main():
-    s = serial.Serial(glob.glob("/dev/cu.usbserial-*")[0], 115200, timeout=0.05)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("pins", nargs="*", type=int, help="only these GPIOs (default: all floating candidates)")
+    ap.add_argument("--port", help="UART adapter")
+    a = ap.parse_args()
+    s = serial.Serial(dbenv.serial_port(a.port), 115200, timeout=0.05)
 
     def cmd(line, wait=0.3):
         s.reset_input_buffer()
@@ -34,8 +40,8 @@ def main():
     cmd("\r\n")
     for k in KEEP_HIGH:
         cmd(f"pin out {k} 1")
-    if len(sys.argv) > 1:
-        pins = [int(a) for a in sys.argv[1:]]
+    if a.pins:
+        pins = a.pins
     else:
         pins = [p for p in range(56) if p not in CONSOLE | KEEP_HIGH | NO_SINK]
     print(f"{len(pins)} pins to try: {pins}\nWatch the board. Press Enter to start.")

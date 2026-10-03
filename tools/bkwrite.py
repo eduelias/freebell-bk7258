@@ -16,6 +16,7 @@ Usage:
   bkwrite.py IMAGE --start 0x0                 # dry run: report differing sectors
   bkwrite.py IMAGE --start 0x0 --write         # actually flash
   bkwrite.py BACKUP.bin --start 0x0 --write --allow-tail   # full restore
+  --port DEV selects the UART adapter (default: SERIAL_PORT or the first USB serial device).
 """
 import argparse, struct, sys, time
 from bkread import BK
@@ -100,6 +101,7 @@ def main():
     ap.add_argument("--kick-wdt", type=lambda s: int(s, 0), metavar="AON_WDT_ADDR",
                     help="first force a watchdog reset via the SDK shell's `memset` (two key writes), "
                          "then catch the ROM window immediately")
+    ap.add_argument("--port", help="UART adapter (default: SERIAL_PORT or the first USB serial device)")
     a = ap.parse_args()
 
     img = open(a.image, "rb").read()
@@ -112,7 +114,7 @@ def main():
         sys.exit(f"range ends at {hex(end)}, overlapping stock KV/RF area at {hex(TAIL_START)}; use --allow-tail to override")
     print(f"image {a.image}: {len(img)//1024} KB -> flash {hex(a.start)}-{hex(end)}  mode={'WRITE' if a.write else 'DRY RUN'}", flush=True)
 
-    bk = BKW()
+    bk = BKW(port=a.port)
     if a.kick:
         # Reset the *running* firmware, then catch the ROM's link window right after:
         # Beken bkreg frame (CMD_Reboot) for stock/SDK images, plus our own `reboot` command.
