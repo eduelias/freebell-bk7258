@@ -66,7 +66,7 @@ reason is a crash/watchdog, automatic sleep is inhibited for that boot (`pwr sta
 ## Steps (least risky first)
 
 Observe with: `dbcmd.py` replies, UART (`tools/serial_capture.py`), HA `input_text.doorbell_bk7258_last_report`
-and the new sensors (after the HA changes below), the Mac camera for LEDs / Mac mic for the chime.
+and the new sensors (after the HA changes below), the laptop camera for LEDs / laptop mic for the chime.
 
 1. **Battery & charger readout (no risk).** `pwr status` -> expect `batt ~4020 mV ~9x% (adc15 ~2012 mV x2.00) usb 1 chg 0 | sleep off ... | boot ... `.
    `hook test` -> HA last report contains `"batt_mv":40xx,"batt_pct":..,"usb":1,"charging":0`.
@@ -84,7 +84,7 @@ and the new sensors (after the HA changes below), the Mac camera for LEDs / Mac 
 4. **Button wake + chime before Wi-Fi.** `pwr snap_min 30`, `pwr sleepnow`, wait for silence, press
    the button. Expected: chime + blue ring within ~2 s of the press (UART: `[pwr] boot: deepsleep gpio
    wake=button`, then `[fx] ring`), HA gets `wake reason button` **and** `ring` (notify.doorbell_family
-   fires) once the IP is up. Mac mic can time the chime vs the press.
+   fires) once the IP is up. A laptop mic can time the chime vs the press.
 5. **USB-plug wake and console wake.** `pwr sleepnow`; after silence unplug and replug USB -> boot
    with `wake=usb`. Again `pwr sleepnow`, then press Enter on the serial console -> `wake=uart`.
    (Both are the recovery paths; confirm them before testing on battery.)
@@ -107,7 +107,7 @@ and the new sensors (after the HA changes below), the Mac camera for LEDs / Mac 
    partially drained pack (this is the one polarity not yet seen: if it stays 0 while clearly
    charging, GPIO 15 is active-low and `charging()` in power.c needs inverting).
 
-## Home Assistant changes (apply on the HA box via du7, then `ha core check`)
+## Home Assistant changes (apply on the HA box, then `ha core check`)
 
 ### 1. `/config/automations.yaml`, automation `doorbell_bk7258_webhook`: add the event fan-out and the wake branch
 
@@ -241,7 +241,7 @@ default `allowlist_external_dirs`, so `camera.snapshot` can write there.
 | 1 battery/charger readout | `pwr status`: `batt 3886 mV 72% (adc15 1943 mV x2.00) usb 1 chg 0`; `hook test` -> HA last report had `batt_mv 3888, batt_pct 72, usb 1, charging 0`; HA sensors populated through the event fan-out. **But** GPIO 19 follows the internal pull (`pin in 19 down` -> usb 0, `up`/`none` -> usb 1): the pin may be floating, i.e. USB may not be plugged at all. GPIO 15 reads 0 with pull-down, none and pull-up = externally driven low (consistent with "not charging"). The pack read 4024 mV at 16:00 (implementer) and 3886 mV at 19:20 after 3 h of HA camera streaming, then flat for 20 min with the camera closed. `adc 15` on its own printed 2006 mV while `pwr status` (median of 3, back-to-back) printed 1943: the readings are bimodal (see caveat in README). Charging polarity still unobserved. |
 | 2 persist | `pwr idle 45`, `pwr snap_min 1`, `reboot` -> both values back after the reboot. OK |
 | 3 RTC wake 1 min | `pwr sleepnow` 19:21:41 -> off the LAN 19:21:54 (+12 s), back 19:22:54 (+72 s = 60 s sleep + ~2 s boot-to-IP), `pwr status`: `boot deepsleep rtc wake=rtc`. HA: `boot` 17:22:53.658Z, `wake reason rtc` .798Z (140 ms later), logbook "woke up (rtc), battery 72 % / 3886 mV", `wake_latest.jpg` (74 KB) written 19:22:58. **PASS** |
-| 4 button wake + chime | needs the owner (asked by WhatsApp 19:36, device left cycling, see below) |
+| 4 button wake + chime | needs the owner (device left cycling, see below) |
 | 5 USB-plug / console wake | needs the owner (USB); console RX wire is dead |
 | 6 automatic sleep | tested with `pwr sleep force on`, `idle 20`, `snap_min 10` (HA camera idle, `busy 0`): see the timeline below |
 | 7 PIR wake | `wake_pir on`, `pir sens 2` (bare board self-triggers ~6/min awake), `snap_min 2`, `sleepnow` 19:24:08 -> off 19:24:20, back **19:26:22 by RTC**, `wake=rtc`, GPIO24 already pulsing again 5 s after boot. Rail check while awake: edges/min with GPIO 9 low 4, GPIO 28 low 5, GPIO 5+6 low 5 (baseline 6) -> the PIR stays powered through the sleep; `bk_gpio_register_wakeup_source` cannot fail here (4 slots, 3 used). Conclusion: the awake "self-triggering" is most likely EMI from the running board and the PIR is quiet while the SoC sleeps; a human wave is needed. v0.21.1 additionally holds GPIO 25/26 (sensitivity bits) through the sleep. **UNPROVEN** |

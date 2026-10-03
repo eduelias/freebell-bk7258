@@ -21,7 +21,7 @@ end of this file.**
   `CONFIG_H264_P_FRAME_CNT=29` (IDR + SPS/PPS every 30 frames = 2 s at 15 fps),
   `CONFIG_H264_ADD_SELF_DEFINE_SEI=n` (no 96-byte private SEI per frame),
   `CONFIG_H264_FRAME_SIZE=131072` (720p I-frames fit). **Kconfig change: delete
-  `$OUT/du7/bk7258_cp1`, `_cp2` and `bk7258` before the first build of this branch in an existing
+  `$OUT/doorbell/bk7258_cp1`, `_cp2` and `bk7258` before the first build of this branch in an existing
   OUT dir** (same lesson as the partition CSVs; a fresh OUT is fine).
 - Rate control: `rtsp q IMB PMB` (KV `db_h264_q`, default `120 24`) = target bits per 16x16
   macroblock for I and P frames, applied through `media_app_set_compression_ratio()` after the
@@ -46,7 +46,7 @@ end of this file.**
 | `cam open [W H] [h264]` | manual open in JPEG (default) or H.264 (switches if needed) | - |
 | `cam close` / `cam stat` | close; `stat` now shows the open mode, policy and H.264 frame count | - |
 
-All commands go through `~/.pyenv/versions/3.11.13/bin/python3 tools/dbcmd.py <cmd...>`.
+All commands go through `python3 tools/dbcmd.py <cmd...>`.
 
 ## Step 0: flash and baseline (nothing enabled yet)
 
@@ -60,11 +60,11 @@ curl -s -o /tmp/s.jpg -w '%{http_code} %{size_download}\n' http://192.168.2.89:8
 Expected: 200 and a 30-90 KB JPEG, exactly as 0.18.x (RTSP is off by default; the only behavioural
 change with RTSP off is the 150 KB buffer cap, which CPU1 can never exceed).
 
-## Step 1: enable RTSP, probe with ffprobe from du7 (TCP)
+## Step 1: enable RTSP, probe with ffprobe from the bench host (TCP)
 
 ```bash
 python3 tools/dbcmd.py rtsp on
-# on du7 (pi_exec host du7, or ssh esaleh@192.168.2.68):
+# on a Linux host on the LAN with ffmpeg (the bench host):
 ffprobe -v error -rtsp_transport tcp -show_streams rtsp://192.168.2.89:554/live 2>&1 | egrep 'codec_name|width|height|r_frame_rate|profile'
 ```
 Expected: `codec_name=h264`, `width=1280`, `height=720`, frame rate ~15/1, profile Baseline/Main
@@ -81,16 +81,16 @@ python3 tools/dbcmd.py rtsp status
 ```
 Expected: ~150 frames, no `corrupt`/`missing picture` warnings beyond the first second; `rtsp
 status` shows `in 15.0 fps`, kbps in the 600-1600 range, `drop busy 0 big 0`, `key` growing by one
-every 2 s, the client line with `tcp playing`, `lost 0`. Copy `/tmp/db.mp4` to the Mac and play it
-(or `ffplay -rtsp_transport tcp rtsp://192.168.2.89:554/live` on the Mac directly: it has ffmpeg).
+every 2 s, the client line with `tcp playing`, `lost 0`. Copy `/tmp/db.mp4` to the workstation and play it
+(or `ffplay -rtsp_transport tcp rtsp://192.168.2.89:554/live` on the workstation directly if it has ffmpeg).
 
 ## Step 2: UDP transport and multiple clients
 
 ```bash
-# du7: UDP (ffmpeg's default tries UDP first)
+# bench host: UDP (ffmpeg's default tries UDP first)
 ffmpeg -v warning -i rtsp://192.168.2.89:554/live -t 10 -c copy -y /tmp/db_udp.mp4
 python3 tools/dbcmd.py rtsp status     # client line says "udp"; udp_err should stay small (< 1 %)
-# Mac + du7 at the same time (2 clients), then a 3rd; a 4th gets "503 Service Unavailable"
+# laptop + bench host at the same time (2 clients), then a 3rd; a 4th gets "503 Service Unavailable"
 ```
 Expected: both play; `clients 2/3 (2 playing)`. If UDP shows many `udp_err` or artefacts while TCP
 is clean, note it and prefer TCP everywhere (HA/go2rtc uses TCP by default).
@@ -119,7 +119,7 @@ python3 tools/dbcmd.py rtsp q 100 16     # ~1.0 Mbit/s nominal, applied live
 python3 tools/dbcmd.py rtsp q 160 40     # richer; watch "big" drops in rtsp status (must stay 0)
 python3 tools/dbcmd.py rtsp q 120 24     # default
 ```
-Judge with ffplay on the Mac: blockiness on motion (wave a hand) vs `kbps` in `rtsp status`. Any
+Judge with ffplay on the workstation: blockiness on motion (wave a hand) vs `kbps` in `rtsp status`. Any
 `drop big` means an access unit exceeded 96 KB: lower IMB. Any `drop busy` with one LAN client means
 that client stalled (TCP backpressure): check Wi-Fi, not the device.
 
@@ -127,15 +127,14 @@ that client stalled (TCP backpressure): check Wi-Fi, not the device.
 
 Option A (recommended): stream-only generic camera, stills come from the stream (no mode flapping).
 `tools/ha_generic_camera.py` (this branch) learned `options` (options flow of an existing entry),
-an optional `--still` and `--rtsp-transport`. Copy it to du7 and run there (token in `~/.ha_token`):
+an optional `--still` and `--rtsp-transport`. Run it from a host that can reach HA (token in `~/.ha_token`):
 ```bash
-scp tools/ha_generic_camera.py esaleh@192.168.2.68:~/ha_generic_camera.py
-# on du7:
-~/.venv-ha/bin/python ~/ha_generic_camera.py list                       # entry_id of "Doorbell BK7258"
-~/.venv-ha/bin/python ~/ha_generic_camera.py options ENTRY_ID --stream rtsp://192.168.2.89:554/live --rtsp-transport tcp
+# from any host that can reach HA (HA_URL, long-lived token in ~/.ha_token):
+python3 tools/ha_generic_camera.py list                       # entry_id of "Doorbell BK7258"
+python3 tools/ha_generic_camera.py options ENTRY_ID --stream rtsp://192.168.2.89:554/live --rtsp-transport tcp
 # (if the options flow rejects an empty still URL, delete + add instead:)
-~/.venv-ha/bin/python ~/ha_generic_camera.py delete ENTRY_ID
-~/.venv-ha/bin/python ~/ha_generic_camera.py add --stream rtsp://192.168.2.89:554/live --rtsp-transport tcp
+python3 tools/ha_generic_camera.py delete ENTRY_ID
+python3 tools/ha_generic_camera.py add --stream rtsp://192.168.2.89:554/live --rtsp-transport tcp
 ```
 The script prints any unknown step's schema; the HA 2026.9 generic flow may want `rtsp_transport`
 inside the nested `advanced` section instead of top level - adjust the `data` dict if it complains.
@@ -180,7 +179,7 @@ python3 tools/dbcmd.py rtsp on
 
 - `rtsp off` + `cam mode jpeg` restores the 0.18.x behaviour at runtime (both persisted).
 - Or OTA the previous image: `scripts/release.sh --no-build` after `ln -sf doorbell-fw_0.18.5_app_pack.rbl
-  ~/data/doorbell-bk7258/firmware/doorbell-fw_latest_app_pack.rbl` (or point `ota` at it directly).
+  $FW_DIR/doorbell-fw_latest_app_pack.rbl` (or point `ota` at it directly).
 - KV keys this feature adds: `db_rtsp`, `db_rtsp_port`, `db_h264_q`, `db_cam_mode`; harmless if left.
 
 ## Known limits / things to watch
@@ -207,14 +206,14 @@ python3 tools/dbcmd.py rtsp on
   up: `CONFIG_H264_P_FRAME_CNT=29`, `H264_ADD_SELF_DEFINE_SEI` off, `H264_FRAME_SIZE=131072` on
   both CPUs). OTA via `release.sh --no-build` three times (0.22.0 / 0.22.1 / 0.22.2), ~90 s each.
 - Step 0: RTSP off by default, `cam stat` `open 0 - (mode auto)`, snapshot 200 / 74 KB / 1.6 s. OK.
-- Step 1 (TCP, Mac and du7): ffprobe `h264 Baseline level 41 1280x720 yuv420p`, SPS/PPS cached
+- Step 1 (TCP, laptop and bench host): ffprobe `h264 Baseline level 41 1280x720 yuv420p`, SPS/PPS cached
   (`sps 30 pps 4`), 10 s recordings play; but **~3 fps**, not 15: PTS spacing a steady 358-362 ms,
   `rtsp status in 2.9-3.0 fps`, 600 kbps. Same rate at 800x480 and in JPEG mode; CPU1 `media_debug`
   (`isr_jpeg == fps_wifi`) shows the encoder itself completes ~3 fps (5-8 fps right after a sensor
   power-on reset, ~9 fps in daylight per the 16:35 notes) => OV9650 night-mode frame-rate reduction,
   not the RTSP path. ffmpeg also warns `time_scale/num_units_in_tick invalid (0/1000)` (encoder VUI;
   cosmetic) and one `Non-monotonic DTS` for the IDR+first P pair at start.
-- Step 2: UDP from du7 works (35 frames / 12 s) with `RTP: missed 6 packets`; TCP lost 0 always.
+- Step 2: UDP from the bench host works (35 frames / 12 s) with `RTP: missed 6 packets`; TCP lost 0 always.
   Three concurrent TCP clients (`3/3 (3 playing)`, lost 0 each, 157/152/113 frames), a 4th gets 503.
 - Step 3: during play snapshot 200 (stale JPEG, 47 ms), `/stream` 503; after the clients stop the
   camera is back in JPEG in 2.4 s (the first snapshot is still the old JPEG); `cam mode jpeg` ->
@@ -231,7 +230,7 @@ python3 tools/dbcmd.py rtsp on
   3/8 bad in a cold-open loop), v0.22.2 uses 800 ms / 150 ms (7/8 ok) + stall self-heal + one retry
   in acquire: 6/6 DESCRIBEs with HA still-polls in between, the one silent open was repaired by the
   next DESCRIBE (7.8 s). Switch cost ~2.1 s.
-- Step 6: 20 min TCP soak from du7 (`systemd-run --user --unit rtsp-soak`, 21:11-21:31): no reboot
+- Step 6: 20 min TCP soak from the bench host (`systemd-run --user --unit rtsp-soak`, 21:11-21:31): no reboot
   (uptime 1852 s), ~3600 frames, `drop busy 2 big 0`, lost 0, ffmpeg log empty, heap 109 K with the
   client and back to 115 K after it left (no leak). v0.22.3 (power off on a failed open) then 6/6
   cold opens, DESCRIBE ok, heap 115.5 K.

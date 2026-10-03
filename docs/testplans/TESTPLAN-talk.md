@@ -48,7 +48,7 @@ curl -s 'http://192.168.2.89:8080/speak?tone=1000&ms=700'
 # -> after ~0.8 s: {"ok":true,"source":"tone","ms":700,"in_bytes":0,"in_rate":8000,"dma_frames":12,"underruns":0}
 ```
 Observe: a clean 1 kHz beep from the speaker; **no loud click** when the amp switches (the DAC
-starts on zeros, the PA comes on 20 ms later and goes off before the DAC stops). Mac check:
+starts on zeros, the PA comes on 20 ms later and goes off before the DAC stops). Laptop-mic check:
 record with `ffmpeg -f avfoundation -i ':1' -t 3 -ac 1 -ar 16000 tone.wav` in Terminal.app and run
 `tools/mac_ear.py tone.wav` (expect a 1 kHz dominant, like `spk tone`).
 UART: `[talk] tone 1000 Hz: 5600 samples`.
@@ -94,7 +94,7 @@ Abort: during a long POST run `python3 tools/dbcmd.py talk stop` -> playback sto
 ## 3. Speaker: pull from a URL (the HA path)
 
 ```bash
-# put a file on HA (from du7): scp hello16k.wav root@192.168.2.80:/config/www/doorbell/say.wav
+# put a file on HA (from the bench host): scp hello16k.wav root@192.168.2.80:/config/www/doorbell/say.wav
 curl -s -m 60 'http://192.168.2.89:8080/speak?url=http://192.168.2.80:8123/local/doorbell/say.wav'
 # -> {"ok":true,"source":"url","ms":1900,...}
 curl -s 'http://192.168.2.89:8080/speak?url=http://192.168.2.80:8123/local/doorbell/nope.wav'
@@ -105,13 +105,13 @@ HA's `/local/` needs no token. Only `http://` with an IPv4 literal.
 ## 4. Microphone
 
 ```bash
-# finite file, then look at it on the Mac
+# finite file, then look at it on the workstation
 curl -s -m 20 -o mic5.wav 'http://192.168.2.89:8080/mic.wav?seconds=5'   # ~5 s, 160044 bytes
 ffprobe mic5.wav                      # pcm_s16le, 16000 Hz, mono, 5.00 s
 python3 -c "import wave;w=wave.open('mic5.wav');print(w.getframerate(),w.getnframes()/w.getframerate())"
 afplay mic5.wav                        # talk near the doorbell while recording, hear yourself
 ```
-Tone check with the Mac as the voice: `afplay` a 1 kHz tone (or `tools/mac_ear.py` rig) near the
+Tone check with the laptop as the voice: `afplay` a 1 kHz tone (or `tools/mac_ear.py` rig) near the
 device during the 5 s, then `python3 tools/mic_raw.py`-style analysis or
 `ffmpeg -i mic5.wav -af "astats" -f null -` — expect the same quality as `mic rec` (pure sine,
 floor rms ~90 at gain 0x3f).
@@ -158,7 +158,7 @@ python3 tools/dbcmd.py talk gain auto; python3 tools/dbcmd.py talk micgain 0x3f;
 
 ## Home Assistant integration (ready to apply)
 
-All files on the HA box (via du7: `ssh esaleh@192.168.2.68`, then `ssh root@192.168.2.80`).
+All files on the HA box (`ssh root@<ha-ip>`).
 After editing YAML: `ha core check`, then **Developer tools > YAML > reload** "Scripts",
 "Shell commands" and "REST commands" (rest_command/shell_command reload exists in 2026.x; a core
 restart also works).
@@ -204,13 +204,13 @@ script:
         data: {url: "http://192.168.2.80:8123/local/doorbell/{{ file }}"}
 ```
 
-Prerecorded messages need no TTS at all: convert on the Mac with
+Prerecorded messages need no TTS at all: convert on the workstation with
 `ffmpeg -i in.mp3 -ac 1 -ar 16000 -f wav leave_parcel.wav`, copy to `/config/www/doorbell/`, call
 `script.doorbell_play` with `file: leave_parcel.wav`.
 
 ### B. `/config/doorbell_tts_wav.py` (new, `chmod 755`)
 
-Uses HA's `POST /api/tts_get_url` (needs a long-lived token: copy du7's `~/.ha_token` to
+Uses HA's `POST /api/tts_get_url` (needs a long-lived token: copy a long-lived token to
 `/config/.doorbell_ha_token`, `chmod 600`) and the `ffmpeg` that ships in the HA core container.
 Check the TTS entity id first (Developer tools > States, filter `tts.`): the default below is the
 Google Translate entity; set `TTS_ENTITY` accordingly.
@@ -285,17 +285,17 @@ Optional: add buttons to the mobile dashboard:
 Merge `feat/talk` -> main as v0.23.0 (6ccbeed; conflicts in both CMakeLists, includes, FW_VERSION,
 the HTTP hook ahead of `cam_want_jpeg()`, 6 KB client stack + `power_activity()`), build 99 s clean,
 OTA 21:43:46 -> back ~21:44:30. UART0 was dead all along (FTDI replays a frozen buffer), so UART
-lines were not checked; everything below is HTTP/`talk status`/Mac-mic/du7 evidence.
+lines were not checked; everything below is HTTP/`talk status`/laptop-mic/bench-host evidence.
 
 | Step | Result |
 |---|---|
 | 0 pre-flight | `talk status` idle, gain auto=0x1c micgain 0x3f max 30 s; index answers once the camera is open |
-| 1 tone | `{"ok":true,"ms":700,"dma_frames":13,"underruns":0}` in 0.97 s; Mac recording: both bursts a clean 991-1000 Hz dominant, silence floor rms 6, no transient at PA on/off |
+| 1 tone | `{"ok":true,"ms":700,"dma_frames":13,"underruns":0}` in 0.97 s; laptop recording: both bursts a clean 991-1000 Hz dominant, silence floor rms 6, no transient at PA on/off |
 | 2 POST | 16 k WAV, 8 k raw, chunked 16 k, 48 k stereo: all `ms 4239` for the 4.24 s clip, 0 underruns, `in_rate` right; u8 WAV -> 415 with the hint. Pitch check: a 400..3500 Hz tone ladder POSTed at 16 k mono / 48 k stereo / 8 k came out identical (1195, 1600, 2006, 2389, 3001, 3513 Hz in order; the bare speaker + Mac mic lose the 400/800 steps) |
 | 2 limit / busy / abort | `talk max 3` + 10.5 s clip -> `ms:3000` (3.2 s); tone during a POST -> 503 `speaker busy`; `talk stop` 3 s into a 10.5 s POST -> POST 200 after 4.3 s |
 | 3 url | `/speak?url=http://192.168.2.80:8123/local/doorbell/test_hello.wav` -> 200 `ms 4239 in_rate 16000`; missing file -> 502 `fetch failed` in 27 ms |
-| 4 mic | `?seconds=5`: 160044 B, pcm_s16le 16000 Hz mono, exactly 5.000 s; a 1 kHz tone from the Mac is the dominant in every 250 ms bin, floor rms ~50, DC ~650. **Found**: the first ~170 ms were a full-scale pop (60 ms at +32767, then a DC settle) -> v0.23.1 sends the first 200 ms as silence (f4e7326); verified: 0-200 ms all zero, then a ~100-peak tail. Live: ffmpeg client 4 s of the chunked stream OK, HTTP/1.0 (`curl -0`) OK, `talk status` idle right after the client leaves; second listener -> 503 `microphone busy` |
-| 5 half duplex | du7 `curl` listener for 16 s: the Mac's 1 kHz tone is heard (8.75-13.0 s of stream), then pure zeros while the device played its own 2 s tone; no echo of the device tone in the stream |
+| 4 mic | `?seconds=5`: 160044 B, pcm_s16le 16000 Hz mono, exactly 5.000 s; a 1 kHz tone from the laptop is the dominant in every 250 ms bin, floor rms ~50, DC ~650. **Found**: the first ~170 ms were a full-scale pop (60 ms at +32767, then a DC settle) -> v0.23.1 sends the first 200 ms as silence (f4e7326); verified: 0-200 ms all zero, then a ~100-peak tail. Live: ffmpeg client 4 s of the chunked stream OK, HTTP/1.0 (`curl -0`) OK, `talk status` idle right after the client leaves; second listener -> 503 `microphone busy` |
+| 5 half duplex | bench-host `curl` listener for 16 s: the laptop's 1 kHz tone is heard (8.75-13.0 s of stream), then pure zeros while the device played its own 2 s tone; no echo of the device tone in the stream |
 | 6 camera | snapshot 200 (34 KB) in 79 ms during the listener + tone; after everything RTSP `ffprobe` h264 1280x720 and snapshot still fine |
 | 7 persist | gain 0x18 / micgain 0x30 / max 20 survived the 0.23.1 OTA reboot; restored to auto / 0x3f / 30 |
 | HA | package appended (backup `.bak-20261003-talk`), `doorbell_tts_wav.py` + token file installed, `ha core check` OK, rest_command/script reload OK, `shell_command` has no reload service -> `ha core restart` (API back < 10 s). `shell_command.doorbell_tts_wav` with `return_response`: `say.wav 162894 B` = 16 kHz mono 5.09 s; `script.doorbell_say` 200 in 3.2 s, `rest_command.doorbell_tone` 200, `script.doorbell_play test_hello.wav` 200 in 4.5 s; the device counted the three `/speak` calls |

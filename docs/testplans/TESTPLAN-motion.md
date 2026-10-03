@@ -6,7 +6,7 @@ two command-table entries). Build: `OUT=~/data/doorbell-bk7258/avdk-build-motion
 (the rbl lands in `~/data/doorbell-bk7258/firmware-motion/`; the shared `firmware/` dir and its
 `_latest` symlink were deliberately left alone).
 
-All device commands below are `~/.pyenv/versions/3.11.13/bin/python3 tools/dbcmd.py ...` from the repo
+All device commands below are `python3 tools/dbcmd.py ...` from the repo
 root (TCP 2323); every command REPLYs its text, so UART is optional. Nothing here needs the owner.
 
 ## What changed on the device
@@ -24,7 +24,7 @@ Report JSON (all events) gains `"pir_on":0|1` and `"pir_sens":0..3`; `light_mv` 
 `motion_count` in the JSON is app_main's counter (PIR-accepted edges + `hook motion`); `pir status`
 `count` is the PIR module's own (hardware + `motion test`). They match unless `hook motion` was used.
 
-Stock facts the defaults come from (capstone on `~/data/doorbell-bk7258/doorbell_flash_20261002_logical.bin`,
+Stock facts the defaults come from (capstone on `<your dump directory>/doorbell_flash_logical.bin`,
 `tuya_pir.c` init at 0x02151c68, set_sens at 0x021519a4, set_enable at 0x02151e40): GPIO 50/26/25 are
 initialised push-pull OUTPUT HIGH from the 3-byte config at 0x020172d5 (`04 01 01`), then
 `set_sens(app_pir_sens)` writes GPIO25 = n&1, GPIO26 = (n>>1)&1. KV defaults `app_pir_sens`=1,
@@ -38,7 +38,7 @@ first real check.
 
 ## Device tests (after OTA of the 0.19.0 rbl)
 
-Observe on the Mac: `dbcmd.py` replies. In HA: `input_text.doorbell_bk7258_last_report` (Settings >
+Observe on the workstation: `dbcmd.py` replies. In HA: `input_text.doorbell_bk7258_last_report` (Settings >
 Helpers, or Developer tools > States), the persistent notifications, and the phones.
 
 1. **Boot state** - `dbcmd.py pir status`
@@ -85,14 +85,14 @@ Helpers, or Developer tools > States), the persistent notifications, and the pho
    `led`, `cam stat`, `spk tone 1000 300` unchanged. Heartbeat JSON (every 5 min) carries the two
    new fields; its length is ~190 bytes, inside the 256-byte buffer.
 
-## Home Assistant changes (apply on the HA box via du7)
+## Home Assistant changes (apply on the HA box)
 
 Files live on HA at `/config/automations.yaml`; edit through the SSH add-on as root
-(`ssh esaleh@192.168.2.68`, then `ssh root@192.168.2.80`) or with pi-fleet `pi_exec host=du7`.
+(`ssh root@<ha-ip>` from a host that can reach it).
 Back up first: `cp /config/automations.yaml /config/automations.yaml.bak-$(date +%Y%m%d)-motionsnap`.
 Create the snapshot dir once: `mkdir -p /config/www/doorbell` (exists already; it holds the OTA rbls).
 `/config/www` is inside HA's default `allowlist_external_dirs`, so `camera.snapshot` may write there.
-The phones are Android (`mobile_app_sm_s908b`, `mobile_app_sm_g986b`), so the `image:` key is the
+The phones are Android (`mobile_app_<your_phone>`), so the `image:` key is the
 right one (companion docs: `data.image` works on both platforms; iOS alternatively takes
 `attachment: {url: ...}`). `/config/www/x.jpg` is served as `/local/x.jpg`; the `?v=` suffix defeats
 the companion app's image cache for a filename that is reused every time.
@@ -167,7 +167,7 @@ not lost):
 
 Then: `ha core check` (must print no error), `ha core restart` is NOT needed; reload with
 `curl -s -X POST -H "Authorization: Bearer $(cat ~/.ha_token)" http://192.168.2.80:8123/api/services/automation/reload`
-from du7 (or Developer tools > YAML > Automations). Verify with
+from the HA box (or Developer tools > YAML > Automations). Verify with
 `curl -s -H "Authorization: Bearer $(cat ~/.ha_token)" http://192.168.2.80:8123/api/states/automation.doorbell_bk7258_webhook_events`
 (`"state":"on"`).
 

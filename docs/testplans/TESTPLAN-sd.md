@@ -1,8 +1,7 @@
 # TESTPLAN — feature `sd` (optional microSD storage), branch `feat/sd`
 
 Firmware: `doorbell-fw_0.19.3_app_pack.rbl` built from this worktree (the integrator renumbers).
-All commands below are `python3 tools/dbcmd.py <cmd>` from the repo (pyenv python
-`~/.pyenv/versions/3.11.13/bin/python3`), unless marked UART. Replies come back over TCP (the
+All commands below are `python3 tools/dbcmd.py <cmd>` from the repo (Python 3.11+), unless marked UART. Replies come back over TCP (the
 `REPLY()` text, max 320 bytes); the UART shows the same plus `[sd] ...` worker lines and the
 SDK's `sd_card` / `sdio_host` / `fatfs` logs.
 
