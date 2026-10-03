@@ -363,7 +363,7 @@ static void kv_set_str(const char *key, const char *val)
 	bk_set_env_enhance(key, val, os_strlen(val));
 }
 
-/* REPLY() for modules outside this file (sdcard.c) */
+/* REPLY() for modules outside this file (talk.c, sdcard.c) */
 void app_reply(const char *fmt, ...)
 {
 	char tmp[256];
@@ -1345,17 +1345,6 @@ bool aud_mic_busy(void) { return s_mic_busy; }
 uint32_t aud_mic_rate(void) { return 2 * s_adc_rate; }   /* measured 2026-10-03: the ADC delivers twice the configured rate */
 void aud_mic_stats(uint32_t *dma_frames, uint32_t *overruns) { *dma_frames = s_adc_frames; *overruns = s_mic_overrun; }
 
-void app_reply(const char *fmt, ...)
-{
-	char buf[256];
-	va_list ap;
-
-	va_start(ap, fmt);
-	vsnprintf(buf, sizeof(buf), fmt, ap);
-	va_end(ap);
-	REPLY("%s", buf);
-}
-
 /* ---- TCP command channel: the same commands as the UART shell, over the LAN ----
  * One line per connection: "<token> <command...>\n". The token is the KV string db_token
  * (set once over serial: `tok set SECRET`); without a stored token the channel is disabled.
@@ -2010,7 +1999,7 @@ int app_cam_grab(uint8_t *dst, uint32_t cap, uint32_t wait_ms)
 	uint32_t seq = 0, t0 = rtos_get_time();
 	int n;
 
-	if (!s_cam_open && cam_do_open(1280, 720) != BK_OK)
+	if (cam_want_jpeg() != 0 && !s_cam_len)   /* H.264 busy (RTSP viewer): fall back to the last JPEG if any */
 		return -1;
 	if (!s_cam_mutex || !s_cam_buf)
 		return -2;

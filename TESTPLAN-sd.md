@@ -144,3 +144,21 @@ JSON - not done here to keep the merge trivial. Suggested follow-up once the car
   is why the code never lowers it on its own.
 - Unformatted/exFAT cards: `f_mount` returns FR_NO_FILESYSTEM for a blank card (handled); exFAT is
   compiled in (FF_FS_EXFAT=1), so >32 GB cards formatted on a PC should mount too.
+
+## Results 2026-10-03 22:17 (v0.24.0 on the device, no card inserted)
+
+Merged as `fd3f1fa`; two merge fixes before it built: the duplicate `app_reply()` (talk and sd
+both added one) and `app_cam_grab()` calling the removed `cam_do_open()` (now `cam_want_jpeg()`,
+falling back to the last JPEG while an RTSP viewer holds H.264). OTA via `release.sh --no-build`,
+device back in ~50 s.
+
+- T1 no-card path PASS: UART `[sd] sd host + fatfs, auto on, pins 2/3/4, pwr 6` at boot, probe
+  at +8 s = `sd card unsupport voltage` + `acmd41 retry time out`, `[sd] no card (init -14600,
+  1170 ms)`; `sd status` shows `card absent unmounted ... no card (init -14600, 1170 ms)`.
+- NTP PASS: first sync 15 s after IP, `sd sync` -> `2/2 ok`; `sd tz 120` applied immediately.
+- `sd save test` without a card -> `save: not mounted (` + "`sd mount`" + `)`, no crash.
+- Camera `cam close` + HTTP snapshot x3 -> 200 in 1.4-2.0 s each (rail power-cycle path with
+  `sd_holds_gpio()` inactive because no card), frames flowing after; heap 108 KB flat; pir/pwr/rtsp
+  status unchanged. No fault/assert lines on UART.
+- Not run tonight (owner asleep, would push phone notifications): ring/motion auto-save. T2-T5 need
+  a card.
