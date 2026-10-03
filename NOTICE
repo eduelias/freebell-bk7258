@@ -1,0 +1,33 @@
+doorbell-bk7258-fw
+Copyright 2026 Eduardo Elias Saleh
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+It includes or derives from the following third-party work.
+
+Beken Armino SDK (bk_idk) and Audio/Video Development Kit (bk_avdk), release/v2.0.1
+  https://github.com/bekencorp/bk_idk
+  https://github.com/bekencorp/bk_avdk
+  Copyright Beken Corporation. Licensed under the Apache License, Version 2.0.
+  The firmware is built inside these trees. The files under patches/ and
+  patches-avdk/ are modifications of SDK/AVDK sources and the files under
+  avdk-overlay/ are additions to the AVDK tree; all are derivative works of
+  the Beken code and are distributed under the same Apache-2.0 terms.
+
+project/main/vendor_flash.c
+  Copyright (c) 2017 BEKEN Inc. Licensed under the MIT License; the full
+  licence text is in the file header, which is kept unchanged.
+
+project/main/vendor_flash_partition.h
+  Copyright 2020-2021 Beken. Licensed under the Apache License, Version 2.0
+  (header kept unchanged).
+
+avdk-overlay/components/bk_peripheral/src/dvp/dvp_ov9650.c
+  OV9650 DVP sensor driver written for this project. Its structure follows
+  Beken's dvp_ov2640.c from bk_avdk (Apache-2.0). The OV9650 register
+  configuration it programs is the sensor configuration the shipped firmware
+  of this doorbell uses, recovered from the device's own flash for
+  interoperability with the sensor module fitted to the board.
+
+OmniVision OV9650 is a product of OmniVision Technologies; Beken, BK7258 and
+Armino are trademarks of Beken Corporation; Tuya is a trademark of Tuya Inc.
+This project is not affiliated with or endorsed by any of them.
