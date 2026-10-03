@@ -72,7 +72,8 @@ def main():
         data["still_image_url"] = args.still
     if args.stream:
         data["stream_source"] = args.stream
-        data["rtsp_transport"] = args.rtsp_transport
+        # HA 2026.9 keeps rtsp_transport inside the "advanced" section (verified on the live entries)
+        data["advanced"]["rtsp_transport"] = args.rtsp_transport
     for _ in range(6):
         if flow.get("type") == "create_entry":
             res = flow.get("result") or {}

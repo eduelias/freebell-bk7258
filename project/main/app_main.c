@@ -63,7 +63,7 @@ void db_reply(const char *fmt, ...)
 	REPLY("%s", buf);
 }
 
-#define FW_VERSION "0.22.0"
+#define FW_VERSION "0.22.1"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -234,6 +234,30 @@ static void cli_pin_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 }
 
 /* ---- adc: one calibrated reading of a SARADC channel (same sequence as volt_detect.c) ---- */
+
+/* mem HEXADDR [N]: N (<= 16) raw 32-bit reads. Debug only (CPU1 counters such as media_debug
+ * live in shared SRAM and are otherwise only visible on the dead UART); a bad address faults. */
+static void cli_mem_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
+{
+	uint32_t addr, n = 4, i;
+	char line[160];
+	int l = 0;
+
+	if (argc < 2) {
+		REPLY("mem HEXADDR [NWORDS<=16]  (raw 32-bit reads, debug only)\r\n");
+		return;
+	}
+	addr = os_strtoul(argv[1], NULL, 16) & ~3U;
+	if (argc > 2)
+		n = os_strtoul(argv[2], NULL, 10);
+	if (n < 1)
+		n = 1;
+	if (n > 16)
+		n = 16;
+	for (i = 0; i < n && l < (int)sizeof(line) - 10; i++)
+		l += snprintf(line + l, sizeof(line) - l, "%s%08x", i ? " " : "", (unsigned)*(volatile uint32_t *)(addr + 4 * i));
+	REPLY("[mem] %08x: %s\r\n", (unsigned)addr, line);
+}
 
 static void cli_adc_read_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
 {
@@ -1543,6 +1567,23 @@ static void cam_rails(int on)
 	}
 }
 
+/* The camera's own supplies: GPIO 28 (sensor power, also feeds the LDR divider) and the LDO
+ * enables 5/6. Dropped at every close so the next open is a real power-on reset of the OV9650:
+ * a close followed by a reopen within a few seconds otherwise leaves the sensor silent (no
+ * frames, "camera wedge", 2026-10-03) and only a rail cycle or a reboot brings it back. GPIO 9
+ * (light sensor / LED rail) is left alone. */
+static uint32_t s_cam_off_ms;
+static void cam_power(int on)
+{
+	static const int pins[] = {28, 5, 6};
+	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
+		pin_configure(pins[i], GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+		if (on) bk_gpio_set_output_high(pins[i]); else bk_gpio_set_output_low(pins[i]);
+	}
+	if (!on)
+		s_cam_off_ms = rtos_get_time();
+}
+
 static void cli_cam_probe(int argc, char **argv)
 {
 	beken_thread_t t;
@@ -1591,8 +1632,13 @@ static int cam_open_locked(uint32_t w, uint32_t h, bool h264)
 	if (!s_cam_mutex)
 		rtos_init_mutex(&s_cam_mutex);
 #if CONFIG_DVP_CAMERA
+	if (s_cam_off_ms) {   /* at least 250 ms without power between a close and the next open */
+		uint32_t off = rtos_get_time() - s_cam_off_ms;
+		if (off < 250)
+			rtos_delay_milliseconds(250 - off);
+	}
 	cam_rails(1);   /* GPIO 9, 28 (camera power, active high per the stock firmware), 5, 6 */
-	rtos_delay_milliseconds(30);
+	rtos_delay_milliseconds(60);
 	/* stock bk_dvp_camera_enumerate: GPIO 52 low 100 ms, high 100 ms, low (sensor PWDN/RESET pulse) */
 	pin_configure(52, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
 	bk_gpio_set_output_low(52);
@@ -1632,6 +1678,9 @@ static void cam_close_locked(void)
 	s_cam_open = false;
 	s_cam_h264 = false;
 	s_h264_q_pending = false;
+#if CONFIG_DVP_CAMERA
+	cam_power(0);   /* power-on reset at the next open, see cam_power() */
+#endif
 }
 
 /* Push our H.264 rate-control targets to the CPU1 encoder. Only valid once the first frame is
@@ -2229,6 +2278,7 @@ uint32_t app_power_pir_sens(void)
 static const struct cli_command s_doorbell_commands[] = {
 	{"pin", "pin all|mux|get|in|out|blink|watch ... (GPIO mapping)", cli_pin_cmd},
 	{"adc", "adc CHANNEL (one calibrated SARADC reading)", cli_adc_read_cmd},
+	{"mem", "mem HEXADDR [N] (raw 32-bit reads, debug)", cli_mem_cmd},
 	{"reboot", "reset the SoC (ROM download mode is reachable right after)", cli_reboot_cmd},
 #if (CONFIG_SYS_CPU0)
 	{"wifi", "wifi set SSID PASS | clear | connect | (status)", cli_wifi_cmd},
