@@ -1,0 +1,36 @@
+diff --git a/components/bk_peripheral/include/dvp_sensor_devices.h b/components/bk_peripheral/include/dvp_sensor_devices.h
+index 03bb5b3..ae252f2 100755
+--- a/components/bk_peripheral/include/dvp_sensor_devices.h
++++ b/components/bk_peripheral/include/dvp_sensor_devices.h
+@@ -24,6 +24,7 @@ extern const dvp_sensor_config_t dvp_sensor_gc0328c;
+ extern const dvp_sensor_config_t dvp_sensor_gc2145;
+ extern const dvp_sensor_config_t dvp_sensor_hm1055;
+ extern const dvp_sensor_config_t dvp_sensor_ov2640;
++extern const dvp_sensor_config_t dvp_sensor_ov9650;
+ extern const dvp_sensor_config_t dvp_sensor_gc0308;
+ extern const dvp_sensor_config_t dvp_sensor_SC101;
+ 
+diff --git a/components/bk_peripheral/src/dvp/config.cmake b/components/bk_peripheral/src/dvp/config.cmake
+index 8fc432e..fd9617b 100755
+--- a/components/bk_peripheral/src/dvp/config.cmake
++++ b/components/bk_peripheral/src/dvp/config.cmake
+@@ -28,3 +28,7 @@ endif()
+ if (CONFIG_DVP_CAMERA)
+ 	list(APPEND DVP_CAMERA_DEVICE_FILES ${DVP_CAMERA_PATH}/dvp_sc101.c)
+ endif()
++
++if (CONFIG_DVP_CAMERA)
++	list(APPEND DVP_CAMERA_DEVICE_FILES ${DVP_CAMERA_PATH}/dvp_ov9650.c)
++endif()
+diff --git a/components/bk_peripheral/src/dvp/dvp_sensor_devices.c b/components/bk_peripheral/src/dvp/dvp_sensor_devices.c
+index 097fe62..a42094a 100755
+--- a/components/bk_peripheral/src/dvp/dvp_sensor_devices.c
++++ b/components/bk_peripheral/src/dvp/dvp_sensor_devices.c
+@@ -29,6 +29,7 @@
+ 
+ const dvp_sensor_config_t *dvp_sensor_configs[] =
+ {
++	&dvp_sensor_ov9650,   /* Tuya IP108 doorbell sensor; probe it first (shares 0x30 with ov2640) */
+ 	&dvp_sensor_gc0328c,
+ 	&dvp_sensor_hm1055,
+ 	&dvp_sensor_gc2145,

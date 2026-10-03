@@ -26,9 +26,21 @@
 #include <driver/flash.h>
 #include <driver/dma.h>
 #endif
+#ifdef DU7_AVDK   /* all cores: media_service_init() runs on CPU0/1/2 */
+#include "media_service.h"
+#if (CONFIG_SYS_CPU0)   /* the multimedia component (media_app) is only linked into the CPU0 image */
+#include "media_app.h"
+#include <driver/media_types.h>
+#include <driver/i2c.h>
+#include <driver/i2c_types.h>
+#if CONFIG_DVP_CAMERA
+#include <driver/video_common_driver.h>
+#endif
+#endif
+#endif
 
 #define FW_NAME "doorbell-bk7258-fw"
-#define FW_VERSION "0.14.1"
+#define FW_VERSION "0.16.1"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -47,6 +59,7 @@ extern float saradc_calculate(uint16_t adc_val);
 /* In libdriver (middleware/driver/gpio), not in a public header: releases a pin from the SDK
  * device map, otherwise bk_gpio_set_config() fails with BK_ERR_GPIO_INTERNAL_USED (-0x2009). */
 extern bk_err_t gpio_dev_unmap(gpio_id_t gpio_id);
+extern bk_err_t gpio_dev_map(gpio_id_t gpio_id, gpio_dev_t dev);
 /* EasyFlash KV (components/easy_flash/bk_ef.h); value_len bytes, returns len read / EF_NO_ERR */
 extern int bk_set_env_enhance(const char *key, const void *value, int value_len);
 extern int bk_get_env_enhance(const char *key, void *value, int value_len);
@@ -1153,6 +1166,357 @@ static void tcp_cmd_task(beken_thread_arg_t arg)
 	}
 }
 
+#if defined(DU7_AVDK) && (CONFIG_SYS_CPU0)
+/* ---- camera (AVDK build only): DVP sensor -> hardware JPEG on CPU1, frames delivered here by the
+ * media transfer task; we keep the latest JPEG in PSRAM and can push it to a TCP peer ---- */
+#define CAM_BUF_MAX (200 * 1024)
+static uint8_t *s_cam_buf;
+static volatile uint32_t s_cam_len, s_cam_frames, s_cam_seq, s_cam_w, s_cam_h, s_cam_drop, s_cam_last_ms;
+static beken_mutex_t s_cam_mutex;
+static bool s_cam_open;
+
+static void cam_frame_cb(frame_buffer_t *frame)
+{
+	if (!frame || !frame->frame || frame->length == 0 || frame->length > CAM_BUF_MAX || !s_cam_buf)
+		return;
+	if (rtos_trylock_mutex(&s_cam_mutex) != BK_OK) {   /* a snapshot is being read out: skip this frame */
+		s_cam_drop++;
+		return;
+	}
+	os_memcpy(s_cam_buf, frame->frame, frame->length);
+	s_cam_len = frame->length;
+	s_cam_seq = frame->sequence;
+	s_cam_w = frame->width;
+	s_cam_h = frame->height;
+	s_cam_frames++;
+	s_cam_last_ms = rtos_get_time();
+	rtos_unlock_mutex(&s_cam_mutex);
+}
+
+static void camsnap_task(beken_thread_arg_t arg)
+{
+	int sock = tcp_connect(s_net_host, s_net_port);
+	uint32_t len = 0, off = 0;
+	int n;
+
+	if (sock < 0) {
+		os_printf("[cam] connect %s:%u failed\r\n", s_net_host, s_net_port);
+		goto out;
+	}
+	rtos_lock_mutex(&s_cam_mutex);
+	len = s_cam_len;
+	while (off < len && (n = send(sock, s_cam_buf + off, len - off > 4096 ? 4096 : len - off, 0)) > 0)
+		off += n;
+	rtos_unlock_mutex(&s_cam_mutex);
+	close(sock);
+	os_printf("[cam] snapshot %u/%u bytes -> %s:%u\r\n", off, len, s_net_host, s_net_port);
+out:
+	rtos_delete_thread(NULL);
+}
+
+
+#if CONFIG_DVP_CAMERA
+/* cam probe [PWR_PIN ...]: power the sensor rails (default GPIO 9 + 28), run MCLK, report the idle
+ * level of every candidate I2C pin (pull-ups present = 1), then scan I2C0 (20/21) and I2C1 on the
+ * pin groups 42/43 and 14/15 for ACKs. GPIO 0/1 (the console UART) are left alone. Runs in its own
+ * thread; results go to the UART log and the next `cam probe` reply buffer is not used. */
+static int s_probe_pins[8], s_probe_n;
+
+static int i2c_scan(i2c_id_t id, const char *label)
+{
+	i2c_config_t cfg = {.baud_rate = I2C_BAUD_RATE_100KHZ, .addr_mode = I2C_ADDR_MODE_7BIT};
+	uint8_t b;
+	int found = 0;
+	char line[160];
+	int l = snprintf(line, sizeof(line), "[cam] %s:", label);
+
+	bk_i2c_init(id, &cfg);
+	for (uint32_t a = 0x08; a < 0x78; a++) {
+		i2c_mem_param_t mp = {.dev_addr = a, .mem_addr = 0x00, .mem_addr_size = I2C_MEM_ADDR_SIZE_8BIT, .data = &b, .data_size = 1, .timeout_ms = 5};
+		if (bk_i2c_memory_read(id, &mp) == BK_OK && l < (int)sizeof(line) - 8) {
+			l += snprintf(line + l, sizeof(line) - l, " 0x%02x", a);
+			found++;
+		}
+	}
+	bk_i2c_deinit(id);
+	os_printf("%s%s\r\n", line, found ? "" : " none");
+	return found;
+}
+
+static const int s_i2c_cand[6] = {20, 21, 42, 43, 14, 15};   /* I2C0, I2C1 group 42/43, I2C1 group 14/15 */
+
+static void cam_idle_levels(int *lv)
+{
+	for (int i = 0; i < 6; i++) {
+		pin_configure(s_i2c_cand[i], GPIO_INPUT_ENABLE, GPIO_PULL_DISABLE);
+		lv[i] = bk_gpio_get_input(s_i2c_cand[i]);
+	}
+}
+
+static void cam_probe_task(beken_thread_arg_t arg)
+{
+	int lv[6];
+
+	for (int i = 0; i < s_probe_n; i++) {
+		pin_configure(s_probe_pins[i], GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+		bk_gpio_set_output_high(s_probe_pins[i]);
+	}
+	rtos_delay_milliseconds(50);
+	bk_video_gpio_init(DVP_GPIO_CLK);
+	bk_video_dvp_mclk_enable(YUV_MODE);
+	rtos_delay_milliseconds(50);
+	cam_idle_levels(lv);
+	os_printf("[cam] probe: %d rail pins high, MCLK on; idle 20=%d 21=%d 42=%d 43=%d 14=%d 15=%d\r\n",
+		  s_probe_n, lv[0], lv[1], lv[2], lv[3], lv[4], lv[5]);
+	/* only scan a pair that shows pull-ups on both lines: a floating bus hangs the I2C engine */
+	if (lv[0] && lv[1])
+		i2c_scan(I2C_ID_0, "I2C0 (20/21)");
+	if (lv[2] && lv[3]) {
+		gpio_dev_unmap(42); gpio_dev_map(42, GPIO_DEV_I2C1_SCL);
+		gpio_dev_unmap(43); gpio_dev_map(43, GPIO_DEV_I2C1_SDA);
+		i2c_scan(I2C_ID_1, "I2C1 (42/43)");
+		gpio_dev_unmap(42); gpio_dev_unmap(43);
+	}
+	if (lv[4] && lv[5]) {
+		gpio_dev_unmap(14); gpio_dev_map(14, GPIO_DEV_I2C1_SCL);
+		gpio_dev_unmap(15); gpio_dev_map(15, GPIO_DEV_I2C1_SDA);
+		i2c_scan(I2C_ID_1, "I2C1 (14/15)");
+		gpio_dev_unmap(14); gpio_dev_unmap(15);
+	}
+	bk_video_dvp_mclk_disable();
+	os_printf("[cam] probe done\r\n");
+	rtos_delete_thread(NULL);
+}
+
+/* cam pwrscan: drive every free GPIO high, then low, and watch the I2C candidate pins for pull-ups
+ * appearing (the sensor board's pull-ups sit on its own supply): finds the camera power switch and
+ * the I2C pair together, with no I2C traffic. GPIO 9 and 28 stay high throughout. */
+static void cam_pwrscan_task(beken_thread_arg_t arg)
+{
+	static const int sweep[] = {2, 3, 4, 5, 6, 8, 12, 13, 16, 17, 18, 19, 22, 23, 25, 26, 40, 41, 47, 48, 49, 50, 51, 52, 54, 55};
+	int lv[6], base[6];
+
+	pin_configure(9, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE); bk_gpio_set_output_high(9);
+	pin_configure(28, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE); bk_gpio_set_output_high(28);
+	bk_video_gpio_init(DVP_GPIO_CLK);
+	bk_video_dvp_mclk_enable(YUV_MODE);
+	rtos_delay_milliseconds(50);
+	cam_idle_levels(base);
+	os_printf("[cam] pwrscan baseline 20=%d 21=%d 42=%d 43=%d 14=%d 15=%d\r\n", base[0], base[1], base[2], base[3], base[4], base[5]);
+	for (unsigned i = 0; i < sizeof(sweep) / sizeof(sweep[0]); i++) {
+		int p = sweep[i];
+		for (int level = 1; level >= 0; level--) {
+			pin_configure(p, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+			if (level) bk_gpio_set_output_high(p); else bk_gpio_set_output_low(p);
+			rtos_delay_milliseconds(80);
+			cam_idle_levels(lv);
+			if (os_memcmp(lv, base, sizeof(lv)))
+				os_printf("[cam] pwrscan GPIO %d=%d -> 20=%d 21=%d 42=%d 43=%d 14=%d 15=%d  <==\r\n", p, level, lv[0], lv[1], lv[2], lv[3], lv[4], lv[5]);
+		}
+		pin_configure(p, GPIO_INPUT_ENABLE, GPIO_PULL_DISABLE);   /* back to hi-Z */
+		rtos_delay_milliseconds(20);
+	}
+	bk_video_dvp_mclk_disable();
+	os_printf("[cam] pwrscan done\r\n");
+	rtos_delete_thread(NULL);
+}
+
+/* ---- software (bit-banged) I2C on any two GPIOs: safe probe of the sensor bus (the SDK's I2C1
+ * driver is pinned to GPIO 0/1 and resets this board). Open-drain emulated: 1 = input + pull-up,
+ * 0 = driven low. Slow (~10 kHz) but every sensor tolerates that. ---- */
+static int s_bb_scl = 42, s_bb_sda = 43;
+static void bb_wait(void) { for (volatile int i = 0; i < 300; i++) ; }
+static void bb_set(int pin, int v)
+{
+	if (v) {
+		pin_configure(pin, GPIO_INPUT_ENABLE, GPIO_PULL_UP_EN);
+	} else {
+		pin_configure(pin, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+		bk_gpio_set_output_low(pin);
+	}
+}
+static void bb_start(void) { bb_set(s_bb_sda, 1); bb_set(s_bb_scl, 1); bb_wait(); bb_set(s_bb_sda, 0); bb_wait(); bb_set(s_bb_scl, 0); bb_wait(); }
+static void bb_stop(void) { bb_set(s_bb_sda, 0); bb_wait(); bb_set(s_bb_scl, 1); bb_wait(); bb_set(s_bb_sda, 1); bb_wait(); }
+static int bb_write(uint8_t b)   /* returns 1 on ACK */
+{
+	int ack;
+	for (int i = 7; i >= 0; i--) {
+		bb_set(s_bb_sda, (b >> i) & 1); bb_wait();
+		bb_set(s_bb_scl, 1); bb_wait();
+		bb_set(s_bb_scl, 0); bb_wait();
+	}
+	bb_set(s_bb_sda, 1); bb_wait();
+	bb_set(s_bb_scl, 1); bb_wait();
+	ack = !bk_gpio_get_input(s_bb_sda);
+	bb_set(s_bb_scl, 0); bb_wait();
+	return ack;
+}
+static uint8_t bb_read(int ack)
+{
+	uint8_t b = 0;
+	bb_set(s_bb_sda, 1);
+	for (int i = 7; i >= 0; i--) {
+		bb_wait(); bb_set(s_bb_scl, 1); bb_wait();
+		b |= (bk_gpio_get_input(s_bb_sda) & 1) << i;
+		bb_set(s_bb_scl, 0);
+	}
+	bb_set(s_bb_sda, ack ? 0 : 1); bb_wait();
+	bb_set(s_bb_scl, 1); bb_wait();
+	bb_set(s_bb_scl, 0); bb_wait();
+	bb_set(s_bb_sda, 1);
+	return b;
+}
+static int bb_reg_read(uint8_t addr, uint32_t reg, int reg16, uint8_t *out)
+{
+	int ok;
+	bb_start();
+	ok = bb_write(addr << 1);
+	if (ok && reg16) ok = bb_write(reg >> 8);
+	if (ok) ok = bb_write(reg & 0xff);
+	if (ok) { bb_stop(); bb_start(); ok = bb_write((addr << 1) | 1); }   /* SCCB: stop, then a fresh start */
+	if (ok) *out = bb_read(0);
+	bb_stop();
+	return ok;
+}
+
+static void cam_bb_task(beken_thread_arg_t arg)
+{
+	uint8_t v, found[8];
+	int n = 0;
+	char line[160];
+	int l;
+
+	bk_video_gpio_init(DVP_GPIO_CLK);
+	bk_video_dvp_mclk_enable(YUV_MODE);
+	rtos_delay_milliseconds(30);
+	bb_set(s_bb_scl, 1); bb_set(s_bb_sda, 1); bb_wait();
+	l = snprintf(line, sizeof(line), "[cam] bb scan SCL=%d SDA=%d (idle scl=%d sda=%d):", s_bb_scl, s_bb_sda,
+		     bk_gpio_get_input(s_bb_scl), bk_gpio_get_input(s_bb_sda));
+	for (uint32_t a = 0x08; a < 0x78; a++) {
+		int ack;
+		bb_start(); ack = bb_write(a << 1); bb_stop();
+		if (ack) {
+			if (l < (int)sizeof(line) - 8) l += snprintf(line + l, sizeof(line) - l, " 0x%02x", a);
+			if (n < 8) found[n++] = a;
+		}
+	}
+	os_printf("%s%s\r\n", line, n ? "" : " none");
+	for (int i = 0; i < n && n < 20; i++) {   /* a real device answers at one or two addresses, not all */
+		uint8_t a = found[i];
+		l = snprintf(line, sizeof(line), "[cam] 0x%02x:", a);
+		static const struct { const char *name; uint32_t reg; int r16; } ids[] = {
+			{"f0", 0xf0, 0}, {"f1", 0xf1, 0}, {"00", 0x00, 0}, {"0a", 0x0a, 0}, {"0b", 0x0b, 0}, {"3107", 0x3107, 1}, {"3108", 0x3108, 1}, {"0001", 0x0001, 1}, {"0002", 0x0002, 1}};
+		for (unsigned k = 0; k < sizeof(ids) / sizeof(ids[0]); k++)
+			if (bb_reg_read(a, ids[k].reg, ids[k].r16, &v)) l += snprintf(line + l, sizeof(line) - l, " r%s=%02x", ids[k].name, v);
+		os_printf("%s\r\n", line);
+	}
+	bb_set(s_bb_scl, 1); bb_set(s_bb_sda, 1);
+	bk_video_dvp_mclk_disable();
+	os_printf("[cam] bb done\r\n");
+	rtos_delete_thread(NULL);
+}
+
+static void cam_rails(int on)
+{
+	static const int rails[] = {9, 28, 5, 6};
+	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
+		pin_configure(rails[i], GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+		if (on) bk_gpio_set_output_high(rails[i]); else bk_gpio_set_output_low(rails[i]);
+	}
+}
+
+static void cli_cam_probe(int argc, char **argv)
+{
+	beken_thread_t t;
+
+	s_probe_pins[0] = 9; s_probe_pins[1] = 28; s_probe_n = 2;
+	for (int i = 2; i < argc && s_probe_n < 8; i++)
+		s_probe_pins[s_probe_n++] = os_strtoul(argv[i], NULL, 10);
+	if (argc >= 3 && os_strcmp(argv[2], "rails") == 0) {   /* cam probe rails on|off : GPIO 9, 28, 5, 6 */
+		cam_rails(argc >= 4 && os_strcmp(argv[3], "on") == 0);
+		REPLY("[cam] rails 9/28/5/6 %s\r\n", argc >= 4 && os_strcmp(argv[3], "on") == 0 ? "high" : "low");
+		return;
+	}
+	if (argc >= 5 && os_strcmp(argv[2], "bb") == 0) {   /* cam probe bb SCL SDA : software I2C scan */
+		s_bb_scl = os_strtoul(argv[3], NULL, 10);
+		s_bb_sda = os_strtoul(argv[4], NULL, 10);
+		REPLY("[cam] bb scan on SCL=%d SDA=%d started, see UART\r\n", s_bb_scl, s_bb_sda);
+		if (rtos_create_thread(&t, BEKEN_APPLICATION_PRIORITY, "cambb", cam_bb_task, 4096, NULL) != BK_OK)
+			REPLY("[cam] thread failed\r\n");
+		return;
+	}
+	if (argc >= 3 && os_strcmp(argv[2], "scan") == 0) {   /* cam probe scan = power-pin sweep */
+		REPLY("[cam] pwrscan started, see UART (~6 s)\r\n");
+		if (rtos_create_thread(&t, BEKEN_APPLICATION_PRIORITY, "campwr", cam_pwrscan_task, 4096, NULL) != BK_OK)
+			REPLY("[cam] thread failed\r\n");
+		return;
+	}
+	REPLY("[cam] probe started (%d rail pins), see UART\r\n", s_probe_n);
+	if (rtos_create_thread(&t, BEKEN_APPLICATION_PRIORITY, "camprobe", cam_probe_task, 4096, NULL) != BK_OK)
+		REPLY("[cam] thread failed\r\n");
+}
+#endif /* CONFIG_DVP_CAMERA */
+
+static void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
+{
+#if CONFIG_DVP_CAMERA
+	if (argc >= 2 && os_strcmp(argv[1], "probe") == 0) {
+		cli_cam_probe(argc, argv);
+		return;
+	}
+#endif
+	if (argc >= 2 && os_strcmp(argv[1], "open") == 0) {
+		media_camera_device_t dev = {0};
+		int ret;
+		if (s_cam_open) { REPLY("[cam] already open\r\n"); return; }
+		if (!s_cam_buf) s_cam_buf = psram_malloc(CAM_BUF_MAX);
+		if (!s_cam_buf) { REPLY("[cam] psram_malloc failed\r\n"); return; }
+		if (!s_cam_mutex) rtos_init_mutex(&s_cam_mutex);
+#if CONFIG_DVP_CAMERA
+		cam_rails(1);   /* GPIO 9, 28 (camera power, active high per the stock firmware), 5, 6 */
+		rtos_delay_milliseconds(30);
+		/* stock bk_dvp_camera_enumerate: GPIO 52 low 100 ms, high 100 ms, low (sensor PWDN/RESET pulse) */
+		pin_configure(52, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+		bk_gpio_set_output_low(52);
+		rtos_delay_milliseconds(100);
+		bk_gpio_set_output_high(52);
+		rtos_delay_milliseconds(100);
+		bk_gpio_set_output_low(52);
+		rtos_delay_milliseconds(50);
+#endif
+		dev.type = DVP_CAMERA;
+		dev.mode = JPEG_MODE;
+		dev.fmt = PIXEL_FMT_JPEG;
+		dev.info.resolution.width = argc >= 4 ? os_strtoul(argv[2], NULL, 10) : 640;
+		dev.info.resolution.height = argc >= 4 ? os_strtoul(argv[3], NULL, 10) : 480;
+		dev.info.fps = FPS20;
+		ret = media_app_camera_open(&dev);
+		REPLY("[cam] open %ux%u -> %d\r\n", dev.info.resolution.width, dev.info.resolution.height, ret);
+		if (ret != BK_OK) return;
+		ret = media_app_register_read_frame_callback(PIXEL_FMT_JPEG, cam_frame_cb);
+		REPLY("[cam] frame callback -> %d\r\n", ret);
+		s_cam_open = (ret == BK_OK);
+	} else if (argc >= 2 && os_strcmp(argv[1], "close") == 0) {
+		media_app_unregister_read_frame_callback();
+		REPLY("[cam] close -> %d\r\n", media_app_camera_close(DVP_CAMERA));
+		s_cam_open = false;
+	} else if (argc >= 2 && os_strcmp(argv[1], "stat") == 0) {
+		REPLY("[cam] open %d frames %u dropped %u last %u bytes %ux%u seq %u age %u ms\r\n", s_cam_open, s_cam_frames,
+		      s_cam_drop, s_cam_len, s_cam_w, s_cam_h, s_cam_seq, s_cam_last_ms ? rtos_get_time() - s_cam_last_ms : 0);
+	} else if (argc >= 4 && os_strcmp(argv[1], "snap") == 0) {
+		beken_thread_t t;
+		if (!s_cam_len) { REPLY("[cam] no frame yet\r\n"); return; }
+		os_strncpy(s_net_host, argv[2], sizeof(s_net_host) - 1);
+		s_net_port = os_strtoul(argv[3], NULL, 10);
+		REPLY("[cam] sending %u bytes to %s:%u\r\n", s_cam_len, s_net_host, s_net_port);
+		if (rtos_create_thread(&t, BEKEN_APPLICATION_PRIORITY, "camsnap", camsnap_task, 4096, NULL) != BK_OK)
+			REPLY("[cam] thread failed\r\n");
+	} else {
+		REPLY("cam open [W H] | close | stat | snap HOST PORT | probe [PWR_PIN ...] | probe scan | probe rails on|off | probe bb SCL SDA\r\n");
+	}
+}
+#endif /* DU7_AVDK */
+
 /* ---- LEDs (found 2026-10-03 with the Mac camera): GPIO 44 = white fill LED, GPIO 45 = the four blue
  * button-ring LEDs (night locator light), both active high. The IR LED above the camera is still unmapped. ---- */
 #define PIN_LED_WHITE 44
@@ -1225,6 +1589,9 @@ static const struct cli_command s_doorbell_commands[] = {
 	{"ota", "ota URL (download app_pack.rbl over HTTP, then reboot)", cli_ota_cmd},
 	{"tok", "tok set SECRET | clear (token for the TCP command channel, port 2323)", cli_tok_cmd},
 	{"led", "led white|ring on|off (white fill LED GPIO 44 / blue button ring GPIO 45)", cli_led_cmd},
+#if defined(DU7_AVDK) && (CONFIG_SYS_CPU0)
+	{"cam", "cam open [W H] | close | stat | snap HOST PORT (AVDK build)", cli_cam_cmd},
+#endif
 	{"spk", "spk tone [HZ] [MS] | play beepa|beepb|bell|ADDR LEN | net HOST PORT | stop", cli_spk_cmd},
 	{"mic", "mic level [MS] [HZ] | rec MS HOST PORT (on-board ADC mic)", cli_mic_cmd},
 #endif
@@ -1293,6 +1660,9 @@ int main(void)
 	rtos_set_user_app_entry((beken_thread_function_t)user_app_main);
 #endif
 	bk_init();
+#ifdef DU7_AVDK
+	media_service_init();   /* CPU0: media app (mailbox client); CPU1: media major (camera/JPEG); CPU2: minor */
+#endif
 
 	return 0;
 }

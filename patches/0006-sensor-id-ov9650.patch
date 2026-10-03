@@ -1,0 +1,14 @@
+diff --git a/include/driver/dvp_camera_types.h b/include/driver/dvp_camera_types.h
+index 9d0b8808..26949736 100755
+--- a/include/driver/dvp_camera_types.h
++++ b/include/driver/dvp_camera_types.h
+@@ -42,7 +42,8 @@ typedef enum
+ 	ID_OV2640,
+ 	ID_GC0308,
+ 	ID_TVP5150,
+-	ID_SC101
++	ID_SC101,
++	ID_OV9650
+ } sensor_id_t;
+ 
+ /**
