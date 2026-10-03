@@ -68,22 +68,52 @@ fails on it, which is why the driver has its own `ov9650_sccb_read`.
   then ~9 fps of ~33 KB JPEGs. CPU1 info logs are compiled out (log level 2): use `BK_LOGW` to see
   driver prints.
 
-### H.264 live stream over RTSP (v0.19.0, `rtsp.c`)
+### H.264 live stream over RTSP (v0.22, `rtsp.c`)
 
 `rtsp://192.168.2.89:554/live`: our own RTSP/1.0 server with RFC 6184 packetization (TCP
-interleaved and UDP unicast), fed by the BK7258 hardware H.264 encoder (1280x720, 15 fps, IDR with
-SPS/PPS every 2 s = `CONFIG_H264_P_FRAME_CNT=29` on CPU1). The DVP pipeline runs one encoder at a
-time, so the camera has a mode: JPEG (HTTP) or H.264 (RTSP), chosen by `cam mode auto|jpeg|h264`
-(default `auto`: an RTSP client switches to H.264, an HTTP request switches back to JPEG unless an
-RTSP client is playing; then `/snapshot.jpg` is the last JPEG and `/stream` answers 503).
+interleaved and UDP unicast, up to 3 clients), fed by the BK7258 hardware H.264 encoder (1280x720
+Baseline, IDR with SPS/PPS every 30 frames = `CONFIG_H264_P_FRAME_CNT=29` on CPU1, plus an IDR on
+every PLAY). The DVP pipeline runs one encoder at a time, so the camera has a mode: JPEG (HTTP) or
+H.264 (RTSP), chosen by `cam mode auto|jpeg|h264` (default `auto`: an RTSP client switches to
+H.264, an HTTP request switches back to JPEG unless an RTSP client is playing; then `/snapshot.jpg`
+is the last JPEG and `/stream` answers 503). The first `/snapshot.jpg` after a switch back can still
+be the previous JPEG (the handler does not wait for a new frame).
 
-- `rtsp on|off` (KV, default **off**), `rtsp status` (clients, fps, kbps, drops),
+- `rtsp on|off` (KV, default **off**; the house device has it **on** since 2026-10-03 because the
+  HA camera entry is stream-only), `rtsp status` (clients, fps, kbps, drops, SPS/PPS cached),
   `rtsp port N`, `rtsp q IMB PMB` (bits per macroblock for I/P frames, default 120/24 =
-  ~1.5 Mbit/s nominal), `rtsp idr`.
-- Test: `ffplay -rtsp_transport tcp rtsp://192.168.2.89:554/live`; HA generic camera with
-  `stream_source` = that URL (stills from the stream). Details and the full plan: `TESTPLAN-rtsp.md`.
+  ~1.5 Mbit/s nominal, applied live), `rtsp idr`.
+- Test: `ffplay -rtsp_transport tcp rtsp://192.168.2.89:554/live` (TCP is the robust transport;
+  UDP showed `RTP: missed 6 packets` in 12 s on Wi-Fi). Details and results: `TESTPLAN-rtsp.md`.
+- **Frame rate is the sensor's, not the stream's**: the OV9650 with the stock register table gives
+  ~8-9 fps in daylight / right after a power-on reset and ~3 fps in a dark room (COM11 `0x3b=0xa9`
+  night mode halves the rate as exposure grows). Measured 2026-10-03 evening: H.264 and JPEG both
+  2.9-6 fps, identical at 800x480, CPU1 `media_debug` `isr_jpeg == fps_wifi` (nothing is lost in the
+  CPU1->CPU0 hand-off). Consequence: ffmpeg/ffprobe need 5-11 s to probe the stream and HA's
+  still-from-stream takes ~7 s (its 10 s timeout is marginal at 3 fps). Fix candidates: disable
+  night mode in the sensor table (constant ~9 fps, darker night picture) or a GOP of ~10 frames.
+- **Camera power-cycle on close (v0.22.1/0.22.2)**: `cam_close_locked()` drops GPIO 28/5/6 and the
+  next open waits for 800 ms of power-off plus 150 ms settle before the GPIO 52 pulse. Without it a
+  close followed by a reopen within a few seconds (exactly what the JPEG<->H.264 switch does) left
+  the sensor silent ("camera wedge", reboot-only before; now also cleared by `cam probe rails off`
+  + `on`). 250 ms/60 ms was not enough (3/8 cold opens silent or undetected); 800/150 gave 7/8 and
+  the remaining case is self-healed: a camera open for 4 s without a frame is power-cycled at the
+  next use (`cam_stalled_locked()`), and `rtsp_cam_acquire()` retries a silent open once. A
+  JPEG->H.264 switch now takes ~2.1 s.
+- Home Assistant: the generic camera entry `01M40YN6CC2SS5DFP8X8Y35ZRN` ("Doorbell BK7258") is
+  **stream-only** since 2026-10-03: `stream_source rtsp://192.168.2.89:554/live`, `advanced.rtsp_transport
+  tcp`, no still URL (stills come from the stream through go2rtc, ~7 s). Set with
+  `~/.venv-ha/bin/python ~/ha_generic_camera.py options ENTRY_ID --stream rtsp://192.168.2.89:554/live
+  --rtsp-transport tcp` on du7 (HA 2026.9 keeps `rtsp_transport` inside the `advanced` section).
+  Rollback = the same command with `--still http://192.168.2.89:8080/snapshot.jpg --stream
+  http://192.168.2.89:8080/stream` (what it was before). `/api/camera_proxy_stream` (HA's MJPEG
+  re-encode) produced nothing in 15 s at 3 fps; the UI live view uses go2rtc directly.
 - Kconfig changes on CPU1 (`project-avdk/config/bk7258_cp1/config`): after switching to/from this
   version in an existing build dir, delete `$OUT/du7/bk7258_cp1`, `_cp2` and `bk7258` first.
+- `mem HEXADDR [N]` reads raw 32-bit words (debug): CPU1's `media_debug_t` counters are reachable
+  from CPU0 through the `transfer_log` pointer in the CPU0 map (`grep transfer_log $OUT/du7/bk7258/app.map`,
+  then `mem <that address> 1` gives the struct address; word 0 = `isr_jpeg | isr_h264<<16`, word 4
+  high half = `fps_wifi`, word 6/7 = last JPEG/H.264 length).
 
 ## Flash
 
@@ -211,6 +241,7 @@ build (`CFG_LOG_LEVEL=2`), so the firmware adds its own `os_printf`-based comman
 | `pin blink N [count]` | reclaim N, toggle at 300 ms (LED hunting), leave it low |
 | `pin watch SECONDS` | poll all pins every 5 ms on the device and print each edge with a timestamp |
 | `adc CHANNEL` | one calibrated SARADC reading (raw + mV) |
+| `mem HEXADDR [N]` | N (<= 16) raw 32-bit reads, debug only (a bad address faults) |
 
 `pin in/out/blink` refuse GPIO 10/11 (the console). Host-side helpers in `tools/`:
 `pinmap_session.py` (mux / pull classification / scan / watch / ADC sweep), `led_hunt.py`

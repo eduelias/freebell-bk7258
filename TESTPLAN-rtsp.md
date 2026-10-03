@@ -1,7 +1,7 @@
 # Test plan: H.264 + RTSP live stream (feat/rtsp, fw 0.19.0)
 
-Branch `feat/rtsp`, worktree `~/reps/home/iot/wt-rtsp`. Build verified with
-`OUT=~/data/doorbell-bk7258/avdk-build-rtsp scripts/build-avdk.sh`. Nothing was run on the device.
+Branch `feat/rtsp`, merged into main 2026-10-03 as v0.22.0 (fixes v0.22.1/0.22.2). **Results at the
+end of this file.**
 
 ## What changed
 
@@ -200,3 +200,35 @@ python3 tools/dbcmd.py rtsp on
   500 ms; the transfer task callback never calls into media_app.
 - UART shows `[cam] open ... h264`, `[cam] h264 q ...`, `[rtsp] #n ... connected/closed` lines;
   nothing new on CPU1 except the encoder's own prints.
+
+## Results 2026-10-03 (integrator, fw 0.22.0 -> 0.22.2, dark room, UART dead)
+
+- Build: the branch built clean at the first try after the merge (625 s full build; Kconfig picked
+  up: `CONFIG_H264_P_FRAME_CNT=29`, `H264_ADD_SELF_DEFINE_SEI` off, `H264_FRAME_SIZE=131072` on
+  both CPUs). OTA via `release.sh --no-build` three times (0.22.0 / 0.22.1 / 0.22.2), ~90 s each.
+- Step 0: RTSP off by default, `cam stat` `open 0 - (mode auto)`, snapshot 200 / 74 KB / 1.6 s. OK.
+- Step 1 (TCP, Mac and du7): ffprobe `h264 Baseline level 41 1280x720 yuv420p`, SPS/PPS cached
+  (`sps 30 pps 4`), 10 s recordings play; but **~3 fps**, not 15: PTS spacing a steady 358-362 ms,
+  `rtsp status in 2.9-3.0 fps`, 600 kbps. Same rate at 800x480 and in JPEG mode; CPU1 `media_debug`
+  (`isr_jpeg == fps_wifi`) shows the encoder itself completes ~3 fps (5-8 fps right after a sensor
+  power-on reset, ~9 fps in daylight per the 16:35 notes) => OV9650 night-mode frame-rate reduction,
+  not the RTSP path. ffmpeg also warns `time_scale/num_units_in_tick invalid (0/1000)` (encoder VUI;
+  cosmetic) and one `Non-monotonic DTS` for the IDR+first P pair at start.
+- Step 2: UDP from du7 works (35 frames / 12 s) with `RTP: missed 6 packets`; TCP lost 0 always.
+  Three concurrent TCP clients (`3/3 (3 playing)`, lost 0 each, 157/152/113 frames), a 4th gets 503.
+- Step 3: during play snapshot 200 (stale JPEG, 47 ms), `/stream` 503; after the clients stop the
+  camera is back in JPEG in 2.4 s (the first snapshot is still the old JPEG); `cam mode jpeg` ->
+  DESCRIBE 503; `cam mode h264` -> snapshot stale, `/stream` 503; back to `auto`. OK.
+- Step 4: `rtsp q 160 40` applied live, `drop big 0`; back to 120/24. OK.
+- Step 5: HA entry switched to stream-only (`stream_source` rtsp, `advanced.rtsp_transport tcp`) with
+  the fixed helper (`rtsp_transport` must sit inside `advanced`). `camera_proxy` still from the
+  stream: 200, 115-144 KB 1280x720 JPEG in ~7 s (one attempt timed out at 10 s with the camera
+  mid-switch). `camera_proxy_stream` gave 0 bytes in 15 s. Live view in the UI not clicked (owner).
+- **Wedge**: the JPEG<->H.264 switch (close + immediate reopen) hit the pre-existing camera wedge
+  (sensor silent, `open -> 0`, no frames) on the 8th switch; `cam probe rails off` + `on` cleared it
+  without a reboot. v0.22.1 cuts GPIO 28/5/6 on every close (250 ms off / 60 ms settle: 7/8 ok ->
+  3/8 bad in a cold-open loop), v0.22.2 uses 800 ms / 150 ms (7/8 ok) + stall self-heal + one retry
+  in acquire: 6/6 DESCRIBEs with HA still-polls in between, the one silent open was repaired by the
+  next DESCRIBE (7.8 s). Switch cost ~2.1 s.
+- Step 6: 20 min TCP soak from du7 (`systemd-run --user --unit rtsp-soak`), results in NOTES.md.
+- Not done: UI live view by eye, audio track, daylight frame-rate check, `rtsp port` change.
