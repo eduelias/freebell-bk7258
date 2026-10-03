@@ -50,10 +50,10 @@ def main():
     st, flow = api("POST", "/api/config/config_entries/flow", {"handler": "generic"})
     print("init:", st, flow.get("step_id"), flow.get("errors"))
     fid = flow["flow_id"]
-    data = {"still_image_url": args.still, "stream_source": args.stream, "username": "", "password": "",
-            "limit_refetch_to_url_change": False, "framerate": args.framerate, "verify_ssl": False}
-    if not args.stream:
-        data.pop("stream_source")
+    # HA 2026.x schema: top-level URLs/credentials, advanced options in a nested "advanced" section
+    data = {"still_image_url": args.still, "advanced": {"framerate": args.framerate, "verify_ssl": False}}
+    if args.stream:
+        data["stream_source"] = args.stream
     for _ in range(6):
         if flow.get("type") == "create_entry":
             print("created:", flow["result"]["entry_id"], flow["title"])
