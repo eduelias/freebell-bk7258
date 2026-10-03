@@ -25,6 +25,7 @@
 #include <driver/aud_adc_types.h>
 #include <driver/flash.h>
 #include <driver/dma.h>
+#include "pir.h"
 #endif
 #ifdef DU7_AVDK   /* all cores: media_service_init() runs on CPU0/1/2 */
 #include "media_service.h"
@@ -60,7 +61,7 @@ void db_reply(const char *fmt, ...)
 	REPLY("%s", buf);
 }
 
-#define FW_VERSION "0.19.0"
+#define FW_VERSION "0.20.0"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -280,7 +281,7 @@ static void cli_adc_read_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc,
 #if (CONFIG_SYS_CPU0)
 
 /* ---- doorbell prototype: Wi-Fi + Home Assistant webhook ---- */
-#define PIN_PIR 24      /* active-high motion output, 2-4 s pulses */
+/* PIR (GPIO 24 output, 50 enable, 25/26 sensitivity) lives in pir.c since v0.19.0 */
 #define PIN_BUTTON 53   /* externally pulled high, expected to drop on press */
 #define HEARTBEAT_MS (5 * 60 * 1000)
 #define KV_SSID "db_ssid"
@@ -404,29 +405,27 @@ static int http_post_json(const char *hook, const char *json)
 
 static int report(const char *event)
 {
-	char json[192];
+	char json[256];
 	int st;
 
 	if (!s_got_ip)
 		return -ENOTCONN;
 	snprintf(json, sizeof(json),
 		 "{\"event\":\"%s\",\"fw\":\"" FW_VERSION "\",\"ip\":\"%s\",\"mv\":%u,\"light_mv\":%u,"
-		 "\"uptime_s\":%u,\"motion_count\":%u,\"ring_count\":%u}",
-		 event, s_ip, adc_read_mv(9), light_read_mv(), rtos_get_time() / 1000, s_motion_count, s_ring_count);
+		 "\"uptime_s\":%u,\"motion_count\":%u,\"ring_count\":%u,\"pir_on\":%u,\"pir_sens\":%u}",
+		 event, s_ip, adc_read_mv(9), light_read_mv(), rtos_get_time() / 1000, s_motion_count, s_ring_count,
+		 pir_is_on() ? 1u : 0u, pir_sens_get());
 	st = http_post_json(s_hook, json);
 	os_printf("[hook] %s -> %d\r\n", event, st);
 	return st;
 }
 
-static void pir_isr(gpio_id_t id)
+/* ISR context (from pir.c, after its cooldown/warm-up filter): flag the reporter task. */
+static void motion_cb(void)
 {
-	uint32_t now = rtos_get_time();
-
-	if (now - s_last_motion_ms > 3000) {
-		s_last_motion_ms = now;
-		s_motion_count++;
-		s_pend_motion = true;
-	}
+	s_last_motion_ms = rtos_get_time();
+	s_motion_count++;
+	s_pend_motion = true;
 }
 
 static volatile uint32_t s_last_ring_report_ms;
@@ -520,11 +519,7 @@ static void reporter_task(beken_thread_arg_t arg)
 
 static void inputs_init(void)
 {
-	pin_configure(PIN_PIR, GPIO_INPUT_ENABLE, GPIO_PULL_DISABLE);
-	bk_gpio_disable_output(PIN_PIR);
-	bk_gpio_register_isr(PIN_PIR, pir_isr);
-	bk_gpio_set_interrupt_type(PIN_PIR, GPIO_INT_TYPE_RISING_EDGE);
-	bk_gpio_enable_interrupt(PIN_PIR);
+	pir_init(motion_cb);   /* GPIO 24 ISR + GPIO 50/25/26 from KV (pir.c) */
 
 	pin_configure(PIN_BUTTON, GPIO_INPUT_ENABLE, GPIO_PULL_UP_EN);
 	bk_gpio_disable_output(PIN_BUTTON);
@@ -605,6 +600,23 @@ static void cli_hook_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, cha
 		s_pend_motion = true;
 	}
 	REPLY("[hook] %s  (hook set HOST:PORT/PATH | test | ring | motion)\r\n", s_hook);
+}
+
+/* ---- PIR (pir.c): settings + simulated motion edge; the text comes back here for REPLY ---- */
+static void cli_pir_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
+{
+	char out[256];
+
+	pir_command(argc, argv, out, sizeof(out));
+	REPLY("%s", out);
+}
+
+static void cli_motion_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
+{
+	char out[160];
+
+	motion_command(argc, argv, out, sizeof(out));
+	REPLY("%s", out);
 }
 
 
@@ -1870,6 +1882,8 @@ static const struct cli_command s_doorbell_commands[] = {
 #if (CONFIG_SYS_CPU0)
 	{"wifi", "wifi set SSID PASS | clear | connect | (status)", cli_wifi_cmd},
 	{"hook", "hook set HOST:PORT/PATH | test | ring | motion | (show)", cli_hook_cmd},
+	{"pir", "pir on|off | sens 0-3 | cooldown MS | status (PIR GPIO 24/50/25/26)", cli_pir_cmd},
+	{"motion", "motion test (simulated PIR edge through the ISR handler)", cli_motion_cmd},
 	{"ota", "ota URL (download app_pack.rbl over HTTP, then reboot)", cli_ota_cmd},
 	{"tok", "tok set SECRET | clear (token for the TCP command channel, port 2323)", cli_tok_cmd},
 	{"led", "led white|ring on|off|auto (white fill LED GPIO 44 / blue button ring GPIO 45)", cli_led_cmd},

@@ -235,6 +235,24 @@ sessions (before that worked) are noise, except the ADC readings.
 Open: which pin is the button, the PIR, the LEDs (`pin blink` on 5/8/9 first), the chime, the
 charger status, and the power-hold line.
 
+## PIR motion (v0.19.0, `project/main/pir.c`)
+
+Pins from the stock `tuya_pir.c` (disassembled 2026-10-03): GPIO 24 = PIR output (rising-edge ISR),
+GPIO 50 = PIR enable (stock drives it high and never lowers it), GPIO 25 = sensitivity bit 0,
+GPIO 26 = sensitivity bit 1 (stock `set_sens(n)`: 25 = n&1, 26 = n>>1&1; stock default n=1).
+
+| Command | What it does | KV, default |
+|---|---|---|
+| `pir status` | on/off, sens + GPIO 25/26 levels, cooldown, count, ms since last, raw/ignored edges, live GPIO 24/50 | |
+| `pir on\|off` | enable: GPIO 50 high + IRQ on (edges blanked 5 s); off: IRQ off, GPIO 50 low | `db_pir_on`, on |
+| `pir sens 0-3` | sensitivity bits (stock used 0/1/2; which end is "more" is untested) | `db_pir_sens`, 1 |
+| `pir cooldown MS` | minimum gap between accepted motions, enforced in the ISR (stock: 30 s) | `db_pir_cd`, 10000 |
+| `motion test` | simulated edge through the ISR handler: counts, cooldown, `motion` report to HA | |
+
+Reports carry `"pir_on"` and `"pir_sens"` next to `light_mv`. The HA side (snapshot to
+`/config/www/doorbell/last_{motion,ring}.jpg` + phone notification with the image) is in
+`TESTPLAN-motion.md`.
+
 ## Audio (v0.13.x: DMA engine, both directions working)
 
 Measured with the Mac as ear/voice on 2026-10-03 (`tools/mac_ear.py`, `tools/mic_raw.py`):

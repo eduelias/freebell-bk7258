@@ -2,6 +2,7 @@ set(incs .)
 set(srcs
     app_main.c
     night.c
+    pir.c
     )
 
 if (CONFIG_OVERRIDE_FLASH_PARTITION)

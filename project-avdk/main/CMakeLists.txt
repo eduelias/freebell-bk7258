@@ -1,5 +1,5 @@
 set(incs . ../shared)
-set(srcs ../shared/app_main.c ../shared/night.c)
+set(srcs ../shared/app_main.c ../shared/night.c ../shared/pir.c)
 if (CONFIG_OVERRIDE_FLASH_PARTITION)
     list(APPEND srcs ../shared/vendor_flash.c)
 endif()
