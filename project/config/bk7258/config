@@ -3,3 +3,6 @@ CONFIG_PSRAM_AUTO_DETECT=n
 CONFIG_PSRAM_APS128XXO_OB9=y
 CONFIG_SYS_CPU1_OFFSET=0x21b0000
 CONFIG_AUDIO_TEST=y
+# microSD (feature sd): the SDK's power-GPIO helper would drive GPIO 13 (SDCARD_LDO_CTRL_GPIO) and
+# power the card down from a timer after 10 s idle; sdcard.c drives the real power pin (GPIO 6) itself
+CONFIG_SDCARD_POWER_GPIO_CTRL=n

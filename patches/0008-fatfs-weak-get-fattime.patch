@@ -1,0 +1,14 @@
+diff --git a/components/fatfs/ff.c b/components/fatfs/ff.c
+index dc4d6be..4454052 100755
+--- a/components/fatfs/ff.c
++++ b/components/fatfs/ff.c
+@@ -6329,7 +6329,8 @@ void beken_mem_set(void* dst, int val, UINT cnt)
+ 	mem_set(dst,val,cnt);
+ }
+ 
+-DWORD get_fattime (void)
++/* doorbell-bk7258-fw: weak so the application can supply the real (SNTP) time for FAT timestamps */
++__attribute__((weak)) DWORD get_fattime (void)
+ {
+ 	return ((DWORD)(FF_NORTC_YEAR - 1980) << 25 | (DWORD)FF_NORTC_MON << 21 | (DWORD)FF_NORTC_MDAY << 16);
+ }

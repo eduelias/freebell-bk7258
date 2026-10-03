@@ -29,6 +29,7 @@
 #include "power.h"   /* feat/power: battery, charger, deep sleep */
 #include "aud_engine.h"   /* engine API implemented below, used by talk.c */
 #include "talk.h"         /* two-way audio over HTTP (/speak, /mic.wav) */
+#include "sdcard.h"   /* optional microSD storage (feature "sd") */
 #endif
 #ifdef DU7_AVDK   /* all cores: media_service_init() runs on CPU0/1/2 */
 #include "media_service.h"
@@ -65,7 +66,7 @@ void db_reply(const char *fmt, ...)
 	REPLY("%s", buf);
 }
 
-#define FW_VERSION "0.23.1"
+#define FW_VERSION "0.24.0"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -362,6 +363,23 @@ static void kv_set_str(const char *key, const char *val)
 	bk_set_env_enhance(key, val, os_strlen(val));
 }
 
+/* REPLY() for modules outside this file (sdcard.c) */
+void app_reply(const char *fmt, ...)
+{
+	char tmp[256];
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(tmp, sizeof(tmp), fmt, ap);
+	va_end(ap);
+	REPLY("%s", tmp);
+}
+
+bool app_net_up(void)
+{
+	return s_got_ip;
+}
+
 static uint32_t adc_read_mv(uint32_t chan)
 {
 	adc_config_t config = {0};
@@ -532,6 +550,7 @@ static void reporter_task(beken_thread_arg_t arg)
 		if (s_pend_fx) {
 			s_pend_fx = false;
 			ringfx_start();
+			sd_on_event("ring");   /* queued snapshot to the SD card, never blocks */
 		}
 		if (s_got_ip && s_pend_ring) {   /* wait for Wi-Fi: a press that woke us from deep sleep arrives before the IP */
 			s_pend_ring = false;
@@ -540,6 +559,7 @@ static void reporter_task(beken_thread_arg_t arg)
 		if (s_got_ip && s_pend_motion) {
 			s_pend_motion = false;
 			night_on_motion();   /* white light for 20 s when dark, before the snapshot HA will take */
+			sd_on_event("motion");   /* queued SD snapshot, never blocks */
 			report("motion");
 		}
 		if (s_got_ip && power_wake_pending()) {
@@ -1726,6 +1746,8 @@ static void cam_power(int on)
 {
 	static const int pins[] = {28, 5, 6};
 	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
+		if (!on && sd_holds_gpio(pins[i]))   /* GPIO 6 also powers a mounted microSD card: keep it */
+			continue;
 		pin_configure(pins[i], GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
 		if (on) bk_gpio_set_output_high(pins[i]); else bk_gpio_set_output_low(pins[i]);
 	}
@@ -1980,6 +2002,21 @@ static int cam_copy_latest(uint8_t *dst, uint32_t cap, uint32_t *seq)
 	}
 	rtos_unlock_mutex(&s_cam_mutex);
 	return (int)len;
+}
+
+/* For sdcard.c: latest JPEG, opening the camera on demand (first frame takes ~1 s). */
+int app_cam_grab(uint8_t *dst, uint32_t cap, uint32_t wait_ms)
+{
+	uint32_t seq = 0, t0 = rtos_get_time();
+	int n;
+
+	if (!s_cam_open && cam_do_open(1280, 720) != BK_OK)
+		return -1;
+	if (!s_cam_mutex || !s_cam_buf)
+		return -2;
+	while ((n = cam_copy_latest(dst, cap, &seq)) <= 0 && rtos_get_time() - t0 < wait_ms)
+		rtos_delay_milliseconds(50);
+	return n;
 }
 
 static int send_all(int sock, const void *p, int n)
@@ -2350,6 +2387,7 @@ static void cli_ring_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, cha
 	if (argc >= 2 && os_strcmp(argv[1], "test") == 0) {
 		uint32_t mv = light_read_mv();   /* read before the effects thread touches GPIO 28 */
 		ringfx_start();
+		sd_on_event("ring");   /* same as a real press: queued SD snapshot when a card is mounted */
 		REPLY("[ring] effects started (light %u mV, dark above %u -> %s)\r\n", mv, s_dark_mv, mv > s_dark_mv ? "white light on" : "day, no light");
 	} else if (argc >= 3 && os_strcmp(argv[1], "dark") == 0) {
 		s_dark_mv = os_strtoul(argv[2], NULL, 10);
@@ -2470,6 +2508,7 @@ static const struct cli_command s_doorbell_commands[] = {
 #if (CONFIG_SYS_CPU0)
 	{"ring", "ring test | dark MV | fx on|off (local chime, ring LEDs, light when dark)", cli_ring_cmd},
 	{"pwr", "pwr status | sleep on|off | idle S | wake_pir on|off | snap_min M | sleepnow (battery, charger, deep sleep)", cli_pwr_cmd},
+	{"sd", "sd status | mount | umount | format | ls [DIR] | save [EVENT] | auto on|off (microSD)", cli_sd_cmd},
 #endif
 #if defined(DU7_AVDK) && (CONFIG_SYS_CPU0)
 	{"cam", "cam open [W H] [h264] | close | stat | mode auto|jpeg|h264 | snap HOST PORT (AVDK build)", cli_cam_cmd},
@@ -2575,6 +2614,7 @@ void user_app_main(void)
 	bk_event_register_cb(EVENT_MOD_WIFI, EVENT_ID_ALL, wifi_event_cb, NULL);
 	inputs_init();
 	power_init();   /* before the reporter: a button wake from deep sleep must chime at once, before Wi-Fi */
+	sd_init();   /* microSD worker: auto-mount 8 s after boot when `sd auto` is on (default) */
 	rtos_create_thread(&reporter, BEKEN_APPLICATION_PRIORITY, "reporter",
 			   reporter_task, 4096, NULL);
 	kv_get_str(KV_TOKEN, s_token, sizeof(s_token));

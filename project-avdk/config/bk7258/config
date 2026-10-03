@@ -25,3 +25,6 @@ CONFIG_DVP_CAMERA_TEST=n
 CONFIG_H264_P_FRAME_CNT=29
 CONFIG_H264_ADD_SELF_DEFINE_SEI=n
 CONFIG_H264_FRAME_SIZE=131072
+# microSD (feature sd): the SDK's power-GPIO helper would drive GPIO 13 (SDCARD_LDO_CTRL_GPIO) and
+# power the card down from a timer after 10 s idle; sdcard.c drives the real power pin (GPIO 6) itself
+CONFIG_SDCARD_POWER_GPIO_CTRL=n
