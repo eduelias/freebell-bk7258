@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* doorbell-bk7258-fw: DMA audio engine (DAC/ADC rings in app_main.c) shared with the feature files. */
 /* aud_engine.h — the DMA audio engine in app_main.c, exposed to feature files (talk.c).
  *
  * The engine (v0.13.x) serves the DAC and ADC FIFOs by DMA from two byte rings. spk_task /

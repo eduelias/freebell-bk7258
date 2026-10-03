@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* doorbell-bk7258-fw: OmniVision OV9650 DVP sensor driver for the Beken AVDK. Register configuration
+ * recovered from the device's shipped firmware for interoperability. */
 // OV9650 DVP sensor driver for the Beken AVDK, written for the Tuya IP108 doorbell (BK7258).
 // The register table is the one the vendor firmware programs (extracted from the stock image);
 // the structure follows dvp_ov2640.c. The sensor sits on I2C1 (GPIO 0/1) at 0x30, power on GPIO 28

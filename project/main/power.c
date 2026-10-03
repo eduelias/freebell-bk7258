@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* doorbell-bk7258-fw: battery and charger readout, deep sleep policy and wake sources. */
 /* Battery, charger and deep sleep (feat/power). See power.h and TESTPLAN-power.md.
  *
  * Hardware facts (stock tuya_battery.c / tuya_pir.c disassembly, 2026-10-03, verified where noted):

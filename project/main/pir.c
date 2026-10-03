@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* doorbell-bk7258-fw: PIR motion sensor: enable, sensitivity, edge ISR + level poller, cooldown. */
 /* PIR motion sensor control (feat/motion, merged as v0.20.0).
  *
  * Pins (stock tuya_pir.c, recovered from the flash dump with capstone, 2026-10-03):
