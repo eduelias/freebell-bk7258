@@ -30,6 +30,7 @@
 #include "media_service.h"
 #if (CONFIG_SYS_CPU0)   /* the multimedia component (media_app) is only linked into the CPU0 image */
 #include "media_app.h"
+#include "rtsp.h"
 #include <driver/media_types.h>
 #include <driver/i2c.h>
 #include <driver/i2c_types.h>
@@ -46,7 +47,7 @@ static bool s_reply_on;
 #define REPLY(...) do { os_printf(__VA_ARGS__); if (s_reply_on) { size_t _l = os_strlen(s_reply); \
 	if (_l < sizeof(s_reply) - 1) snprintf(s_reply + _l, sizeof(s_reply) - _l, __VA_ARGS__); } } while (0)
 
-#define FW_VERSION "0.18.5"
+#define FW_VERSION "0.19.0"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -1190,14 +1191,57 @@ static void tcp_cmd_task(beken_thread_arg_t arg)
 #if defined(DU7_AVDK) && (CONFIG_SYS_CPU0)
 /* ---- camera (AVDK build only): DVP sensor -> hardware JPEG on CPU1, frames delivered here by the
  * media transfer task; we keep the latest JPEG in PSRAM and can push it to a TCP peer ---- */
-#define CAM_BUF_MAX (200 * 1024)
+/* CPU1 never emits a JPEG larger than its own frame buffer (CONFIG_JPEG_FRAME_SIZE = 150 KB). The
+ * CPU0 PSRAM heap is only 512 KB and also holds one such buffer per HTTP client plus the 128 KB
+ * RTSP ring, so size this exactly. */
+#ifdef CONFIG_JPEG_FRAME_SIZE
+#define CAM_BUF_MAX (CONFIG_JPEG_FRAME_SIZE)
+#else
+#define CAM_BUF_MAX (150 * 1024)
+#endif
 static uint8_t *s_cam_buf;
 static volatile uint32_t s_cam_len, s_cam_frames, s_cam_seq, s_cam_w, s_cam_h, s_cam_drop, s_cam_last_ms;
 static beken_mutex_t s_cam_mutex;
 
+/* ---- encoder mode (v0.19.0): the DVP pipeline runs ONE hardware encoder at a time, JPEG (HTTP
+ * snapshot/MJPEG) or H.264 (RTSP). Who gets it is decided by `cam mode` (KV db_cam_mode):
+ *   auto (default): consumer driven. An RTSP client switches the camera to H.264; an HTTP request
+ *                   switches it back to JPEG unless an RTSP client is playing (then the snapshot
+ *                   is the last JPEG taken before the switch, /stream answers 503).
+ *   jpeg:           never H.264 (RTSP DESCRIBE answers 503)   - the pre-0.19 behaviour.
+ *   h264:           never JPEG (HTTP serves the stale JPEG / 503); use the RTSP stream in HA.
+ * A switch costs a close + open (~0.5 s) and the first frame of the new mode (~1 s). ---- */
+enum { CAM_PREF_AUTO = 0, CAM_PREF_JPEG = 1, CAM_PREF_H264 = 2 };
+static int s_cam_pref = CAM_PREF_AUTO;
+static bool s_cam_h264;                      /* mode of the open camera */
+static volatile uint32_t s_cam_h264_frames;  /* H.264 access units since the last open */
+static beken_mutex_t s_cam_ctl;              /* serialises open/close/switch (init in user_app_main) */
+/* H.264 rate control (KV db_h264_q "IMB PMB"): target bits per 16x16 macroblock for I and P
+ * frames. 720p = 3600 MB, GOP = 30 frames (CONFIG_H264_P_FRAME_CNT=29 on CPU1 = IDR every 2 s at
+ * 15 fps): 120/24 ~ 54 KB I + 11 KB P = ~1.5 Mbit/s nominal, less on a static scene. The SDK's own
+ * preset (quality level 2: 160/60) is ~3.5 Mbit/s. Keep IMB <= 290 (I-frame must fit the 128 KB
+ * CPU1 buffer). */
+static uint32_t s_h264_imb = 120, s_h264_pmb = 24;
+static bool s_h264_q_pending;                /* apply after the first frame (the SDK preset is applied there) */
+static uint16_t s_rtsp_port = RTSP_DEFAULT_PORT;
+static bool s_rtsp_on;                       /* KV db_rtsp, default off */
+#define KV_CAM_MODE "db_cam_mode"
+#define KV_H264_Q "db_h264_q"
+#define KV_RTSP "db_rtsp"
+#define KV_RTSP_PORT "db_rtsp_port"
+
 static void cam_frame_cb(frame_buffer_t *frame)
 {
-	if (!frame || !frame->frame || frame->length == 0 || frame->length > CAM_BUF_MAX || !s_cam_buf)
+	if (!frame || !frame->frame || frame->length == 0)
+		return;
+	if (frame->fmt == PIXEL_FMT_H264) {   /* H.264 access unit (Annex-B) -> RTSP ring; nothing else wants it */
+		s_cam_h264_frames++;
+		s_cam_frames++;
+		s_cam_last_ms = rtos_get_time();
+		rtsp_feed_frame(frame->frame, frame->length, frame->timestamp);
+		return;
+	}
+	if (frame->length > CAM_BUF_MAX || !s_cam_buf)
 		return;
 	if (rtos_trylock_mutex(&s_cam_mutex) != BK_OK) {   /* a snapshot is being read out: skip this frame */
 		s_cam_drop++;
@@ -1477,13 +1521,15 @@ static void cli_cam_probe(int argc, char **argv)
 }
 #endif /* CONFIG_DVP_CAMERA */
 
-static int cam_do_open(uint32_t w, uint32_t h)
+/* Open the sensor in JPEG or H.264 mode (1280x720 only for H.264: the encoder needs height % 16
+ * == 0 and the OV9650 table has 720p). Caller holds s_cam_ctl. */
+static int cam_open_locked(uint32_t w, uint32_t h, bool h264)
 {
 	media_camera_device_t dev = {0};
 	int ret;
 
 	if (s_cam_open)
-		return BK_OK;
+		return s_cam_h264 == h264 ? BK_OK : BK_ERR_STATE;
 	if (!s_cam_buf)
 		s_cam_buf = psram_malloc(CAM_BUF_MAX);
 	if (!s_cam_buf)
@@ -1503,17 +1549,136 @@ static int cam_do_open(uint32_t w, uint32_t h)
 	rtos_delay_milliseconds(50);
 #endif
 	dev.type = DVP_CAMERA;
-	dev.mode = JPEG_MODE;
-	dev.fmt = PIXEL_FMT_JPEG;
+	dev.mode = h264 ? H264_MODE : JPEG_MODE;
+	dev.fmt = h264 ? PIXEL_FMT_H264 : PIXEL_FMT_JPEG;
 	dev.info.resolution.width = w;
 	dev.info.resolution.height = h;
 	dev.info.fps = FPS15;
+	s_cam_h264_frames = 0;
 	ret = media_app_camera_open(&dev);
 	if (ret != BK_OK)
 		return ret;
-	ret = media_app_register_read_frame_callback(PIXEL_FMT_JPEG, cam_frame_cb);
+	/* one registration at a time: the format selects which CPU1 frame queue is forwarded */
+	ret = media_app_register_read_frame_callback(dev.fmt, cam_frame_cb);
 	s_cam_open = (ret == BK_OK);
+	s_cam_h264 = s_cam_open && h264;
+	s_h264_q_pending = s_cam_h264;
+	os_printf("[cam] open %ux%u %s -> %d\r\n", w, h, h264 ? "h264" : "jpeg", ret);
 	return ret;
+}
+
+/* Caller holds s_cam_ctl. The last JPEG stays in s_cam_buf (stale snapshot while in H.264). */
+static void cam_close_locked(void)
+{
+	int ret;
+
+	media_app_unregister_read_frame_callback();
+	ret = media_app_camera_close(DVP_CAMERA);
+	os_printf("[cam] close (%s) -> %d\r\n", s_cam_h264 ? "h264" : "jpeg", ret);
+	s_cam_open = false;
+	s_cam_h264 = false;
+	s_h264_q_pending = false;
+}
+
+/* Push our H.264 rate-control targets to the CPU1 encoder. Only valid once the first frame is
+ * out: bk_h264_init() queues the SDK preset and the encoder ISR applies it at the first frame,
+ * and bk_h264_set_base_config() refuses while that is pending. */
+static int cam_h264_apply_q(void)
+{
+	compress_ratio_t r = {0};
+	int ret = BK_FAIL, tries;
+
+	if (!s_cam_open || !s_cam_h264)
+		return BK_ERR_STATE;
+	r.mode = H264_MODE;
+	r.enable = 1;
+	r.qp.init_qp = 30;
+	r.qp.i_min_qp = 10;
+	r.qp.i_max_qp = 45;
+	r.qp.p_min_qp = 10;
+	r.qp.p_max_qp = 45;
+	r.imb_bits = s_h264_imb;
+	r.pmb_bits = s_h264_pmb;
+	for (tries = 0; tries < 3 && ret != BK_OK; tries++) {
+		ret = media_app_set_compression_ratio(&r);
+		if (ret != BK_OK)
+			rtos_delay_milliseconds(150);
+	}
+	os_printf("[cam] h264 q imb %u pmb %u -> %d\r\n", s_h264_imb, s_h264_pmb, ret);
+	return ret;
+}
+
+/* HTTP wants JPEG frames. 0 = the camera is (now) in JPEG mode, -1 = stay/503 (see cam mode). */
+static int cam_want_jpeg(void)
+{
+	int ret = 0, playing = 0;
+
+	rtos_lock_mutex(&s_cam_ctl);
+	if (s_cam_open && !s_cam_h264)
+		goto out;
+	if (s_cam_pref == CAM_PREF_H264) {
+		ret = -1;
+		goto out;
+	}
+	if (s_cam_open && s_cam_h264) {
+		rtsp_clients(&playing);
+		if (playing > 0) {   /* auto: a live RTSP viewer keeps H.264 */
+			ret = -1;
+			goto out;
+		}
+		cam_close_locked();
+	}
+	ret = cam_open_locked(1280, 720, false);
+out:
+	rtos_unlock_mutex(&s_cam_ctl);
+	return ret;
+}
+
+/* ---- rtsp.c callbacks: the RTSP server wants H.264 ---- */
+int rtsp_cam_acquire(void)
+{
+	int ret = 0, w;
+
+	rtos_lock_mutex(&s_cam_ctl);
+	if (s_cam_pref == CAM_PREF_JPEG) {
+		ret = -1;
+		goto out;
+	}
+	if (s_cam_open && !s_cam_h264)
+		cam_close_locked();
+	if (!s_cam_open)
+		ret = cam_open_locked(1280, 720, true);
+	if (ret != 0)
+		goto out;
+	for (w = 0; w < 300 && s_cam_h264_frames == 0; w++)   /* first access unit ~1 s after open */
+		rtos_delay_milliseconds(10);
+	if (s_cam_h264_frames == 0) {
+		os_printf("[cam] h264: no frame within 3 s\r\n");
+		ret = -2;
+		goto out;
+	}
+	if (s_h264_q_pending) {
+		rtos_delay_milliseconds(100);   /* let the encoder ISR consume the SDK preset first */
+		if (cam_h264_apply_q() == BK_OK)
+			s_h264_q_pending = false;
+	}
+out:
+	rtos_unlock_mutex(&s_cam_ctl);
+	return ret;
+}
+
+void rtsp_cam_release(void)
+{
+	rtos_lock_mutex(&s_cam_ctl);
+	if (s_cam_open && s_cam_h264)
+		cam_close_locked();
+	rtos_unlock_mutex(&s_cam_ctl);
+}
+
+void rtsp_cam_idr(void)
+{
+	if (s_cam_open && s_cam_h264)
+		media_app_h264_regenerate_idr(DVP_CAMERA);
 }
 
 /* ---- camera HTTP server (AVDK build): GET /snapshot.jpg = latest JPEG, GET /stream = MJPEG
@@ -1561,10 +1726,16 @@ static void cam_http_client_task(beken_thread_arg_t arg)
 	if (n <= 0)
 		goto out;
 	req[n] = 0;
-	if (!s_cam_open && (os_strncmp(req, "GET /stream", 11) == 0 || os_strncmp(req, "GET /snapshot", 13) == 0)) {
-		cam_do_open(1280, 720);   /* open on demand; the first frame takes ~1 s */
-		for (int w = 0; w < 300 && s_cam_len == 0; w++)
-			rtos_delay_milliseconds(10);
+	if (os_strncmp(req, "GET /stream", 11) == 0 || os_strncmp(req, "GET /snapshot", 13) == 0) {
+		if (cam_want_jpeg() == 0) {   /* open on demand (or switch back from H.264); the first frame takes ~1 s */
+			for (int w = 0; w < 300 && s_cam_len == 0; w++)
+				rtos_delay_milliseconds(10);
+		} else if (os_strncmp(req, "GET /stream", 11) == 0 || !s_cam_len) {
+			n = snprintf(hdr, sizeof(hdr), "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 24\r\nConnection: close\r\n\r\ncamera busy (H.264/RTSP)");
+			send_all(sock, hdr, n);
+			goto out;
+		}
+		/* else: the snapshot is the last JPEG taken before the switch to H.264 (stale but useful) */
 	}
 	if (!s_cam_mutex || !s_cam_buf) {
 		n = snprintf(hdr, sizeof(hdr), "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 15\r\nConnection: close\r\n\r\ncamera not open");
@@ -1665,16 +1836,39 @@ static void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 	}
 #endif
 	if (argc >= 2 && os_strcmp(argv[1], "open") == 0) {
-		uint32_t w = argc >= 4 ? os_strtoul(argv[2], NULL, 10) : 1280, h = argc >= 4 ? os_strtoul(argv[3], NULL, 10) : 720;
-		int ret = cam_do_open(w, h);
-		REPLY("[cam] open %ux%u -> %d%s\r\n", w, h, ret, s_cam_open ? " (open)" : "");
+		/* cam open | open h264 | open W H | open W H h264 */
+		bool h264 = os_strcmp(argv[argc - 1], "h264") == 0;
+		int dims = argc - 2 - (h264 ? 1 : 0), ret;
+		uint32_t w = dims >= 2 ? os_strtoul(argv[2], NULL, 10) : 1280, h = dims >= 2 ? os_strtoul(argv[3], NULL, 10) : 720;
+		rtos_lock_mutex(&s_cam_ctl);
+		if (s_cam_open && s_cam_h264 != h264)
+			cam_close_locked();
+		ret = cam_open_locked(w, h, h264);
+		rtos_unlock_mutex(&s_cam_ctl);
+		REPLY("[cam] open %ux%u %s -> %d%s\r\n", w, h, h264 ? "h264" : "jpeg", ret, s_cam_open ? " (open)" : "");
 	} else if (argc >= 2 && os_strcmp(argv[1], "close") == 0) {
-		media_app_unregister_read_frame_callback();
-		REPLY("[cam] close -> %d\r\n", media_app_camera_close(DVP_CAMERA));
-		s_cam_open = false;
+		rtos_lock_mutex(&s_cam_ctl);
+		cam_close_locked();
+		rtos_unlock_mutex(&s_cam_ctl);
+		REPLY("[cam] closed\r\n");
 	} else if (argc >= 2 && os_strcmp(argv[1], "stat") == 0) {
-		REPLY("[cam] open %d frames %u dropped %u last %u bytes %ux%u seq %u age %u ms\r\n", s_cam_open, s_cam_frames,
+		static const char *const pref[] = {"auto", "jpeg", "h264"};
+		REPLY("[cam] open %d %s (mode %s) frames %u h264 %u dropped %u last jpeg %u bytes %ux%u seq %u age %u ms\r\n", s_cam_open,
+		      s_cam_open ? (s_cam_h264 ? "h264" : "jpeg") : "-", pref[s_cam_pref], s_cam_frames, s_cam_h264_frames,
 		      s_cam_drop, s_cam_len, s_cam_w, s_cam_h, s_cam_seq, s_cam_last_ms ? rtos_get_time() - s_cam_last_ms : 0);
+	} else if (argc >= 3 && os_strcmp(argv[1], "mode") == 0) {
+		if (os_strcmp(argv[2], "auto") == 0)
+			s_cam_pref = CAM_PREF_AUTO;
+		else if (os_strcmp(argv[2], "jpeg") == 0)
+			s_cam_pref = CAM_PREF_JPEG;
+		else if (os_strcmp(argv[2], "h264") == 0)
+			s_cam_pref = CAM_PREF_H264;
+		else {
+			REPLY("cam mode auto|jpeg|h264\r\n");
+			return;
+		}
+		kv_set_str(KV_CAM_MODE, argv[2]);
+		REPLY("[cam] mode %s (applies at the next open/switch)\r\n", argv[2]);
 	} else if (argc >= 4 && os_strcmp(argv[1], "snap") == 0) {
 		beken_thread_t t;
 		if (!s_cam_len) { REPLY("[cam] no frame yet\r\n"); return; }
@@ -1684,7 +1878,64 @@ static void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 		if (rtos_create_thread(&t, BEKEN_APPLICATION_PRIORITY, "camsnap", camsnap_task, 4096, NULL) != BK_OK)
 			REPLY("[cam] thread failed\r\n");
 	} else {
-		REPLY("cam open [W H] | close | stat | snap HOST PORT | http://IP:8080/snapshot.jpg /stream | probe [PWR_PIN ...] | probe scan | probe rails on|off | probe bb SCL SDA\r\n");
+		REPLY("cam open [W H] [h264] | close | stat | mode auto|jpeg|h264 | snap HOST PORT | http://IP:8080/snapshot.jpg /stream | probe [PWR_PIN ...] | probe scan | probe rails on|off | probe bb SCL SDA\r\n");
+	}
+}
+
+/* ---- rtsp: H.264 live stream server (rtsp.c), rtsp://IP:554/live ---- */
+static void cli_rtsp_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
+{
+	char buf[320];
+
+	if (argc >= 2 && os_strcmp(argv[1], "on") == 0) {
+		int ret = rtsp_start(s_rtsp_port);
+		s_rtsp_on = true;
+		kv_set_str(KV_RTSP, "1");
+		REPLY("[rtsp] on, port %u -> %d (persisted; clients switch the camera to H.264 on demand)\r\n", s_rtsp_port, ret);
+	} else if (argc >= 2 && os_strcmp(argv[1], "off") == 0) {
+		rtsp_stop();
+		s_rtsp_on = false;
+		kv_set_str(KV_RTSP, "0");
+		REPLY("[rtsp] off (persisted; server stops within ~1 s, camera released if in H.264)\r\n");
+	} else if (argc >= 2 && os_strcmp(argv[1], "status") == 0) {
+		rtsp_status(buf, sizeof(buf));
+		REPLY("%s", buf);
+		if (rtsp_status_clients(buf, sizeof(buf)) > 0)
+			REPLY("%s", buf);
+	} else if (argc >= 3 && os_strcmp(argv[1], "port") == 0) {
+		uint32_t p = os_strtoul(argv[2], NULL, 10);
+		if (p == 0 || p > 65535) {
+			REPLY("[rtsp] bad port\r\n");
+			return;
+		}
+		s_rtsp_port = (uint16_t)p;
+		kv_set_str(KV_RTSP_PORT, argv[2]);
+		REPLY("[rtsp] port %u (takes effect at the next `rtsp off` + `rtsp on`, or reboot)\r\n", s_rtsp_port);
+	} else if (argc >= 4 && os_strcmp(argv[1], "q") == 0) {
+		uint32_t imb = os_strtoul(argv[2], NULL, 10), pmb = os_strtoul(argv[3], NULL, 10);
+		if (imb < 10 || imb > 290 || pmb < 4 || pmb > 1000) {
+			REPLY("[rtsp] q IMB(10..290) PMB(4..1000) bits per macroblock; 720p = 3600 MB, 15 fps, IDR every 2 s\r\n");
+			return;
+		}
+		s_h264_imb = imb;
+		s_h264_pmb = pmb;
+		snprintf(buf, sizeof(buf), "%u %u", imb, pmb);
+		kv_set_str(KV_H264_Q, buf);
+		s_h264_q_pending = true;
+		if (s_cam_open && s_cam_h264 && s_cam_h264_frames) {
+			rtos_lock_mutex(&s_cam_ctl);
+			if (cam_h264_apply_q() == BK_OK)
+				s_h264_q_pending = false;
+			rtos_unlock_mutex(&s_cam_ctl);
+		}
+		REPLY("[rtsp] q imb %u pmb %u (~%u kbit/s nominal)%s\r\n", imb, pmb, (imb + 29 * pmb) * 3600 / 2000,
+		      s_h264_q_pending ? ", applied at the next H.264 open" : ", applied");
+	} else if (argc >= 2 && os_strcmp(argv[1], "idr") == 0) {
+		rtsp_request_idr();
+		REPLY("[rtsp] IDR requested\r\n");
+	} else {
+		REPLY("rtsp on|off | status | port N | q IMB PMB | idr   (now %s, port %u, q %u/%u, cam mode %d)\r\n",
+		      rtsp_running() ? "running" : "stopped", s_rtsp_port, s_h264_imb, s_h264_pmb, s_cam_pref);
 	}
 }
 #endif /* DU7_AVDK */
@@ -1857,7 +2108,8 @@ static const struct cli_command s_doorbell_commands[] = {
 	{"ring", "ring test | dark MV | fx on|off (local chime, ring LEDs, light when dark)", cli_ring_cmd},
 #endif
 #if defined(DU7_AVDK) && (CONFIG_SYS_CPU0)
-	{"cam", "cam open [W H] | close | stat | snap HOST PORT (AVDK build)", cli_cam_cmd},
+	{"cam", "cam open [W H] [h264] | close | stat | mode auto|jpeg|h264 | snap HOST PORT (AVDK build)", cli_cam_cmd},
+	{"rtsp", "rtsp on|off | status | port N | q IMB PMB | idr (H.264 live stream rtsp://IP:554/live)", cli_rtsp_cmd},
 #endif
 	{"spk", "spk tone [HZ] [MS] | play beepa|beepb|bell|ADDR LEN | net HOST PORT | stop", cli_spk_cmd},
 	{"mic", "mic level [MS] [HZ] | rec MS HOST PORT (on-board ADC mic)", cli_mic_cmd},
@@ -1896,7 +2148,25 @@ void user_app_main(void)
 #if defined(DU7_AVDK)
 	{
 		beken_thread_t http;
+		char v[24], *e;
+
+		rtos_init_mutex(&s_cam_ctl);
+		if (kv_get_str(KV_CAM_MODE, v, sizeof(v)))
+			s_cam_pref = os_strcmp(v, "jpeg") == 0 ? CAM_PREF_JPEG : os_strcmp(v, "h264") == 0 ? CAM_PREF_H264 : CAM_PREF_AUTO;
+		if (kv_get_str(KV_H264_Q, v, sizeof(v))) {
+			uint32_t a = os_strtoul(v, &e, 10), b = os_strtoul(e, NULL, 10);
+			if (a >= 10 && a <= 290 && b >= 4 && b <= 1000) {
+				s_h264_imb = a;
+				s_h264_pmb = b;
+			}
+		}
+		if (kv_get_str(KV_RTSP_PORT, v, sizeof(v)) && os_strtoul(v, NULL, 10) && os_strtoul(v, NULL, 10) <= 65535)
+			s_rtsp_port = (uint16_t)os_strtoul(v, NULL, 10);
+		if (kv_get_str(KV_RTSP, v, sizeof(v)))
+			s_rtsp_on = v[0] == '1';
 		rtos_create_thread(&http, BEKEN_APPLICATION_PRIORITY, "camhttp", cam_http_task, 4096, NULL);
+		if (s_rtsp_on)   /* default off: nothing changes for the camera until `rtsp on` */
+			rtsp_start(s_rtsp_port);
 	}
 #endif
 	pin_configure(PIN_LED_WHITE, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);

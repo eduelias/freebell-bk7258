@@ -22,3 +22,9 @@ CONFIG_PSRAM_AUTO_DETECT=n
 CONFIG_PSRAM_APS128XXO_OB9=y
 CONFIG_CAMERA_POWER_GPIO_CTRL=y
 CONFIG_CAMERA_CTRL_POWER_GPIO_ID=28
+# H.264 for the RTSP stream (v0.19.0): one IDR (with SPS/PPS, CONFIG_H264_GOP_START_IDR_FRAME) every
+# 30 frames = 2 s at 15 fps; no SDK-private SEI NAL appended to each access unit; 128 KB per access
+# unit so 720p I-frames fit (8 x 128 KB out of the 1.4 MB encode slab; JPEG uses 4 x 150 KB).
+CONFIG_H264_P_FRAME_CNT=29
+CONFIG_H264_ADD_SELF_DEFINE_SEI=n
+CONFIG_H264_FRAME_SIZE=131072
