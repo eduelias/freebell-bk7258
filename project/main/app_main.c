@@ -27,6 +27,8 @@
 #include <driver/dma.h>
 #include "pir.h"
 #include "power.h"   /* feat/power: battery, charger, deep sleep */
+#include "aud_engine.h"   /* engine API implemented below, used by talk.c */
+#include "talk.h"         /* two-way audio over HTTP (/speak, /mic.wav) */
 #endif
 #ifdef DU7_AVDK   /* all cores: media_service_init() runs on CPU0/1/2 */
 #include "media_service.h"
@@ -63,7 +65,7 @@ void db_reply(const char *fmt, ...)
 	REPLY("%s", buf);
 }
 
-#define FW_VERSION "0.22.3"
+#define FW_VERSION "0.23.0"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -1187,6 +1189,153 @@ static void cli_mic_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 	}
 }
 
+/* ---- engine API for talk.c (aud_engine.h): the same DAC/ADC + DMA rings as `spk`/`mic`, but opened
+ * and closed by the caller's thread (the HTTP client thread) instead of spk_task / micnet_task.
+ * Mutual exclusion is the existing s_spk_busy / s_mic_busy, so the ring chime, `spk tone`, `mic rec`
+ * and talk never drive the hardware at the same time. ---- */
+int aud_spk_open(uint16_t gain)
+{
+	aud_dac_config_t cfg = DEFAULT_AUD_DAC_CONFIG();
+	int rc;
+	GLOBAL_INT_DECLARATION();
+
+	GLOBAL_INT_DISABLE();
+	if (s_spk_busy) {
+		GLOBAL_INT_RESTORE();
+		return -1;
+	}
+	s_spk_busy = true;
+	GLOBAL_INT_RESTORE();
+	s_spk_stop = false;
+	cfg.samp_rate = s_dac_rate;
+	cfg.clk_src = s_dac_clk;
+	cfg.dac_chl = s_dac_chl;
+	cfg.work_mode = s_dac_mode;
+	cfg.dac_gain = gain ? gain : s_dac_gain;
+	s_spk_w = s_spk_r = 0;
+	s_dac_half = 0;
+	s_spk_underrun = s_dac_frames = 0;
+	s_spk_feeding = true;
+	if (bk_aud_dac_init(&cfg) != BK_OK) {
+		s_spk_busy = false;
+		return -2;
+	}
+	if (!s_dac_dma_buf)
+		s_dac_dma_buf = os_malloc(2 * AUD_FRAME);
+	if (s_dac_dma_buf)
+		os_memset(s_dac_dma_buf, 0, 2 * AUD_FRAME);   /* no stale audio from the last playback before the PA comes on */
+	if ((rc = aud_dma_start(0)) != 0 || bk_aud_dac_start() != BK_OK) {
+		os_printf("[talk] dma/dac start failed (%d)\r\n", rc);
+		aud_dma_stop(0);
+		bk_aud_dac_deinit();
+		s_spk_busy = false;
+		return -3;
+	}
+	rtos_delay_milliseconds(20);   /* DAC runs on silence first, then the amplifier: softer pop */
+	pa_set(1);
+	return 0;
+}
+
+int aud_spk_write(const uint8_t *s16le, uint32_t bytes)
+{
+	spk_ring_write(s16le, bytes);
+	return s_spk_stop ? -1 : 0;
+}
+
+void aud_spk_close(void)
+{
+	uint32_t i;
+
+	s_spk_feeding = false;
+	for (i = 0; i < 250 && s_spk_w != s_spk_r && !s_spk_stop; i++)   /* drain the ring (<= 1 s of audio) */
+		rtos_delay_milliseconds(10);
+	rtos_delay_milliseconds(2 * AUD_FRAME / 2 * 1000 / s_dac_rate);   /* plus the two DMA halves in flight */
+	pa_set(0);                     /* amplifier off before the DAC stops: no stop transient on the speaker */
+	rtos_delay_milliseconds(20);
+	aud_dma_stop(0);
+	bk_aud_dac_stop();
+	bk_aud_dac_deinit();
+	s_spk_busy = false;
+}
+
+bool aud_spk_busy(void) { return s_spk_busy; }
+uint32_t aud_spk_rate(void) { return s_dac_rate; }
+uint16_t aud_spk_gain(void) { return s_dac_gain; }
+void aud_spk_stats(uint32_t *dma_frames, uint32_t *underruns) { *dma_frames = s_dac_frames; *underruns = s_spk_underrun; }
+
+int aud_mic_open(uint32_t gain)
+{
+	aud_adc_config_t cfg = DEFAULT_AUD_ADC_CONFIG();
+	int rc;
+	GLOBAL_INT_DECLARATION();
+
+	GLOBAL_INT_DISABLE();
+	if (s_mic_busy) {
+		GLOBAL_INT_RESTORE();
+		return -1;
+	}
+	s_mic_busy = true;
+	GLOBAL_INT_RESTORE();
+	cfg.samp_rate = s_adc_rate;
+	cfg.clk_src = s_adc_clk;
+	cfg.adc_chl = s_adc_chl;
+	cfg.adc_mode = s_adc_mode;
+	cfg.adc_gain = gain ? gain : s_adc_gain;
+	if (bk_aud_adc_init(&cfg) != BK_OK) {
+		s_mic_busy = false;
+		return -2;
+	}
+	bk_aud_adc_set_mic_mode(s_mic_id, s_adc_mode);
+	s_mic_w = s_mic_r = 0;
+	s_adc_half = 0;
+	s_mic_overrun = s_adc_frames = 0;
+	if ((rc = aud_dma_start(1)) != 0 || bk_aud_adc_start() != BK_OK) {
+		os_printf("[talk] dma/adc start failed (%d)\r\n", rc);
+		aud_dma_stop(1);
+		bk_aud_adc_deinit();
+		s_mic_busy = false;
+		return -3;
+	}
+	return 0;
+}
+
+uint32_t aud_mic_read(uint8_t *dst, uint32_t cap)
+{
+	uint32_t n = s_mic_w - s_mic_r;
+
+	if (n > cap)
+		n = cap;
+	n &= ~3u;   /* whole 32-bit FIFO words */
+	if (!n)
+		return 0;
+	ring_copy_out(dst, s_mic_ring, MIC_RING, s_mic_r % MIC_RING, n);
+	s_mic_r += n;
+	return n;
+}
+
+void aud_mic_close(void)
+{
+	bk_aud_adc_stop();
+	aud_dma_stop(1);
+	bk_aud_adc_deinit();
+	s_mic_busy = false;
+}
+
+bool aud_mic_busy(void) { return s_mic_busy; }
+uint32_t aud_mic_rate(void) { return 2 * s_adc_rate; }   /* measured 2026-10-03: the ADC delivers twice the configured rate */
+void aud_mic_stats(uint32_t *dma_frames, uint32_t *overruns) { *dma_frames = s_adc_frames; *overruns = s_mic_overrun; }
+
+void app_reply(const char *fmt, ...)
+{
+	char buf[256];
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	REPLY("%s", buf);
+}
+
 /* ---- TCP command channel: the same commands as the UART shell, over the LAN ----
  * One line per connection: "<token> <command...>\n". The token is the KV string db_token
  * (set once over serial: `tok set SECRET`); without a stored token the channel is disabled.
@@ -1855,6 +2004,8 @@ static void cam_http_client_task(beken_thread_arg_t arg)
 	if (n <= 0)
 		goto out;
 	req[n] = 0;
+	if (talk_http_handle(sock, req, n))   /* /speak, /mic.wav, /talk (talk.c): handled, just close */
+		goto out;
 	if (os_strncmp(req, "GET /stream", 11) == 0 || os_strncmp(req, "GET /snapshot", 13) == 0) {
 		if (cam_want_jpeg() == 0) {   /* open on demand (or switch back from H.264); the first frame takes ~1 s */
 			for (int w = 0; w < 300 && s_cam_len == 0; w++)
@@ -1948,7 +2099,7 @@ static void cam_http_task(beken_thread_arg_t arg)
 		}
 		s_cam_http_clients++;
 		power_activity();
-		if (rtos_create_thread(&t, BEKEN_APPLICATION_PRIORITY, "camhttp", cam_http_client_task, 4096, (beken_thread_arg_t)(intptr_t)c) != BK_OK) {
+		if (rtos_create_thread(&t, BEKEN_APPLICATION_PRIORITY, "camhttp", cam_http_client_task, 6144, (beken_thread_arg_t)(intptr_t)c) != BK_OK) {   /* 6 KB: talk.c (url fetch + WAV parser) runs in this thread */
 			s_cam_http_clients--;
 			close(c);
 		}
@@ -2326,6 +2477,7 @@ static const struct cli_command s_doorbell_commands[] = {
 #endif
 	{"spk", "spk tone [HZ] [MS] | play beepa|beepb|bell|ADDR LEN | net HOST PORT | stop", cli_spk_cmd},
 	{"mic", "mic level [MS] [HZ] | rec MS HOST PORT (on-board ADC mic)", cli_mic_cmd},
+	{"talk", "talk status | gain N|auto | micgain N | max S | stop (two-way audio over HTTP :8080 /speak /mic.wav)", cli_talk_cmd},
 #endif
 };
 #if (CONFIG_SYS_CPU0)
@@ -2396,6 +2548,7 @@ void user_app_main(void)
 		if (kv_get_str(KV_LIGHT_CHAN, v, sizeof(v)))
 			s_light_chan = os_strtoul(v, NULL, 10);
 	}
+	talk_init();   /* KV: db_talk_gain / db_talk_micgain / db_talk_max */
 	kv_get_str(KV_PASS, s_pass, sizeof(s_pass));
 	if (!kv_get_str(KV_HOOK, s_hook, sizeof(s_hook)))
 		os_strlcpy(s_hook, HOOK_DEFAULT, sizeof(s_hook));

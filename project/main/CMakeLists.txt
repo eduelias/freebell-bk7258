@@ -5,6 +5,7 @@ set(srcs
     pir.c
     power.c
     rtsp.c
+    talk.c
     )
 
 if (CONFIG_OVERRIDE_FLASH_PARTITION)
