@@ -40,7 +40,7 @@
 #endif
 
 #define FW_NAME "doorbell-bk7258-fw"
-#define FW_VERSION "0.17.0"
+#define FW_VERSION "0.17.1"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -1501,7 +1501,7 @@ static int cam_do_open(uint32_t w, uint32_t h)
  * generic/mjpeg camera; the frame is copied out of the shared buffer first so the camera callback
  * is never blocked by a slow client. ---- */
 #define CAM_HTTP_PORT 8080
-#define CAM_HTTP_MAX_CLIENTS 2
+#define CAM_HTTP_MAX_CLIENTS 6   /* HA keeps the MJPEG stream open; leave room for snapshots and a browser */
 static volatile int s_cam_http_clients;
 
 static int cam_copy_latest(uint8_t *dst, uint32_t cap, uint32_t *seq)
@@ -1536,6 +1536,7 @@ static void cam_http_client_task(beken_thread_arg_t arg)
 	struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
 
 	setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));   /* a stalled stream client is dropped, not held forever */
 	n = recv(sock, req, sizeof(req) - 1, 0);
 	if (n <= 0)
 		goto out;
