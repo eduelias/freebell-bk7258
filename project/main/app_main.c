@@ -40,7 +40,7 @@
 #endif
 
 #define FW_NAME "doorbell-bk7258-fw"
-#define FW_VERSION "0.16.1"
+#define FW_VERSION "0.17.0"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -1457,6 +1457,184 @@ static void cli_cam_probe(int argc, char **argv)
 }
 #endif /* CONFIG_DVP_CAMERA */
 
+static int cam_do_open(uint32_t w, uint32_t h)
+{
+	media_camera_device_t dev = {0};
+	int ret;
+
+	if (s_cam_open)
+		return BK_OK;
+	if (!s_cam_buf)
+		s_cam_buf = psram_malloc(CAM_BUF_MAX);
+	if (!s_cam_buf)
+		return BK_ERR_NO_MEM;
+	if (!s_cam_mutex)
+		rtos_init_mutex(&s_cam_mutex);
+#if CONFIG_DVP_CAMERA
+	cam_rails(1);   /* GPIO 9, 28 (camera power, active high per the stock firmware), 5, 6 */
+	rtos_delay_milliseconds(30);
+	/* stock bk_dvp_camera_enumerate: GPIO 52 low 100 ms, high 100 ms, low (sensor PWDN/RESET pulse) */
+	pin_configure(52, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+	bk_gpio_set_output_low(52);
+	rtos_delay_milliseconds(100);
+	bk_gpio_set_output_high(52);
+	rtos_delay_milliseconds(100);
+	bk_gpio_set_output_low(52);
+	rtos_delay_milliseconds(50);
+#endif
+	dev.type = DVP_CAMERA;
+	dev.mode = JPEG_MODE;
+	dev.fmt = PIXEL_FMT_JPEG;
+	dev.info.resolution.width = w;
+	dev.info.resolution.height = h;
+	dev.info.fps = FPS15;
+	ret = media_app_camera_open(&dev);
+	if (ret != BK_OK)
+		return ret;
+	ret = media_app_register_read_frame_callback(PIXEL_FMT_JPEG, cam_frame_cb);
+	s_cam_open = (ret == BK_OK);
+	return ret;
+}
+
+/* ---- camera HTTP server (AVDK build): GET /snapshot.jpg = latest JPEG, GET /stream = MJPEG
+ * (multipart/x-mixed-replace), GET / = status. Plain HTTP on the LAN for Home Assistant's
+ * generic/mjpeg camera; the frame is copied out of the shared buffer first so the camera callback
+ * is never blocked by a slow client. ---- */
+#define CAM_HTTP_PORT 8080
+#define CAM_HTTP_MAX_CLIENTS 2
+static volatile int s_cam_http_clients;
+
+static int cam_copy_latest(uint8_t *dst, uint32_t cap, uint32_t *seq)
+{
+	uint32_t len;
+	rtos_lock_mutex(&s_cam_mutex);
+	len = s_cam_len;
+	if (len && len <= cap) {
+		os_memcpy(dst, s_cam_buf, len);
+		*seq = s_cam_seq;
+	} else {
+		len = 0;
+	}
+	rtos_unlock_mutex(&s_cam_mutex);
+	return (int)len;
+}
+
+static int send_all(int sock, const void *p, int n)
+{
+	int off = 0, r;
+	while (off < n && (r = send(sock, (const uint8_t *)p + off, n - off > 4096 ? 4096 : n - off, 0)) > 0)
+		off += r;
+	return off == n ? 0 : -1;
+}
+
+static void cam_http_client_task(beken_thread_arg_t arg)
+{
+	int sock = (int)(intptr_t)arg, n;
+	char req[256], hdr[192];
+	uint8_t *buf = NULL;
+	uint32_t seq = 0, last = 0;
+	struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+
+	setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	n = recv(sock, req, sizeof(req) - 1, 0);
+	if (n <= 0)
+		goto out;
+	req[n] = 0;
+	if (!s_cam_open && (os_strncmp(req, "GET /stream", 11) == 0 || os_strncmp(req, "GET /snapshot", 13) == 0)) {
+		cam_do_open(1280, 720);   /* open on demand; the first frame takes ~1 s */
+		for (int w = 0; w < 300 && s_cam_len == 0; w++)
+			rtos_delay_milliseconds(10);
+	}
+	if (!s_cam_mutex || !s_cam_buf) {
+		n = snprintf(hdr, sizeof(hdr), "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 15\r\nConnection: close\r\n\r\ncamera not open");
+		send_all(sock, hdr, n);
+		goto out;
+	}
+	buf = psram_malloc(CAM_BUF_MAX);
+	if (!buf)
+		goto out;
+	if (os_strncmp(req, "GET /stream", 11) == 0) {
+		n = snprintf(hdr, sizeof(hdr), "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+			     "Cache-Control: no-cache\r\nConnection: close\r\n\r\n");
+		if (send_all(sock, hdr, n))
+			goto out;
+		for (;;) {
+			for (int w = 0; w < 200 && s_cam_seq == last; w++)   /* wait up to 2 s for a new frame */
+				rtos_delay_milliseconds(10);
+			if (s_cam_seq == last)
+				continue;
+			n = cam_copy_latest(buf, CAM_BUF_MAX, &seq);
+			if (n <= 0)
+				continue;
+			last = seq;
+			int hl = snprintf(hdr, sizeof(hdr), "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n", n);
+			if (send_all(sock, hdr, hl) || send_all(sock, buf, n) || send_all(sock, "\r\n", 2))
+				break;
+		}
+	} else if (os_strncmp(req, "GET /snapshot", 13) == 0) {
+		n = cam_copy_latest(buf, CAM_BUF_MAX, &seq);
+		if (n > 0) {
+			int hl = snprintf(hdr, sizeof(hdr), "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n"
+					  "Cache-Control: no-cache\r\nConnection: close\r\n\r\n", n);
+			if (!send_all(sock, hdr, hl))
+				send_all(sock, buf, n);
+		} else {
+			n = snprintf(hdr, sizeof(hdr), "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 12\r\nConnection: close\r\n\r\nno frame yet");
+			send_all(sock, hdr, n);
+		}
+	} else {
+		char body[160];
+		int bl = snprintf(body, sizeof(body), "<html><body>doorbell " FW_VERSION " cam open=%d frames=%u %ux%u<br>"
+				  "<a href=/snapshot.jpg>snapshot.jpg</a> <a href=/stream>stream</a></body></html>",
+				  s_cam_open, s_cam_frames, s_cam_w, s_cam_h);
+		n = snprintf(hdr, sizeof(hdr), "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", bl);
+		if (!send_all(sock, hdr, n))
+			send_all(sock, body, bl);
+	}
+out:
+	if (buf)
+		os_free(buf);
+	close(sock);
+	s_cam_http_clients--;
+	rtos_delete_thread(NULL);
+}
+
+static void cam_http_task(beken_thread_arg_t arg)
+{
+	struct sockaddr_in sa = {0};
+	int ls = socket(AF_INET, SOCK_STREAM, 0), one = 1;
+
+	if (ls < 0)
+		goto out;
+	setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	sa.sin_family = AF_INET;
+	sa.sin_port = htons(CAM_HTTP_PORT);
+	sa.sin_addr.s_addr = INADDR_ANY;
+	if (bind(ls, (struct sockaddr *)&sa, sizeof(sa)) < 0 || listen(ls, 2) < 0) {
+		os_printf("[cam] http bind/listen failed\r\n");
+		close(ls);
+		goto out;
+	}
+	os_printf("[cam] http server on port %d\r\n", CAM_HTTP_PORT);
+	for (;;) {
+		int c = accept(ls, NULL, NULL);
+		beken_thread_t t;
+		if (c < 0)
+			continue;
+		if (s_cam_http_clients >= CAM_HTTP_MAX_CLIENTS) {
+			close(c);
+			continue;
+		}
+		s_cam_http_clients++;
+		if (rtos_create_thread(&t, BEKEN_APPLICATION_PRIORITY, "camhttp", cam_http_client_task, 4096, (beken_thread_arg_t)(intptr_t)c) != BK_OK) {
+			s_cam_http_clients--;
+			close(c);
+		}
+	}
+out:
+	rtos_delete_thread(NULL);
+}
+
 static void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
 {
 #if CONFIG_DVP_CAMERA
@@ -1466,36 +1644,9 @@ static void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 	}
 #endif
 	if (argc >= 2 && os_strcmp(argv[1], "open") == 0) {
-		media_camera_device_t dev = {0};
-		int ret;
-		if (s_cam_open) { REPLY("[cam] already open\r\n"); return; }
-		if (!s_cam_buf) s_cam_buf = psram_malloc(CAM_BUF_MAX);
-		if (!s_cam_buf) { REPLY("[cam] psram_malloc failed\r\n"); return; }
-		if (!s_cam_mutex) rtos_init_mutex(&s_cam_mutex);
-#if CONFIG_DVP_CAMERA
-		cam_rails(1);   /* GPIO 9, 28 (camera power, active high per the stock firmware), 5, 6 */
-		rtos_delay_milliseconds(30);
-		/* stock bk_dvp_camera_enumerate: GPIO 52 low 100 ms, high 100 ms, low (sensor PWDN/RESET pulse) */
-		pin_configure(52, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
-		bk_gpio_set_output_low(52);
-		rtos_delay_milliseconds(100);
-		bk_gpio_set_output_high(52);
-		rtos_delay_milliseconds(100);
-		bk_gpio_set_output_low(52);
-		rtos_delay_milliseconds(50);
-#endif
-		dev.type = DVP_CAMERA;
-		dev.mode = JPEG_MODE;
-		dev.fmt = PIXEL_FMT_JPEG;
-		dev.info.resolution.width = argc >= 4 ? os_strtoul(argv[2], NULL, 10) : 640;
-		dev.info.resolution.height = argc >= 4 ? os_strtoul(argv[3], NULL, 10) : 480;
-		dev.info.fps = FPS20;
-		ret = media_app_camera_open(&dev);
-		REPLY("[cam] open %ux%u -> %d\r\n", dev.info.resolution.width, dev.info.resolution.height, ret);
-		if (ret != BK_OK) return;
-		ret = media_app_register_read_frame_callback(PIXEL_FMT_JPEG, cam_frame_cb);
-		REPLY("[cam] frame callback -> %d\r\n", ret);
-		s_cam_open = (ret == BK_OK);
+		uint32_t w = argc >= 4 ? os_strtoul(argv[2], NULL, 10) : 1280, h = argc >= 4 ? os_strtoul(argv[3], NULL, 10) : 720;
+		int ret = cam_do_open(w, h);
+		REPLY("[cam] open %ux%u -> %d%s\r\n", w, h, ret, s_cam_open ? " (open)" : "");
 	} else if (argc >= 2 && os_strcmp(argv[1], "close") == 0) {
 		media_app_unregister_read_frame_callback();
 		REPLY("[cam] close -> %d\r\n", media_app_camera_close(DVP_CAMERA));
@@ -1512,7 +1663,7 @@ static void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 		if (rtos_create_thread(&t, BEKEN_APPLICATION_PRIORITY, "camsnap", camsnap_task, 4096, NULL) != BK_OK)
 			REPLY("[cam] thread failed\r\n");
 	} else {
-		REPLY("cam open [W H] | close | stat | snap HOST PORT | probe [PWR_PIN ...] | probe scan | probe rails on|off | probe bb SCL SDA\r\n");
+		REPLY("cam open [W H] | close | stat | snap HOST PORT | http://IP:8080/snapshot.jpg /stream | probe [PWR_PIN ...] | probe scan | probe rails on|off | probe bb SCL SDA\r\n");
 	}
 }
 #endif /* DU7_AVDK */
@@ -1624,6 +1775,12 @@ void user_app_main(void)
 
 #if (CONFIG_SYS_CPU0)
 	pa_set(0);   /* amplifier enable floats at boot and half-turns the speaker on: park it low */
+#if defined(DU7_AVDK)
+	{
+		beken_thread_t http;
+		rtos_create_thread(&http, BEKEN_APPLICATION_PRIORITY, "camhttp", cam_http_task, 4096, NULL);
+	}
+#endif
 	pin_configure(PIN_LED_WHITE, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
 	bk_gpio_set_output_low(PIN_LED_WHITE);
 	pin_configure(PIN_LED_RING, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
