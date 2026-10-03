@@ -28,7 +28,7 @@
 #endif
 
 #define FW_NAME "doorbell-bk7258-fw"
-#define FW_VERSION "0.14.0"
+#define FW_VERSION "0.14.1"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -1153,19 +1153,20 @@ static void tcp_cmd_task(beken_thread_arg_t arg)
 	}
 }
 
-/* ---- LEDs (found 2026-10-03 with the Mac camera): GPIO 44 = white fill LED, GPIO 45 = IR illuminators, both active high ---- */
+/* ---- LEDs (found 2026-10-03 with the Mac camera): GPIO 44 = white fill LED, GPIO 45 = the four blue
+ * button-ring LEDs (night locator light), both active high. The IR LED above the camera is still unmapped. ---- */
 #define PIN_LED_WHITE 44
-#define PIN_LED_IR 45
+#define PIN_LED_RING 45
 static void cli_led_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
 {
 	int pin = -1, on;
 
 	if (argc >= 3 && os_strcmp(argv[1], "white") == 0)
 		pin = PIN_LED_WHITE;
-	else if (argc >= 3 && os_strcmp(argv[1], "ir") == 0)
-		pin = PIN_LED_IR;
+	else if (argc >= 3 && os_strcmp(argv[1], "ring") == 0)
+		pin = PIN_LED_RING;
 	if (pin < 0 || (os_strcmp(argv[2], "on") && os_strcmp(argv[2], "off"))) {
-		REPLY("led white|ir on|off\r\n");
+		REPLY("led white|ring on|off\r\n");
 		return;
 	}
 	on = os_strcmp(argv[2], "on") == 0;
@@ -1223,7 +1224,7 @@ static const struct cli_command s_doorbell_commands[] = {
 	{"hook", "hook set HOST:PORT/PATH | test | ring | motion | (show)", cli_hook_cmd},
 	{"ota", "ota URL (download app_pack.rbl over HTTP, then reboot)", cli_ota_cmd},
 	{"tok", "tok set SECRET | clear (token for the TCP command channel, port 2323)", cli_tok_cmd},
-	{"led", "led white|ir on|off (GPIO 44 / GPIO 45)", cli_led_cmd},
+	{"led", "led white|ring on|off (white fill LED GPIO 44 / blue button ring GPIO 45)", cli_led_cmd},
 	{"spk", "spk tone [HZ] [MS] | play beepa|beepb|bell|ADDR LEN | net HOST PORT | stop", cli_spk_cmd},
 	{"mic", "mic level [MS] [HZ] | rec MS HOST PORT (on-board ADC mic)", cli_mic_cmd},
 #endif
@@ -1258,8 +1259,8 @@ void user_app_main(void)
 	pa_set(0);   /* amplifier enable floats at boot and half-turns the speaker on: park it low */
 	pin_configure(PIN_LED_WHITE, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
 	bk_gpio_set_output_low(PIN_LED_WHITE);
-	pin_configure(PIN_LED_IR, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
-	bk_gpio_set_output_low(PIN_LED_IR);
+	pin_configure(PIN_LED_RING, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+	bk_gpio_set_output_low(PIN_LED_RING);
 	kv_get_str(KV_SSID, s_ssid, sizeof(s_ssid));
 	kv_get_str(KV_PASS, s_pass, sizeof(s_pass));
 	if (!kv_get_str(KV_HOOK, s_hook, sizeof(s_hook)))

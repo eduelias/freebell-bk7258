@@ -184,7 +184,7 @@ sessions (before that worked) are noise, except the ADC readings.
 | 24 | idle low; 8 isolated high pulses of 2-4 s in 8 min at irregular intervals with nobody at the device (`pinmap_watch10/11_passive.txt`) | **PIR motion output**, active-high, 2-4 s hold (one wave in front of it will confirm) |
 | 53 | **doorbell button, confirmed 2026-10-03** (active-low, ~0.3 s presses; 46 edges / 13 `ring` posts in a 45 s press test) | button |
 | 44 | **white fill LED enable (2026-10-03, camera-verified)**: high = white LED on (big flare), low/hi-Z = off | white LED, active high (`led white on`) |
-| 45 (ADC11) | **IR illuminator enable (2026-10-03, camera-verified)**: high = dim blue-purple glow from the LED board in the Mac camera (how 850 nm IR looks), low/hi-Z = off; the 2026-10-02 "kills the white LED" reading was a coincidence | IR LEDs, active high (`led ir on`) |
+| 45 (ADC11) | **blue button-ring LEDs (2026-10-03, camera-verified, user-identified)**: high = the four blue LEDs around the button light up (night locator light), low/hi-Z = off. Not infrared: the IR LED sits above the camera lens and is still unmapped. The 2026-10-02 "kills the white LED" reading was a coincidence | ring LEDs, active high (`led ring on`) |
 | 46 | **speaker amplifier enable, confirmed 2026-10-03** (active-high; GPIO sweep with the Mac mic listening: 1 kHz tone at 108 with 46 high vs <1 for the other pins; left floating it leaks a faint output) | PA enable, firmware default `spk pa 46` |
 | 10, 11 | UART0 console | never touch |
 | others | see the latest `pinmap_session*.txt` (v0.4.0 reclaim) | |
