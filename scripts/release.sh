@@ -5,7 +5,8 @@
 #   scripts/release.sh --dry-run   # print what would run (build script, image, publish command,
 #                                  # OTA URL) and exit before any copy; combine with --no-build
 # Settings come from the environment or ~/.config/doorbell-bk7258/env (scripts/env.example):
-#   BUILD         build-avdk.sh (default, camera flavour) or build.sh
+#   BUILD         build-avdk.sh (default, camera flavour), build.sh, or build-remote.sh (same
+#                 flavour built on REMOTE_BUILD_HOST, see scripts/build-remote.sh)
 #   FW_DIR        where the build put doorbell-fw_<ver>_app_pack.rbl
 #   OTA_URL_BASE  HTTP base URL the device fetches from, e.g. http://<ha-ip>:8123/local/doorbell
 #   OTA_PUBLISH   shell command that copies the image there; {rbl} = full path, {name} = basename,
@@ -31,8 +32,8 @@ for arg in "$@"; do
 done
 
 case "$BUILD" in
-	build.sh|build-avdk.sh) ;;
-	*) echo "BUILD must be build-avdk.sh or build.sh (got '$BUILD')" >&2; exit 2 ;;
+	build.sh|build-avdk.sh|build-remote.sh) ;;
+	*) echo "BUILD must be build-avdk.sh, build.sh or build-remote.sh (got '$BUILD')" >&2; exit 2 ;;
 esac
 
 if [ $build = 1 ] && [ $dry = 0 ]; then
@@ -60,7 +61,7 @@ url="${OTA_URL_BASE%/}/$name"
 if [ $dry = 1 ]; then
 	echo "dry run: nothing is copied or sent"
 	echo "  build:    $([ $build = 1 ] && echo "scripts/$BUILD" || echo "skipped (--no-build)")"
-	echo "  image:    $rbl ($([ -s "$rbl" ] && echo "$(stat -f %z "$rbl" 2>/dev/null || stat -c %s "$rbl") bytes" || echo "missing"))"
+	echo "  image:    $rbl ($([ -s "$rbl" ] && echo "$(stat -c %s "$rbl" 2>/dev/null || stat -f %z "$rbl") bytes" || echo "missing"))"
 	echo "  publish:  $publish"
 	echo "  verify:   curl -sf -o /dev/null $url"
 	echo "  trigger:  python3 tools/dbcmd.py ota $url"

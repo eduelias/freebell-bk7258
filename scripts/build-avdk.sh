@@ -11,6 +11,13 @@ AVDK=${AVDK:-$HOME/reps/oss/bk_avdk}
 OUT=${OUT:-$HOME/data/doorbell-bk7258/avdk-build}
 FW_DIR=${FW_DIR:-$HOME/data/doorbell-bk7258/firmware}
 IMAGE=docker.io/bekencorp/armino-idk:1.5
+# container runtime: CONTAINER_RUNTIME=podman|docker, else podman if installed, else docker
+RUNTIME=${CONTAINER_RUNTIME:-}
+if [ -z "$RUNTIME" ]; then
+	if command -v podman >/dev/null 2>&1; then RUNTIME=podman
+	elif command -v docker >/dev/null 2>&1; then RUNTIME=docker
+	else echo "need podman or docker to run $IMAGE" >&2; exit 1; fi
+fi
 
 for p in "$HERE"/patches/*.patch; do
 	name=$(basename "$p")
@@ -27,10 +34,13 @@ for p in "$HERE"/patches-avdk/*.patch; do
 	elif git -C "$AVDK" apply --check "$p" 2>/dev/null; then git -C "$AVDK" apply "$p" && echo "avdk patch applied: $name"
 	else echo "avdk patch does not apply: $name" >&2; exit 1; fi
 done
-podman machine inspect --format '{{.State}}' 2>/dev/null | grep -q running || podman machine start
+# macOS/Windows podman runs the containers in a VM ("machine"); Linux podman has none
+if [ "$RUNTIME" = podman ] && [ -n "$(podman machine list --format '{{.Name}}' 2>/dev/null)" ]; then
+	podman machine inspect --format '{{.State}}' 2>/dev/null | grep -q running || podman machine start
+fi
 mkdir -p "$OUT" "$FW_DIR"
 start=$(date +%s)
-podman run --platform linux/amd64 --rm \
+"$RUNTIME" run --platform linux/amd64 --rm \
 	-v "$AVDK":/avdk \
 	-v "$SDK":/avdk/bk_idk \
 	-v "$HERE/project-avdk":/avdk/projects/doorbell \

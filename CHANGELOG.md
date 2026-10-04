@@ -4,6 +4,18 @@ Versions are the `FW_VERSION` in `project/main/app_main.c` (also in every report
 `sys info`). Dates are 2026 unless stated; most of this was written between 2026-10-01 and
 2026-10-03.
 
+## Unreleased
+- tools: **remote builder** (2026-10-04). `scripts/build-remote.sh` mirrors the working tree to an
+  x86-64 host over ssh/rsync, runs `scripts/build-avdk.sh` (or `build.sh` with `--bare`) there and
+  copies the images back into `FW_DIR`; flags `--no-sync-back`, `--shell`; keys `REMOTE_BUILD_HOST`,
+  `REMOTE_BUILD_PORT`, `REMOTE_REPO_DIR`, `REMOTE_SDK`, `REMOTE_AVDK`, `REMOTE_OUT`,
+  `REMOTE_FW_DIR`, `REMOTE_WAKE` in `scripts/env.example`; `release.sh` accepts
+  `BUILD=build-remote.sh`. `build.sh`/`build-avdk.sh` now run under docker as well as podman
+  (`CONTAINER_RUNTIME` to force one; the podman-machine start only runs where a machine exists),
+  `build.sh` takes `GIT_REV` for the image name and uses a portable `stat`. The author's remote is a
+  WSL2 Ubuntu-24.04 on a Windows 11 desktop (`docs/notes/remote-build.md`): full build 41 s,
+  incremental 15 s, against ~11 min / ~100 s emulated on the laptop.
+
 ## 0.26.0
 - **Full-duplex two-way audio over RTSP with echo cancellation** (2026-10-04, feature "duplex"). New
   `project/main/audio_voc.c`: the SDK's `aud_intf` voice mode (ADC/DAC, AEC, noise suppression and
