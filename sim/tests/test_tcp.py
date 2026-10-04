@@ -43,7 +43,8 @@ def test_reply_formats(sim):
     assert re.match(r"ok\n\[pir\] on sens=1 \(GPIO25=1 GPIO26=0\) cooldown=10000 ms count=\d+ last=\d+ ms ago \(cooldown left \d+ ms\) "
                     r"edges=\d+ ignored=\d+ missed=0 GPIO24=0 GPIO50=1$", sim.cmd("pir status"))
     assert re.match(r"ok\n\[pwr\] batt \d+ mV \d+% \(adc15 \d+ mV x2\.00\) usb 1 chg 0 \| sleep off force off idle 60 s wake_pir off "
-                    r"snap_min 0 \| up \d+ s hold \d+ s idle \d+ s busy [01] \| boot power-on$", sim.cmd("pwr status"))
+                    r"snap_min 0 \| sched 07:00-22:00 day 15 night 60 -> next (15|60) min \((day|night) by clock \d\d:\d\d\) "
+                    r"\| up \d+ s hold \d+ s idle \d+ s busy [01] \| boot power-on$", sim.cmd("pwr status"))
     assert re.match(r"ok\n\[night\] auto 1 ring 1 hyst 400 \| light \d+ mV \(last \d+, dark > 1400\) cam [01] cam_dark 0 samples \d+ "
                     r"motion_left \d+ s \| white src 0x[0-9a-f]+ manual -1 out [01] \| ring manual -1 out 0 wifi 1 fx [01]$",
                     sim.cmd("night status"))

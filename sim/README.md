@@ -21,8 +21,8 @@ Stop it with Ctrl-C.
 | Interface | Firmware | Simulator |
 |---|---|---|
 | TCP command channel | port 2323, one line `<token> <command>`, reply `ok` / `unknown` / `denied` + REPLY() text, close after 100 ms | identical framing, same reply strings as `app_main.c` / `night.c` / `pir.c` / `power.c` / `rtsp.c`; token from `--token`, `$DOORBELL_TOKEN`, a stored `tok set`, else `sim` |
-| HTTP | port 8080: `/` status page, `/snapshot.jpg`, `/stream` (MJPEG), feat/talk `/speak` `/mic.wav` `/talk` | same routes, status codes, headers and bodies (`503 camera not open`, `503 camera busy (H.264/RTSP)`, `multipart/x-mixed-replace; boundary=frame`, talk JSON), plus `/sim/<command>` |
-| Webhook | `POST` JSON to the KV hook on boot, ring, motion, wake, test, heartbeat (5 min) | same JSON (`event fw ip mv light_mv uptime_s motion_count ring_count pir_on pir_sens batt_mv batt_pct usb charging [reason]`), same timing |
+| HTTP | port 8080: `/` status page, `/snapshot.jpg`, `/stream` (MJPEG), feat/talk `/speak` `/mic.wav` `/talk`, fw 0.25 `/cmd?t=TOKEN&c=COMMAND` and `/log?t=TOKEN` | same routes, status codes, headers and bodies (`503 camera not open`, `503 camera busy (H.264/RTSP)`, `multipart/x-mixed-replace; boundary=frame`, talk JSON, `403 denied`), plus `/sim/<command>` |
+| Webhook | `POST` JSON to the KV hook on boot, ring, motion, wake, test, heartbeat (5 min) | same JSON (`event fw ip mv light_mv uptime_s motion_count ring_count pir_on pir_sens batt_mv batt_pct usb charging sleep_min wake_pir [reason] [policy policy_rev]`), same timing; `pwr policy` really GETs and applies a policy.json |
 | RTSP | `rtsp://IP:554/live`, own H.264 server | optional stand-in: `--rtsp` + ffmpeg serve a test pattern at `rtsp://HOST:8554/live` for one client after `rtsp on` |
 
 The reported firmware version is the `FW_VERSION` of `project/main/app_main.c` next to the

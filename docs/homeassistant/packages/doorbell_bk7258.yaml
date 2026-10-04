@@ -1,6 +1,10 @@
 # Doorbell BK7258 (custom firmware): Home Assistant package.
 # Copy to /config/packages/doorbell_bk7258.yaml (configuration.yaml: homeassistant: packages: !include_dir_named packages).
-# Replace <your_phone>, <device-ip> and <ha-ip>, then check the configuration and restart once (shell_command).
+# Replace <your_phone>, <device-ip> and <ha-ip>, then check the configuration and reload (rest_command / shell_command /
+# automation / template all have reload services in HA 2026.9; a restart also works).
+# fw 0.25 additions: rest_command.doorbell_cmd (needs `doorbell_cmd_url` in secrets.yaml, see below), the policy file
+# writer (shell_command.doorbell_policy_write + /config/doorbell_policy.py + the seven input helpers) and the
+# "Doorbell BK7258 policy" sensor.
 #
 # Notification group: add/remove phones here (the webhook automation and the low-battery automation use it).
 notify:
@@ -41,6 +45,15 @@ template:
           fw: "{{ trigger.event.data.fw }}"
           ip: "{{ trigger.event.data.ip }}"
           uptime_s: "{{ trigger.event.data.uptime_s }}"
+      - name: Doorbell BK7258 policy
+        # fw 0.25: result of the boot-time policy pull (applied | none | error); rev = the policy.json "rev" it applied
+        unique_id: doorbell_bk7258_policy
+        icon: mdi:file-cog-outline
+        state: "{{ trigger.event.data.policy if trigger.event.data.policy else this.state }}"
+        attributes:
+          rev: "{{ trigger.event.data.policy_rev if trigger.event.data.policy else this.attributes.get('rev') }}"
+          sleep_min: "{{ trigger.event.data.sleep_min }}"
+          wake_pir: "{{ trigger.event.data.wake_pir }}"
     binary_sensor:
       - name: Doorbell BK7258 USB power
         unique_id: doorbell_bk7258_usb
@@ -70,6 +83,31 @@ automation:
           message: "Doorbell battery {{ states('sensor.doorbell_bk7258_battery') }} % - charge it"
     mode: single
 
+  # fw 0.25: the seven helpers -> /config/www/doorbell/policy.json (the device fetches it on every boot), then try
+  # to apply at once in case the device is awake (`pwr policy pull` over GET /cmd; a sleeping device just fails here).
+  - id: doorbell_bk7258_policy
+    alias: "Doorbell BK7258: policy file from the helpers"
+    description: "Rewrites /config/www/doorbell/policy.json (rev = timestamp) whenever a doorbell setting helper changes and asks an awake device to pull it."
+    triggers:
+      - trigger: state
+        entity_id:
+          - input_number.doorbell_volume
+          - input_select.doorbell_pir_sens
+          - input_boolean.doorbell_pir_wake
+          - input_number.doorbell_day_interval
+          - input_number.doorbell_night_interval
+          - input_number.doorbell_dark_mv
+          - input_boolean.doorbell_night_light
+        not_to: [unknown, unavailable]
+    actions:
+      - action: shell_command.doorbell_policy_write
+      - action: rest_command.doorbell_cmd
+        data:
+          cmd: "pwr policy pull"
+        continue_on_error: true
+    mode: queued
+    max: 3
+
 # ---- talk (fw 0.23.0): speaker via the device's HTTP /speak, TTS through HA ----
 rest_command:
   doorbell_speak_url:
@@ -81,11 +119,25 @@ rest_command:
     url: "http://<device-ip>:8080/speak?tone={{ hz | default(1000) }}&ms={{ ms | default(500) }}"
     method: get
     timeout: 20
+  # fw 0.25: any shell command while the device is awake (GET /cmd, token-protected). The URL carries the TCP
+  # token, so it lives in secrets.yaml (chmod 600):
+  #   doorbell_cmd_url: "http://<device-ip>:8080/cmd?t=<tcp-token>&c={{ cmd | urlencode }}"
+  # Use: action rest_command.doorbell_cmd, data: {cmd: "vol 60"}; the reply text comes back in response_variable.
+  doorbell_cmd:
+    url: !secret doorbell_cmd_url
+    method: get
+    timeout: 5
 
 shell_command:
   # message -> TTS mp3 (HA's own TTS API) -> 16 kHz mono WAV in /config/www/doorbell/<name>.wav
   doorbell_tts_wav: >-
     python3 /config/doorbell_tts_wav.py "{{ message }}" "{{ lang | default('en') }}" "{{ name | default('say') }}"
+  # fw 0.25: helper states -> /config/www/doorbell/policy.json (doorbell_policy.py, rev = write time)
+  doorbell_policy_write: >-
+    python3 /config/doorbell_policy.py "{{ states('input_number.doorbell_volume') }}" "{{ states('input_select.doorbell_pir_sens') }}"
+    "{{ states('input_boolean.doorbell_pir_wake') }}" "{{ states('input_number.doorbell_day_interval') }}"
+    "{{ states('input_number.doorbell_night_interval') }}" "{{ states('input_number.doorbell_dark_mv') }}"
+    "{{ states('input_boolean.doorbell_night_light') }}"
 
 script:
   doorbell_say:

@@ -19,6 +19,7 @@
 #include "lwip/inet.h"
 #include "aud_engine.h"
 #include "talk.h"
+#include "applog.h"   /* last: our os_printf lines go to the RAM log ring (policy.c) */
 
 extern int bk_set_env_enhance(const char *key, const void *value, int value_len);
 extern int bk_get_env_enhance(const char *key, void *value, int value_len);

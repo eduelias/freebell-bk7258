@@ -30,6 +30,7 @@
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
 #include "rtsp.h"
+#include "applog.h"   /* last: our os_printf lines go to the RAM log ring (policy.c) */
 
 #define RTSP_MAX_CLIENTS 3
 #define RTSP_RING_SIZE (128 * 1024)      /* ~1 s of video at 1 Mbit/s; PSRAM heap on CPU0 is only 512 KB */

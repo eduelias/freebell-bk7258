@@ -32,6 +32,7 @@
 #include "aud_engine.h"   /* engine API implemented below, used by talk.c */
 #include "talk.h"         /* two-way audio over HTTP (/speak, /mic.wav) */
 #include "sdcard.h"   /* optional microSD storage (feature "sd") */
+#include "policy.h"   /* fw 0.25: policy pull, volume, RAM log, GET /cmd (policy.c) */
 #endif
 #ifdef DOORBELL_AVDK   /* all cores: media_service_init() runs on CPU0/1/2 */
 #include "media_service.h"
@@ -48,6 +49,7 @@
 #endif
 #include <stdarg.h>
 #include "night.h"   /* LED arbiter, night light, ring indicator, `night` / `sys` commands (night.c) */
+#include "applog.h"  /* last: our os_printf lines go to the RAM log ring (policy.c); CPU0 only */
 
 #define FW_NAME "doorbell-bk7258-fw"
 /* ---- reply buffer: command output for the TCP channel (UART still gets everything) ---- */
@@ -59,7 +61,7 @@ static bool s_reply_on;
 /* REPLY() for other source files (night.c, power.c) */
 void db_reply(const char *fmt, ...)
 {
-	char buf[300];
+	char buf[640];   /* = sizeof(s_reply); 300 cut the 0.25 `pwr status` line */
 	va_list ap;
 
 	va_start(ap, fmt);
@@ -68,7 +70,7 @@ void db_reply(const char *fmt, ...)
 	REPLY("%s", buf);
 }
 
-#define FW_VERSION "0.24.4"
+#define FW_VERSION "0.25.0"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -487,7 +489,7 @@ static int http_post_json(const char *hook, const char *json)
 /* extra: NULL or more JSON members starting with a comma (e.g. ",\"reason\":\"rtc\"") */
 static int report_ex(const char *event, const char *extra)
 {
-	char json[384], pwr[96];
+	char json[448], pwr[128];
 	int st;
 
 	if (!s_got_ip)
@@ -585,8 +587,11 @@ static void reporter_task(beken_thread_arg_t arg)
 
 	while (1) {
 		if (s_pend_boot) {
+			char pol[64];
 			s_pend_boot = false;
-			report("boot");
+			policy_boot_fetch();   /* once per boot: GET policy.json from HA and apply it (<= ~3 s), so the boot report can say so */
+			policy_json(pol, sizeof(pol));
+			report_ex("boot", pol);
 			last_hb = rtos_get_time();
 		}
 		if (s_pend_fx) {
@@ -738,7 +743,9 @@ static uint32_t s_spk_hz, s_spk_ms, s_spk_addr, s_spk_len;
 static int s_pa_pin = 46;   /* speaker amplifier enable, active high (found by sweep 2026-10-03) */
 static aud_dac_chl_t s_dac_chl = AUD_DAC_CHL_L;
 static aud_dac_work_mode_t s_dac_mode = AUD_DAC_WORK_MODE_DIFFEN;
-static uint16_t s_dac_gain = 0x1c;   /* 0x2d = 0 dB clips the amplifier hard; 0x1c is the loudest clean level measured 2026-10-03 */
+static int s_dac_gain_raw = -1;      /* `spk cfg gain N`: raw DAC gain override; -1 = follow `vol` (policy.c: 100 % = 0x1c, the loudest clean level
+                                      * measured 2026-10-03; 0x2d = 0 dB clips the amplifier hard) */
+static uint16_t spk_gain_now(void) { return s_dac_gain_raw >= 0 ? (uint16_t)s_dac_gain_raw : vol_gain(); }
 static aud_adc_chl_t s_adc_chl = AUD_ADC_CHL_L;
 static aud_adc_mode_t s_adc_mode = AUD_ADC_MODE_DIFFEN;
 static aud_mic_id_t s_mic_id = AUD_MIC_MIC1;
@@ -944,7 +951,7 @@ static void spk_task(beken_thread_arg_t arg)
 	cfg.clk_src = s_dac_clk;
 	cfg.dac_chl = s_dac_chl;
 	cfg.work_mode = s_dac_mode;
-	cfg.dac_gain = s_dac_gain;
+	cfg.dac_gain = spk_gain_now();
 	s_spk_w = s_spk_r = 0;
 	s_dac_half = 0;
 	s_spk_underrun = s_dac_frames = 0;
@@ -1065,13 +1072,14 @@ static void cli_spk_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 			else if (!os_strcmp(argv[i], "mode"))
 				s_dac_mode = !os_strcmp(argv[i + 1], "se") ? AUD_DAC_WORK_MODE_SIGNAL_END : AUD_DAC_WORK_MODE_DIFFEN;
 			else if (!os_strcmp(argv[i], "gain"))
-				s_dac_gain = os_strtoul(argv[i + 1], NULL, 0);
+				s_dac_gain_raw = !os_strcmp(argv[i + 1], "auto") ? -1 : (int)os_strtoul(argv[i + 1], NULL, 0);   /* raw override; `auto` = back to `vol` */
 			else if (!os_strcmp(argv[i], "rate"))
 				s_dac_rate = os_strtoul(argv[i + 1], NULL, 10);
 			else if (!os_strcmp(argv[i], "clk"))
 				s_dac_clk = !os_strcmp(argv[i + 1], "apll") ? AUD_CLK_APLL : AUD_CLK_XTAL;
 		}
-		REPLY("[spk] cfg chl %d mode %d gain 0x%x rate %u clk %s pa %d\r\n", s_dac_chl, s_dac_mode, s_dac_gain, s_dac_rate, s_dac_clk == AUD_CLK_APLL ? "apll" : "xtal", s_pa_pin);
+		REPLY("[spk] cfg chl %d mode %d gain 0x%x%s rate %u clk %s pa %d\r\n", s_dac_chl, s_dac_mode, spk_gain_now(),
+		      s_dac_gain_raw >= 0 ? " (raw override)" : " (vol)", s_dac_rate, s_dac_clk == AUD_CLK_APLL ? "apll" : "xtal", s_pa_pin);
 	} else {
 		REPLY("spk tone [HZ] [MS] | play beepa|beepb|bell|ADDR LEN | net HOST PORT | stop | pa PIN|off | cfg [chl L|R|LR] [mode diff|se] [gain N] [rate HZ] [clk xtal|apll]  (busy %d)\r\n", s_spk_busy);
 	}
@@ -1273,7 +1281,7 @@ int aud_spk_open(uint16_t gain)
 	cfg.clk_src = s_dac_clk;
 	cfg.dac_chl = s_dac_chl;
 	cfg.work_mode = s_dac_mode;
-	cfg.dac_gain = gain ? gain : s_dac_gain;
+	cfg.dac_gain = gain ? gain : spk_gain_now();
 	s_spk_w = s_spk_r = 0;
 	s_dac_half = 0;
 	s_spk_underrun = s_dac_frames = 0;
@@ -1322,7 +1330,7 @@ void aud_spk_close(void)
 
 bool aud_spk_busy(void) { return s_spk_busy; }
 uint32_t aud_spk_rate(void) { return s_dac_rate; }
-uint16_t aud_spk_gain(void) { return s_dac_gain; }
+uint16_t aud_spk_gain(void) { return spk_gain_now(); }
 void aud_spk_stats(uint32_t *dma_frames, uint32_t *underruns) { *dma_frames = s_dac_frames; *underruns = s_spk_underrun; }
 
 int aud_mic_open(uint32_t gain)
@@ -1415,11 +1423,71 @@ static int run_line(char *line)
 	return -1;
 }
 
+/* ---- shared dispatcher (fw 0.25): the TCP channel, GET /cmd (policy.c) and the policy pull all run
+ * commands through here. s_cmd_mutex serialises the reply buffer between the TCP task and the HTTP
+ * client threads. ---- */
+static beken_mutex_t s_cmd_mutex;
+
+int app_exec(const char *cmd, char *out, int cap)
+{
+	char line[192];
+	int rc;
+
+	os_strlcpy(line, cmd, sizeof(line));
+	rtos_lock_mutex(&s_cmd_mutex);
+	power_activity();
+	s_reply[0] = 0;
+	s_reply_on = true;
+	rc = run_line(line);
+	s_reply_on = false;
+	if (out && cap > 0)
+		os_strlcpy(out, s_reply, cap);
+	rtos_unlock_mutex(&s_cmd_mutex);
+	return rc;
+}
+
+/* A command run on behalf of another one (policy apply): its REPLY text goes to the UART/log only,
+ * the outer command's reply stays intact. lock = not already inside app_exec() (boot-time apply). */
+int app_exec_quiet(const char *cmd, bool lock)
+{
+	char line[192];
+	bool was;
+	int rc;
+
+	os_strlcpy(line, cmd, sizeof(line));
+	if (lock)
+		rtos_lock_mutex(&s_cmd_mutex);
+	was = s_reply_on;
+	s_reply_on = false;
+	rc = run_line(line);
+	s_reply_on = was;
+	if (lock)
+		rtos_unlock_mutex(&s_cmd_mutex);
+	return rc;
+}
+
+/* Reply text that must not be logged (the `log` command quoting the log) */
+void app_reply_raw(const char *str)
+{
+	if (s_reply_on) {
+		size_t l = os_strlen(s_reply);
+		if (l < sizeof(s_reply) - 1)
+			os_strlcpy(s_reply + l, str, sizeof(s_reply) - l);
+	} else {
+		bk_printf("%s", str);
+	}
+}
+
+const char *app_cmd_token(void)
+{
+	return s_token;
+}
+
 static void tcp_cmd_task(beken_thread_arg_t arg)
 {
 	struct sockaddr_in sa = {0};
 	int ls, cs, n, one = 1;
-	char line[192], *cmd;
+	char line[192], *cmd, *out;
 	struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
 
 	ls = socket(AF_INET, SOCK_STREAM, 0);
@@ -1434,8 +1502,12 @@ static void tcp_cmd_task(beken_thread_arg_t arg)
 		return;
 	}
 	os_printf("[tcp] command channel on port %d\r\n", TCP_CMD_PORT);
+	out = os_malloc(sizeof(s_reply));
 	while (1) {
-		cs = accept(ls, NULL, NULL);
+		struct sockaddr_in peer = {0};
+		socklen_t pl = sizeof(peer);
+
+		cs = accept(ls, (struct sockaddr *)&peer, &pl);
 		if (cs < 0)
 			continue;
 		setsockopt(cs, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -1445,20 +1517,19 @@ static void tcp_cmd_task(beken_thread_arg_t arg)
 			cmd = os_strchr(line, ' ');
 			if (!s_token[0] || !cmd || os_strncmp(line, s_token, cmd - line) != 0
 			    || os_strlen(s_token) != (size_t)(cmd - line)) {
+				os_printf("[tcp] %s: denied\r\n", inet_ntoa(peer.sin_addr));
 				send(cs, "denied\n", 7, 0);
 			} else {
 				cmd++;
-				os_printf("[tcp] %s\r\n", cmd);
-				power_activity();
-				s_reply[0] = 0;
-				s_reply_on = true;
-				if (run_line(cmd) == 0)
+				os_printf("[tcp] %s: %s\r\n", inet_ntoa(peer.sin_addr), cmd);   /* 0.25.0: the peer, so an unexpected poller (every command restarts the idle timer) can be traced */
+				if (out)
+					out[0] = 0;
+				if (app_exec(cmd, out, sizeof(s_reply)) == 0)
 					send(cs, "ok\n", 3, 0);
 				else
 					send(cs, "unknown\n", 8, 0);
-				s_reply_on = false;
-				if (s_reply[0])
-					send(cs, s_reply, os_strlen(s_reply), 0);
+				if (out && out[0])
+					send(cs, out, os_strlen(out), 0);
 			}
 		}
 		rtos_delay_milliseconds(100);
@@ -2073,7 +2144,7 @@ static int send_all(int sock, const void *p, int n)
 static void cam_http_client_task(beken_thread_arg_t arg)
 {
 	int sock = (int)(intptr_t)arg, n;
-	char req[256], hdr[192];
+	char req[384], hdr[192];   /* 384: GET /cmd?t=<token>&c=<url-encoded command> must fit in the first read */
 	uint8_t *buf = NULL;
 	uint32_t seq = 0, last = 0;
 	struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
@@ -2085,6 +2156,8 @@ static void cam_http_client_task(beken_thread_arg_t arg)
 		goto out;
 	req[n] = 0;
 	if (talk_http_handle(sock, req, n))   /* /speak, /mic.wav, /talk (talk.c): handled, just close */
+		goto out;
+	if (policy_http_handle(sock, req, n))   /* /cmd?t=&c=, /log?t= (policy.c): handled, just close */
 		goto out;
 	if (os_strncmp(req, "GET /stream", 11) == 0 || os_strncmp(req, "GET /snapshot", 13) == 0) {
 		if (cam_want_jpeg() == 0) {   /* open on demand (or switch back from H.264); the first frame takes ~1 s */
@@ -2451,7 +2524,23 @@ static void cli_ring_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, cha
 	}
 }
 
-/* ---- hooks for power.c (feat/power): thin wrappers so power.c stays a separate file ---- */
+/* ---- hooks for power.c / policy.c: thin wrappers so they stay separate files ---- */
+bool app_light_is_dark(void) { return light_read_mv() > s_dark_mv; }
+uint32_t app_dark_mv(void) { return s_dark_mv; }
+
+/* host and port of the webhook ("HOST:PORT/PATH"), for the policy URL default */
+bool app_hook_hostport(char *host, int cap, int *port)
+{
+	const char *colon = os_strchr(s_hook, ':');
+
+	if (!s_hook[0] || !colon || colon - s_hook >= cap)
+		return false;
+	os_memcpy(host, s_hook, colon - s_hook);
+	host[colon - s_hook] = 0;
+	*port = (int)os_strtoul(colon + 1, NULL, 10);
+	return *port > 0;
+}
+
 int db_kv_get(const char *key, char *out, int cap) { return kv_get_str(key, out, cap); }
 void db_kv_set(const char *key, const char *val) { kv_set_str(key, val); }
 uint32_t db_adc_mv(uint32_t chan) { return adc_read_mv(chan); }
@@ -2551,8 +2640,10 @@ static const struct cli_command s_doorbell_commands[] = {
 	{"sys", "sys info (fw, uptime, ip, heap, reset reason, light/battery mV)", sys_cli_cmd},
 #if (CONFIG_SYS_CPU0)
 	{"ring", "ring test | dark MV | fx on|off (local chime, ring LEDs, light when dark)", cli_ring_cmd},
-	{"pwr", "pwr status | sleep on|off | idle S | wake_pir on|off | snap_min M | sleepnow (battery, charger, deep sleep)", cli_pwr_cmd},
+	{"pwr", "pwr status | sleep on|off | idle S | wake_pir on|off | snap_min M | sched ... | policy ... | sleepnow (battery, charger, deep sleep)", cli_pwr_cmd},
 	{"sd", "sd status | mount | umount | format | ls [DIR] | save [EVENT] | auto on|off | keep S | probe (microSD)", cli_sd_cmd},
+	{"vol", "vol [0-100] (speaker volume: chime and talk `gain auto`; KV)", cli_vol_cmd},
+	{"log", "log [N<=600] | stat (last N bytes of the RAM log; GET /log?t=TOKEN for all 8 KB)", cli_log_cmd},
 #endif
 #if defined(DOORBELL_AVDK) && (CONFIG_SYS_CPU0)
 	{"cam", "cam open [W H] [h264] | close | stat | mode auto|jpeg|h264 | snap HOST PORT (AVDK build)", cli_cam_cmd},
@@ -2632,9 +2723,12 @@ void user_app_main(void)
 			s_light_chan = os_strtoul(v, NULL, 10);
 	}
 	talk_init();   /* KV: db_talk_gain / db_talk_micgain / db_talk_max */
+	vol_init();    /* KV: db_vol (policy.c) */
 	kv_get_str(KV_PASS, s_pass, sizeof(s_pass));
 	if (!kv_get_str(KV_HOOK, s_hook, sizeof(s_hook)))
 		os_strlcpy(s_hook, HOOK_DEFAULT, sizeof(s_hook));
+	policy_init();   /* KV: db_pwr_policy (the auto URL derives from the hook) */
+	rtos_init_mutex(&s_cmd_mutex);
 	{
 		/* night.c: LED arbiter + night light + ring indicator; before inputs_init() so a press
 		 * (ringfx -> night_white_set) never runs ahead of it */

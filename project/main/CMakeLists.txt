@@ -7,6 +7,7 @@ set(srcs
     rtsp.c
     talk.c
     sdcard.c
+    policy.c
     )
 
 if (CONFIG_OVERRIDE_FLASH_PARTITION)

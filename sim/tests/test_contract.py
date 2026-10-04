@@ -45,13 +45,15 @@ def test_fw_version_follows_the_source():
 
 
 def test_report_json_has_the_firmware_fields():
-    """The field list of report_ex() in app_main.c + power_json() in power.c."""
-    src = (REPO / "project" / "main" / "app_main.c").read_text() + (REPO / "project" / "main" / "power.c").read_text()
+    """The field list of report_ex() in app_main.c + power_json() in power.c + policy_json() in policy.c (boot report)."""
+    src = "".join((REPO / "project" / "main" / f).read_text() for f in ("app_main.c", "power.c", "policy.c"))
     fw_fields = set(re.findall(r'\\"([a-z_]+)\\":', src))
     args = vdb.parse_args(["--state", "/dev/null", "--ip", "127.0.0.1"])
     dev = vdb.Device.__new__(vdb.Device)   # no sockets: only the JSON formatter is exercised
     dev.args, dev.clock, dev.store = args, vdb.SimClock(), None
     dev.fw, dev.ip, dev.light_mv, dev.light_chan, dev.batt_mv, dev.usb, dev.charging = "1.0", "127.0.0.1", 740, 14, 3886, 1, 0
     dev.pwr_bchan, dev.pwr_bratio, dev.boot_ms, dev.motion_count, dev.ring_count, dev.pir_on, dev.pir_sens = 15, 200, 0, 0, 0, True, 1
-    sim_fields = set(re.findall(r'"([a-z_]+)":', dev.report_json("test")))
+    dev.sched_on, dev.day_start, dev.day_end, dev.day_min, dev.night_min, dev.pwr_snap_min = True, 7 * 60, 22 * 60, 15, 60, 0
+    dev.pwr_wake_pir, dev.low_batt, dev.policy_result, dev.policy_rev = False, False, "none", ""
+    sim_fields = set(re.findall(r'"([a-z_]+)":', dev.report_json("boot")))
     assert fw_fields - {"reason"} <= sim_fields, "report fields missing in the simulator: %s" % (fw_fields - sim_fields)

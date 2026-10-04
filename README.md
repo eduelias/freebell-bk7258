@@ -40,9 +40,10 @@ webhook `local_only`, choose a long random token and webhook id, and rotate both
 There is no secure boot, no TLS, and no protection against someone with physical access to the
 UART header.
 
-Hardening ideas (not implemented): the shared token on the HTTP endpoints too; `/speak` and
-`/mic.wav` as an opt-in (`talk on|off`); an IP allow-list for 2323/8080/554; restricting `ota` and
-`/speak?url=` to a configured base URL.
+`GET /cmd` and `GET /log` (0.25) carry the same shared token as a query parameter, in clear text.
+Hardening ideas (not implemented): the shared token on the camera/talk endpoints too; `/speak` and
+`/mic.wav` as an opt-in (`talk on|off`); an IP allow-list for 2323/8080/554; restricting `ota`,
+`/speak?url=` and the policy URL to a configured base URL.
 
 ## Hardware
 
@@ -68,10 +69,11 @@ streams of `FF`. *(`docs/img/`: add a photo of the UART header.)*
 | Doorbell | button on GPIO 53 with debounce and a 10 s report rate limit; bell chime on the speaker; blue ring blinks; white night light when dark; PIR on/off, sensitivity and cooldown |
 | Camera | JPEG snapshot `http://<device-ip>:8080/snapshot.jpg`, MJPEG `/stream`, H.264 720p over RTSP `rtsp://<device-ip>:554/live` (TCP/UDP, 3 clients) |
 | Audio | half-duplex two-way audio over HTTP: `POST /speak` (raw/WAV), `/speak?url=`, `/speak?tone=`, `/mic.wav`, a `/talk` browser page |
-| Power | battery voltage/percent, USB and charging state, deep sleep with wake on button, PIR, USB, UART or RTC alarm (periodic snapshot) |
+| Power | battery voltage/percent, USB and charging state, deep sleep with wake on button, PIR, USB, UART or RTC alarm; the RTC interval follows a day/night schedule (clock or light sensor) with battery derating |
+| Settings | `vol` (speaker volume), a boot-time **policy pull** of a small JSON file from Home Assistant (`pwr policy`), an 8 KB RAM log (`log`, `/log`), and an authenticated `GET /cmd` so HA can run commands while the device is awake |
 | Storage | optional microSD: a JPEG per ring/motion with SNTP-synced names; mounted only around saves |
 | Updates | OTA over Wi-Fi from any HTTP URL (`ota`), cable-free `scripts/release.sh`; UART flashing via the ROM for the first time and as a last resort |
-| Control | serial shell on UART0 and the same commands over TCP 2323 with a token (`tools/dbcmd.py`) |
+| Control | serial shell on UART0 and the same commands over TCP 2323 with a token (`tools/dbcmd.py`), or `GET /cmd` with the same token; the TCP log line carries the peer address |
 | Development | `sim/`: a virtual doorbell with the same TCP/HTTP/webhook interfaces, pytest suite, CI |
 
 ## Quick start
@@ -155,7 +157,9 @@ flash and survive OTA.
 | `night` | `auto on\|off` \| `ring on\|off` \| `hyst MV` \| `status` | `db_night_auto` (on), `db_night_ring` (on), `db_night_hyst` (400) |
 | `pir` | `on\|off` \| `sens 0-3` \| `cooldown MS` \| `status` | `db_pir_on` (on), `db_pir_sens` (1), `db_pir_cd` (10000) |
 | `motion` | `test` (simulated PIR edge through the ISR path) | |
-| `pwr` | `status` \| `sleep on\|off` \| `sleep force on\|off` \| `idle S` \| `wake_pir on\|off` \| `snap_min M` \| `sleepnow` \| `chan ADC` \| `ratio PCT` | `db_pwr_sleep` (off), `db_pwr_force` (off), `db_pwr_idle` (60), `db_pwr_wpir` (off), `db_pwr_snap` (0), `db_pwr_bchan` (15), `db_pwr_bratio` (200) |
+| `pwr` | `status` \| `sleep on\|off` \| `sleep force on\|off` \| `idle S` \| `wake_pir on\|off` \| `snap_min M` \| `sched DAY_START DAY_END DAY_MIN NIGHT_MIN` \| `sched off\|on` \| `policy URL\|auto\|off\|pull` \| `sleepnow` \| `chan ADC` \| `ratio PCT` | `db_pwr_sleep` (off), `db_pwr_force` (off), `db_pwr_idle` (60), `db_pwr_wpir` (off), `db_pwr_snap` (0, used with `sched off`), `db_pwr_sched` (07:00 22:00 15 60), `db_pwr_policy` (auto), `db_pwr_bchan` (15), `db_pwr_bratio` (200) |
+| `vol` | `vol [0-100]` (speaker volume: chime and talk `gain auto`, linear onto DAC gain 0..0x1c; `spk cfg gain N` stays a raw override, `spk cfg gain auto` releases it) | `db_vol` (100) |
+| `log` | `log [N]` (last N bytes of the 8 KB RAM log, N <= 600) \| `stat` | |
 | `cam` | `open [W H] [h264]` \| `close` \| `stat` \| `mode auto\|jpeg\|h264` \| `snap HOST PORT` \| `probe [PWR_PIN ...]` \| `probe scan` \| `probe rails on\|off` \| `probe bb SCL SDA` | mode (auto) |
 | `rtsp` | `on\|off` \| `status` \| `port N` \| `q IMB PMB` \| `idr` | on/off (off), port (554), q (120/24) |
 | `spk` | `tone [HZ] [MS]` \| `play beepa\|beepb\|bell\|ADDR LEN` \| `net HOST PORT` \| `stop` \| `pa PIN\|off` \| `cfg [chl L\|R\|LR] [mode diff\|se] [gain N] [rate HZ] [clk xtal\|apll]` | gain 0x1c, PA 46 |
@@ -169,11 +173,14 @@ flash and survive OTA.
 Report JSON (every event):
 
 ```json
-{"event":"ring","fw":"0.24.0","ip":"<device-ip>","mv":3068,"light_mv":812,"uptime_s":5121,
- "motion_count":4,"ring_count":1,"pir_on":1,"pir_sens":1,"batt_mv":3940,"batt_pct":78,"usb":0,"charging":0}
+{"event":"ring","fw":"0.25.0","ip":"<device-ip>","mv":3068,"light_mv":812,"uptime_s":5121,
+ "motion_count":4,"ring_count":1,"pir_on":1,"pir_sens":1,"batt_mv":3940,"batt_pct":78,"usb":0,"charging":0,
+ "sleep_min":15,"wake_pir":1}
 ```
 
-plus `"reason":"button|pir|usb|uart|rtc|gpioNN"` on `wake`.
+plus `"reason":"button|pir|usb|uart|rtc|gpioNN"` on `wake`, and `"policy":"applied|none|error","policy_rev":"<rev>"`
+on `boot` (the result of the policy pull, see below). `sleep_min` is the RTC interval the next sleep
+will use; `wake_pir` is the effective PIR wake (0 when the battery derating forced it off).
 
 ### HTTP and RTSP endpoints
 
@@ -186,6 +193,8 @@ plus `"reason":"button|pir|usb|uart|rtc|gpioNN"` on `wake`.
 | `GET :8080/speak?tone=HZ&ms=MS` / `?url=http://...` | test tone / fetch and play a WAV |
 | `GET :8080/mic.wav[?seconds=N]` | 16 kHz mono WAV from the microphone, live or N seconds |
 | `GET :8080/talk` | browser page for listen / tone / upload / URL |
+| `GET :8080/cmd?t=TOKEN&c=COMMAND` | run any shell command (URL-encoded) and return its reply as `text/plain`; `403` without the right token (and when no token is set), `404` for an unknown command |
+| `GET :8080/log?t=TOKEN` | the whole 8 KB RAM log (this firmware's own `os_printf` lines) as `text/plain` |
 | `rtsp://<device-ip>:554/live` | H.264 720p (`rtsp on` first; TCP transport recommended) |
 
 ## Home Assistant
@@ -198,6 +207,13 @@ plus `"reason":"button|pir|usb|uart|rtc|gpioNN"` on `wake`.
 4. Optional: the talk scripts (`script.doorbell_say` via HA TTS, `script.doorbell_play`), which
    need a token file on the HA host and `doorbell_tts_wav.py` in `/config`.
 5. Optional: use `/config/www/doorbell/` as the OTA image host.
+6. Settings from HA (fw 0.25): seven input helpers (volume, PIR sensitivity, PIR wake, day/night
+   wake interval, dark threshold, night light) are written to `/config/www/doorbell/policy.json`
+   by `doorbell_policy.py`; the device fetches that file on every boot (`pwr policy`, default URL
+   `http://<hook host>:<hook port>/local/doorbell/policy.json`) and applies the whitelisted keys
+   through its own commands, so a sleeping doorbell picks up changes at its next wake. While it is
+   awake, `rest_command.doorbell_cmd` applies them at once over `GET /cmd`. The boot report says
+   `policy: applied` with the file's `rev`.
 
 Step-by-step instructions, the sanitized YAML and the helper script:
 [docs/homeassistant/](docs/homeassistant/README.md).
@@ -245,13 +261,13 @@ PIR cooldown, night-light arbiter, sleep/wake cycle, OTA version bump and KV per
 
 | Path | What |
 |---|---|
-| `project/main/` | the application: `app_main.c` (Wi-Fi, webhook, TCP channel, HTTP server, camera, OTA, audio engine, commands), `night.c`, `pir.c`, `power.c`, `rtsp.c`, `talk.c`, `sdcard.c`; `vendor_flash*.{c,h}` are Beken's partition table (see NOTICE) |
+| `project/main/` | the application: `app_main.c` (Wi-Fi, webhook, TCP channel, HTTP server, camera, OTA, audio engine, commands), `night.c`, `pir.c`, `power.c`, `rtsp.c`, `talk.c`, `sdcard.c`, `policy.c` (policy pull, `vol`, RAM log, `/cmd`), `applog.h`; `vendor_flash*.{c,h}` are Beken's partition table (see NOTICE) |
 | `project/`, `project-avdk/` | build glue and Kconfig for the bare-SDK and the AVDK (camera) flavours; both compile the same `project/main` |
 | `patches/`, `patches-avdk/`, `avdk-overlay/` | changes to bk_idk / bk_avdk, applied by the build scripts ([docs/notes/sdk-patches.md](docs/notes/sdk-patches.md)); the OV9650 driver lives in the overlay |
 | `scripts/` | `build.sh`, `build-avdk.sh`, `flash.sh`, `release.sh`, `env.example` |
 | `tools/` | host-side Python: ROM flasher (`bkwrite.py`, `bkread.py`, `bkdump.py`, `bkreboot.py`, `linkcheck.py`), serial (`shell.py`, `serial_capture.py`), LAN (`dbcmd.py`), HA (`ha_generic_camera.py`), audio and pin-mapping helpers |
 | `sim/` | virtual doorbell + tests |
-| `docs/homeassistant/` | HA automation, package, TTS helper, setup guide |
+| `docs/homeassistant/` | HA automation, package, TTS helper, policy file writer, setup guide |
 | `docs/notes/` | technical notes: [flashing](docs/notes/flashing.md), [camera](docs/notes/camera.md), [gpio-irq](docs/notes/gpio-irq.md), [pir](docs/notes/pir.md), [audio](docs/notes/audio.md), [night-light](docs/notes/night-light.md), [power](docs/notes/power.md), [sdcard](docs/notes/sdcard.md), [pin-mapping](docs/notes/pin-mapping.md), [sdk-patches](docs/notes/sdk-patches.md), [bench-setup](docs/notes/bench-setup.md) |
 | `docs/testplans/` | per-feature test plans with measured results ([index](docs/testplans/README.md)) |
 | `CHANGELOG.md` | per-version summary |
@@ -265,9 +281,10 @@ PIR cooldown, night-light arbiter, sleep/wake cycle, OTA version bump and KV per
   firmware runs and configures the pin; cosmetic, cause not investigated.
 - **Camera close + quick reopen wedge**: fixed in v0.22.1-0.22.3 by power-cycling the camera rails
   on close; if you still see a silent camera, `cam probe rails off` then `on` recovers it.
-- **Deep sleep is partly verified**: RTC wake and idle sleep are tested; button, PIR and USB wake
-  and the USB/charging polarity are pending ([docs/notes/power.md](docs/notes/power.md)). Sleep is
-  off by default.
+- **Deep sleep is partly verified**: RTC wake, idle sleep and the button wake are tested; PIR and
+  USB wake and the USB/charging polarity are pending ([docs/notes/power.md](docs/notes/power.md)).
+  Since 0.25.0 GPIO 19 (USB present) is pulled down through the sleep so a charger gives a clean
+  rising edge; unverified until a charger is at hand. Sleep is off by default.
 - **Battery ADC is bimodal** (about 2.5 % swing under load): calibrate `pwr ratio` against a meter.
 - **Amplifier click**: the DAC now starts on zeros before the PA; a residual click is possible and
   was not measurable on the bench.

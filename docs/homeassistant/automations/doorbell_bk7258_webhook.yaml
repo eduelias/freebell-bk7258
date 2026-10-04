@@ -27,6 +27,10 @@
       batt_pct: "{{ trigger.json.batt_pct | default(none) }}"
       usb: "{{ trigger.json.usb | default(none) }}"
       charging: "{{ trigger.json.charging | default(none) }}"
+      sleep_min: "{{ trigger.json.sleep_min | default(none) }}"
+      wake_pir: "{{ trigger.json.wake_pir | default(none) }}"
+      policy: "{{ trigger.json.policy | default('') }}"
+      policy_rev: "{{ trigger.json.policy_rev | default('') }}"
   - action: input_text.set_value
     target:
       entity_id: input_text.doorbell_bk7258_last_report
@@ -101,7 +105,7 @@
       - action: logbook.log
         data:
           name: Doorbell BK7258
-          message: booted, fw {{ trigger.json.fw | default("?") }}, ip {{ trigger.json.ip | default("?") }}
+          message: booted, fw {{ trigger.json.fw | default("?") }}, ip {{ trigger.json.ip | default("?") }}, policy {{ trigger.json.policy | default("-") }} rev {{ trigger.json.policy_rev | default("-") }}, next wake {{ trigger.json.sleep_min | default("?") }} min
     - conditions:
       - condition: template
         value_template: '{{ trigger.json.event == "wake" }}'

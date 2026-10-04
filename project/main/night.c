@@ -25,6 +25,7 @@
 #include <driver/gpio.h>
 #include <components/system.h>
 #include "night.h"
+#include "applog.h"   /* last: our os_printf lines go to the RAM log ring (policy.c) */
 
 #if (CONFIG_SYS_CPU0)
 
@@ -262,6 +263,11 @@ static void night_task(beken_thread_arg_t arg)
 
 		rtos_delay_milliseconds(NIGHT_TICK_MS);
 	}
+}
+
+bool night_auto_get(void)
+{
+	return s_auto;
 }
 
 void night_init(const night_env_t *env)
