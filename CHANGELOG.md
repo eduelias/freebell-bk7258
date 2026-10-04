@@ -4,6 +4,26 @@ Versions are the `FW_VERSION` in `project/main/app_main.c` (also in every report
 `sys info`). Dates are 2026 unless stated; most of this was written between 2026-10-01 and
 2026-10-03.
 
+## 0.24.2
+- microSD bring-up (2026-10-04): **GPIO 13 is the card power enable** (what the stock SDK glue drove via
+  `bk_gpio_ctrl_external_ldo`), **GPIO 6 is card detect** (input, pull-up, 0 = inserted), not power.
+  `sd pwr` default is now `none` (a stored 6 is migrated); `sd pwr 13` drives the pin exactly like the
+  SDK helper and holds it while the card is in use; GPIO 6 removed from the camera rails; `sd status`
+  shows `cd=0|1`. The battery ADC15 read (same pin) returns the last value while GPIO 13 is held.
+- `sd_pins_apply()` reproduces the SDK default SDIO rows (`GPIO_IO_DISABLE` + pull-up, then
+  `gpio_sdio_one_line_sel(mode 0)`, capacity 3); config word `0x378` verified.
+- `sd probe [cmd|pins|lines|regs]`: FatFs-free diagnostics (pin config words and function select,
+  bus lines floating/held, SDIO host registers, CMD0/CMD0/CMD8/CMD55/CMD1 with return codes).
+- `pin get/in/out/hiz/raw` and `pin dump N` reply over TCP; new `pin cfg N` decodes one pin's AON word
+  and system function-select nibble.
+- `sd_do_save` frees its 200 KB PSRAM frame buffer after each save: holding it starved the :8080 HTTP
+  server's own buffer and every request got an empty reply after the first card write.
+- `sd pins` (GPIO 14/15/16 group) removed: it double-mapped the SDIO functions and GPIO 15 is the
+  charging input. Mount: skipped when `cd=1`, 500 ms power settle, SDIO host driver deinit/init before
+  `bk_sd_card_init`, one retry after a power cycle. `sd probe lines` refuses while the card is in use.
+- First successful card mount and writes on the device (32 GB card B, FAT as shipped). Open: the
+  auto-mount right after a reboot still fails until an `sd probe` has run (docs/notes/sdcard.md).
+
 ## 0.24.0
 - Optional microSD storage (`sdcard.c`): SDIO host + FatFs, a JPEG per ring/motion under
   `/doorbell/`, SNTP time with `sd tz`, `sd` command family; SDK patch 0008 (real FAT timestamps).

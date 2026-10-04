@@ -3,9 +3,10 @@
 /* sdcard.h — optional microSD storage for the doorbell (CPU0 only).
  *
  * SD host = the BK7258 SDIO host in 1-bit mode on GPIO 2 (CLK) / 3 (CMD) / 4 (DAT0) (the SDK
- * default pin group, which the stock firmware shared), card power on GPIO 6 (stock
- * ty_app_sdcard.c), FatFs volume "1:" (components/fatfs disk_io.c maps the SD card to physical
- * drive 1). Everything that touches the card runs in one low-priority worker task; the ring and
+ * default pin group, which the stock firmware shared). GPIO 6 = card detect (input, pull-up,
+ * 0 = card present; the stock firmware reads it the same way). Card power: no pin by default;
+ * `sd pwr 13` drives GPIO 13 the way the stock's bk_gpio_ctrl_external_ldo() did. FatFs volume
+ * "1:" (components/fatfs disk_io.c maps the SD card to physical drive 1). Everything that touches the card runs in one low-priority worker task; the ring and
  * motion paths only enqueue a job and never wait.
  */
 #pragma once
@@ -22,9 +23,9 @@ void sd_on_event(const char *event);
 /* The `sd` command (see TESTPLAN-sd.md). */
 void cli_sd_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv);
 
-/* True while GPIO `gpio` is the card power pin and a card is present/mounted (cam_power(0) must
- * then leave it high). */
-bool sd_holds_gpio(int gpio);
+/* True while GPIO `gpio` is the card power pin and is being driven high (the battery ADC shares
+ * GPIO 13: app_main.c skips the ADC15 read then, because bk_adc_init() would remap the pin). */
+bool sd_power_pin_driven(int gpio);
 
 /* Wall-clock seconds since the Unix epoch (UTC), 0 when no time source has been seen yet. */
 uint32_t sd_time_now(void);

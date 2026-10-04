@@ -45,8 +45,8 @@ SDK's `sd_card` / `sdio_host` / `fatfs` logs.
 | `sd ls [DIR] [SKIP]` | lists `1:/doorbell` (or `DIR`, relative to `1:/`), 6 entries per call, `SKIP` to page | |
 | `sd save [EVENT]` | grab the latest JPEG (opens the camera if needed) and write it; waits up to 5.5 s | |
 | `sd auto on\|off` | automatic save on ring and motion (also retries a mount at most once a minute when a card appears) | `db_sd_auto` default `1` |
-| `sd pwr PIN\|none` | card power GPIO | `db_sd_pwr` default `6` |
-| `sd pins 1\|0` | SDIO pin group: 1 = GPIO 2/3/4 (default), 0 = GPIO 14/15/16 | `db_sd_pins` default `1` |
+| `sd pwr PIN\|none` | card power GPIO; 0.24.2: default `none`, **13 on this board** (6 is the card-detect input and is migrated to none) | `db_sd_pwr` default `none` |
+| `sd pins` | removed in 0.24.2 (GPIO 14/15/16 double-mapped the SDIO host and GPIO 15 is the charging input); SDIO is fixed at GPIO 2/3/4 | |
 | `sd power on\|off` | drive the power pin directly (diagnostic) | |
 | `sd ntp HOST` | SNTP server (name or IP) | `db_sd_ntp` default `pool.ntp.org` |
 | `sd tz MIN` | minutes east of UTC for file names/timestamps (Amsterdam: 120 in summer, 60 in winter) | `db_sd_tz` default `0` |
@@ -82,7 +82,7 @@ PC is the easy path; a blank card can be formatted on the device). Owner-only st
    `sd card init ok`-style lines from `sd_card` and `sdcard sector cnt=<n>` from FatFs.
    - `no card (init ...)` with a card inserted: the pin or power guess is wrong. Try in order:
      `sd power on` then `sd mount` again (GPIO 6 should already be high after any camera use;
-     `pin get 6` to check); `sd pins 0` + `sd umount` + `sd mount` (SDIO group 0 = GPIO 14/15/16);
+     `pin get 6` to check); [`sd pins 0` is gone since 0.24.2: do not try the GPIO 14/15/16 group];
      `sd pwr none` if GPIO 6 turns out to be something else. Report which combination worked.
    - `card N MB has no FAT filesystem (fr=13)`: card is present but blank -> T4.
 2. `sd ls` -> `[sd] 1:/doorbell: 0 entries ...` (directory was just created).

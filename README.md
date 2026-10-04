@@ -209,7 +209,7 @@ Step-by-step instructions, the sanitized YAML and the helper script:
 | 0, 1 | camera I2C1 SCL/SDA | sensor at 0x30 |
 | 2, 3, 4 | SD CLK / CMD / DAT0 | SDIO 1-bit, SDK pin group 1 |
 | 5 | camera-related rail | cut on camera close; exact function unverified |
-| 6 | SD card power | active high; also a camera LDO enable |
+| 6 | SD card detect | input with pull-up, 0 = card inserted (was wrongly listed as SD power until 0.24.1) |
 | 7 (ADC9) | regulated rail sense | reported as `mv` |
 | 8 (ADC10) | unknown | 0.30 V, stable; unverified |
 | 9 | sensor/LED rail enable | active high |

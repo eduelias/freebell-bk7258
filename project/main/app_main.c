@@ -68,7 +68,7 @@ void db_reply(const char *fmt, ...)
 	REPLY("%s", buf);
 }
 
-#define FW_VERSION "0.24.1"
+#define FW_VERSION "0.24.2"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -107,7 +107,20 @@ static void pin_print_all(const char *label)
 
 static void pin_usage(void)
 {
-	os_printf("pin all | mux | dump | get N | in N [up|down|none] | hiz N | out N 0|1 | raw N HEX | blink N [count] | watch SECONDS\r\n");
+	REPLY("pin all | mux | dump [N] | cfg N | get N | in N [up|down|none] | hiz N | out N 0|1 | raw N HEX | blink N [count] | watch SECONDS\r\n");
+}
+
+/* One pin's full state: AON cfg word (bits: 2 in_en, 3 out DISABLE (active low), 4 pull up/down,
+ * 5 pull_en, 6 second-function enable, 8-9 drive strength) and the system-controller function
+ * select nibble (SOC_SYS_REG_BASE + 0x30*4 + pin/8*4, 4 bits per pin: which column of the pin's
+ * gpio_map.h row is routed; e.g. GPIO 2 sel 1 = SDIO_HOST_CLK). */
+static void pin_reply_cfg(uint32_t p)
+{
+	uint32_t v = PIN_CFG(p);
+	uint32_t sel = (*(volatile uint32_t *)(0x44010000u + 0x30u * 4u + 4u * (p / 8)) >> (4u * (p % 8))) & 0xfu;
+
+	REPLY("PIN %u cfg %08x: lvl %u in_en %u out_en %u pull %s func %u cap %u sel %u\r\n", p, v, v & 1, (v >> 2) & 1,
+	      ((v >> 3) & 1) ^ 1, (v & BIT(5)) ? ((v & BIT(4)) ? "up" : "down") : "off", (v >> 6) & 1, (v >> 8) & 3, sel);
 }
 
 /* Reclaim the pin from any peripheral function and configure it. */
@@ -149,10 +162,19 @@ static void cli_pin_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 		return;
 	}
 	if (os_strcmp(argv[1], "dump") == 0) {
+		/* no pin: all rows on the UART; with a pin: that pin's row of 8 in the reply too */
+		if (argc >= 3 && p < PIN_COUNT) {
+			i = p & ~7u;
+			REPLY("CFG %02u: %08x %08x %08x %08x %08x %08x %08x %08x\r\n", i,
+			      PIN_CFG(i), PIN_CFG(i + 1), PIN_CFG(i + 2), PIN_CFG(i + 3),
+			      PIN_CFG(i + 4), PIN_CFG(i + 5), PIN_CFG(i + 6), PIN_CFG(i + 7));
+			return;
+		}
 		for (i = 0; i < PIN_COUNT; i += 8)
 			os_printf("CFG %02u: %08x %08x %08x %08x %08x %08x %08x %08x\r\n", i,
 				  PIN_CFG(i), PIN_CFG(i + 1), PIN_CFG(i + 2), PIN_CFG(i + 3),
 				  PIN_CFG(i + 4), PIN_CFG(i + 5), PIN_CFG(i + 6), PIN_CFG(i + 7));
+		REPLY("CFG: 7 rows on the UART; `pin dump N` replies N's row, `pin cfg N` decodes one pin\r\n");
 		return;
 	}
 	/* "watch" takes seconds, not a pin: check it before the pin-range test. */
@@ -162,7 +184,9 @@ static void cli_pin_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 	}
 
 	if (os_strcmp(argv[1], "get") == 0) {
-		os_printf("PIN %u = %d (cfg %02x)\r\n", p, bk_gpio_get_input(p) ? 1 : 0, PIN_CFG(p) & 0xff);
+		REPLY("PIN %u = %d (cfg %02x)\r\n", p, bk_gpio_get_input(p) ? 1 : 0, PIN_CFG(p) & 0xff);
+	} else if (os_strcmp(argv[1], "cfg") == 0) {
+		pin_reply_cfg(p);
 	} else if (os_strcmp(argv[1], "watch") == 0) {
 		/* argv[2] is seconds here: poll every 5 ms, print each transition. */
 		uint32_t secs = p, t0 = rtos_get_time(), n = 0;
@@ -184,7 +208,7 @@ static void cli_pin_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 		}
 		os_printf("WATCH end, %u edges\r\n", n);
 	} else if (PIN_IS_CONSOLE(p)) {
-		os_printf("PIN %u is the console UART, refusing\r\n", p);
+		REPLY("PIN %u is the console UART, refusing\r\n", p);
 	} else if (os_strcmp(argv[1], "in") == 0) {
 		const char *pull = argc >= 4 ? argv[3] : "none";
 		gpio_pull_mode_t pm = GPIO_PULL_DISABLE;
@@ -197,21 +221,21 @@ static void cli_pin_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 		err = pin_configure(p, GPIO_INPUT_ENABLE, pm);
 		bk_gpio_disable_output(p);
 		rtos_delay_milliseconds(5);
-		os_printf("PIN %u in %s = %d (cfg %02x, err %d)\r\n", p, pull, bk_gpio_get_input(p) ? 1 : 0,
-			  PIN_CFG(p) & 0xff, err);
+		REPLY("PIN %u in %s = %d (cfg %02x, err %d)\r\n", p, pull, bk_gpio_get_input(p) ? 1 : 0,
+		      PIN_CFG(p) & 0xff, err);
 	} else if (os_strcmp(argv[1], "raw") == 0 && argc >= 4) {
 		/* write the AON GPIO config word verbatim (hex), e.g. to restore a boot-time state */
 		uint32_t v = os_strtoul(argv[3], NULL, 16);
 
 		gpio_dev_unmap(p);
 		PIN_CFG(p) = v;
-		os_printf("PIN %u raw %08x -> now %08x\r\n", p, v, PIN_CFG(p));
+		REPLY("PIN %u raw %08x -> now %08x\r\n", p, v, PIN_CFG(p));
 	} else if (os_strcmp(argv[1], "hiz") == 0) {
 		bk_err_t err = pin_configure(p, GPIO_IO_DISABLE, GPIO_PULL_DISABLE);
 
 		bk_gpio_disable_output(p);
 		bk_gpio_disable_input(p);
-		os_printf("PIN %u hiz (cfg %02x, err %d)\r\n", p, PIN_CFG(p) & 0xff, err);
+		REPLY("PIN %u hiz (cfg %02x, err %d)\r\n", p, PIN_CFG(p) & 0xff, err);
 	} else if (os_strcmp(argv[1], "out") == 0 && argc >= 4) {
 		int v = os_strtoul(argv[3], NULL, 10) ? 1 : 0;
 
@@ -221,7 +245,7 @@ static void cli_pin_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 			bk_gpio_set_output_high(p);
 		else
 			bk_gpio_set_output_low(p);
-		os_printf("PIN %u out %d (cfg %02x)\r\n", p, v, PIN_CFG(p) & 0xff);
+		REPLY("PIN %u out %d (cfg %02x)\r\n", p, v, PIN_CFG(p) & 0xff);
 	} else if (os_strcmp(argv[1], "blink") == 0) {
 		uint32_t count = argc >= 4 ? os_strtoul(argv[3], NULL, 10) : 6;
 
@@ -385,10 +409,15 @@ bool app_net_up(void)
 
 static uint32_t adc_read_mv(uint32_t chan)
 {
+	static uint32_t s_adc15_last;
 	adc_config_t config = {0};
 	uint16_t raw = 0;
 	uint32_t mv = 0;
 
+	/* ADC15 lives on GPIO 13; bk_adc_init() remaps the pin, which would cut a microSD card that
+	 * `sd pwr 13` is powering. Report the last reading while the card is powered. */
+	if (chan == 15 && sd_power_pin_driven(13))
+		return s_adc15_last;
 	if (bk_adc_acquire() != BK_OK)
 		return 0;
 	if (bk_adc_init(chan) == BK_OK) {
@@ -405,6 +434,8 @@ static uint32_t adc_read_mv(uint32_t chan)
 	bk_adc_stop();
 	bk_adc_deinit(chan);
 	bk_adc_release();
+	if (chan == 15)
+		s_adc15_last = mv;
 	return mv;
 }
 
@@ -1726,9 +1757,11 @@ static void cam_bb_task(beken_thread_arg_t arg)
 	rtos_delete_thread(NULL);
 }
 
+/* GPIO 6 used to be in this list as a "camera LDO enable": it is the microSD card-detect input
+ * (stock firmware, verified 2026-10-04) and belongs to sdcard.c now. */
 static void cam_rails(int on)
 {
-	static const int rails[] = {9, 28, 5, 6};
+	static const int rails[] = {9, 28, 5};
 	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
 		pin_configure(rails[i], GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
 		if (on) bk_gpio_set_output_high(rails[i]); else bk_gpio_set_output_low(rails[i]);
@@ -1736,17 +1769,15 @@ static void cam_rails(int on)
 }
 
 /* The camera's own supplies: GPIO 28 (sensor power, also feeds the LDR divider) and the LDO
- * enables 5/6. Dropped at every close so the next open is a real power-on reset of the OV9650:
+ * enable 5. Dropped at every close so the next open is a real power-on reset of the OV9650:
  * a close followed by a reopen within a few seconds otherwise leaves the sensor silent (no
  * frames, "camera wedge", 2026-10-03) and only a rail cycle or a reboot brings it back. GPIO 9
  * (light sensor / LED rail) is left alone. */
 static uint32_t s_cam_off_ms, s_cam_open_ms;
 static void cam_power(int on)
 {
-	static const int pins[] = {28, 5, 6};
+	static const int pins[] = {28, 5};
 	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
-		if (!on && sd_holds_gpio(pins[i]))   /* GPIO 6 also powers a mounted microSD card: keep it */
-			continue;
 		pin_configure(pins[i], GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
 		if (on) bk_gpio_set_output_high(pins[i]); else bk_gpio_set_output_low(pins[i]);
 	}
@@ -1807,7 +1838,7 @@ static int cam_open_locked(uint32_t w, uint32_t h, bool h264)
 		if (off < 800)
 			rtos_delay_milliseconds(800 - off);
 	}
-	cam_rails(1);   /* GPIO 9, 28 (camera power, active high per the stock firmware), 5, 6 */
+	cam_rails(1);   /* GPIO 9, 28 (camera power, active high per the stock firmware), 5 */
 	rtos_delay_milliseconds(150);
 	/* stock bk_dvp_camera_enumerate: GPIO 52 low 100 ms, high 100 ms, low (sensor PWDN/RESET pulse) */
 	pin_configure(52, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
@@ -2490,7 +2521,7 @@ uint32_t app_power_pir_sens(void)
 #endif /* CONFIG_SYS_CPU0 */
 
 static const struct cli_command s_doorbell_commands[] = {
-	{"pin", "pin all|mux|get|in|out|blink|watch ... (GPIO mapping)", cli_pin_cmd},
+	{"pin", "pin all|mux|dump|cfg|get|in|out|hiz|blink|watch ... (GPIO mapping)", cli_pin_cmd},
 	{"adc", "adc CHANNEL (one calibrated SARADC reading)", cli_adc_read_cmd},
 	{"mem", "mem HEXADDR [N] (raw 32-bit reads, debug)", cli_mem_cmd},
 	{"reboot", "reset the SoC (ROM download mode is reachable right after)", cli_reboot_cmd},
@@ -2507,7 +2538,7 @@ static const struct cli_command s_doorbell_commands[] = {
 #if (CONFIG_SYS_CPU0)
 	{"ring", "ring test | dark MV | fx on|off (local chime, ring LEDs, light when dark)", cli_ring_cmd},
 	{"pwr", "pwr status | sleep on|off | idle S | wake_pir on|off | snap_min M | sleepnow (battery, charger, deep sleep)", cli_pwr_cmd},
-	{"sd", "sd status | mount | umount | format | ls [DIR] | save [EVENT] | auto on|off (microSD)", cli_sd_cmd},
+	{"sd", "sd status | mount | umount | format | ls [DIR] | save [EVENT] | auto on|off | probe (microSD)", cli_sd_cmd},
 #endif
 #if defined(DOORBELL_AVDK) && (CONFIG_SYS_CPU0)
 	{"cam", "cam open [W H] [h264] | close | stat | mode auto|jpeg|h264 | snap HOST PORT (AVDK build)", cli_cam_cmd},
