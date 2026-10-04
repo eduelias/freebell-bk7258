@@ -2,8 +2,12 @@
 /* doorbell-bk7258-fw: RTSP server interface. */
 /* rtsp.h - minimal RTSP/1.0 server for the camera's hardware H.264 stream (AVDK build, CPU0).
  *
- * rtsp://<ip>:<port>/live  - one video track, H264/90000, RFC 6184 packetization-mode=1
- * (single NAL + FU-A), transports RTP/AVP/TCP (interleaved) and RTP/AVP (UDP unicast).
+ * rtsp://<ip>:<port>/live  - track0 video H264/90000, RFC 6184 packetization-mode=1 (single NAL +
+ * FU-A); track1 audio PCMA/8000 (the microphone, a=recvonly); track2 audio PCMA/8000 a=sendonly =
+ * the ONVIF backchannel into the speaker, advertised when the DESCRIBE carries
+ * `Require: www.onvif.org/ver20/backchannel` (go2rtc does). Transports RTP/AVP/TCP (interleaved)
+ * and RTP/AVP (UDP unicast), per track. The audio tracks run on the voc engine (audio_voc.c, SDK
+ * voice mode with AEC): started by the first client that sets one up, stopped with the last.
  *
  * The camera itself is owned by app_main.c: rtsp.c asks for it through rtsp_cam_acquire() and
  * feeds every H.264 access unit it receives (Annex-B byte stream, as produced by the BK7258
@@ -36,8 +40,11 @@ int rtsp_clients(int *playing);
 void rtsp_feed_frame(const uint8_t *data, uint32_t len, uint32_t ts_ms);
 /* Ask the encoder for an IDR at the next opportunity (rate limited to one per 500 ms). */
 void rtsp_request_idr(void);
-/* One-line summary / per-client lines for the `rtsp status` command. Return the length. */
+/* Clients with an audio track set up (the voc engine runs while this is > 0). */
+int rtsp_audio_clients(void);
+/* One-line summary / audio line / per-client lines for the `rtsp status` command. Return the length. */
 int rtsp_status(char *buf, size_t cap);
+int rtsp_status_audio(char *buf, size_t cap);
 int rtsp_status_clients(char *buf, size_t cap);
 
 /* ---- implemented by app_main.c (the camera owner) ---- */

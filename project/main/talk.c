@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* doorbell-bk7258-fw: half-duplex two-way audio over HTTP (/speak, /mic.wav, /talk). */
-/* talk.c — half-duplex two-way audio over HTTP for the doorbell (feature "talk").
+/* talk.c — two-way audio over HTTP for the doorbell (feature "talk"), plus the `talk` command that
+ * also drives the voc engine settings (feature "duplex": `talk aec`, `talk vocmic`, `talk voc`).
  *
  * Runs inside the camera HTTP server's per-client thread (4 KB stack: every buffer here is on the
  * heap). Speaker input is streamed into the DMA engine's 16 KB ring as it arrives, so a clip is
@@ -18,6 +19,7 @@
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
 #include "aud_engine.h"
+#include "audio_voc.h"
 #include "talk.h"
 
 extern int bk_set_env_enhance(const char *key, const void *value, int value_len);
@@ -988,18 +990,48 @@ void talk_init(void)
 		s_talk_micgain = v;
 	if (kv_get_u32(KV_TALK_MAX, &v) && v >= 1 && v <= TALK_MAX_LIMIT_S)
 		s_talk_max_s = v;
-	os_printf("[talk] http://IP:8080/speak /mic.wav /talk: gain %s0x%x micgain 0x%x max %u s\r\n",
+	os_printf("[talk] http://IP:8080/speak /mic.wav /talk: gain %s0x%x micgain 0x%x max %u s (voc engine: talk aec/vocmic/voc)\r\n",
 		  s_talk_gain ? "" : "auto=", s_talk_gain ? s_talk_gain : aud_spk_gain(), s_talk_micgain, s_talk_max_s);
 }
 
 void cli_talk_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
 {
 	if (argc >= 2 && os_strcmp(argv[1], "status") == 0) {
-		app_reply("[talk] %s%s%s | speak: %u calls, last %u ms (in %u Hz), %u bytes in | mic: %u calls, %u bytes out, %u Hz | last http %d | gain %s0x%x micgain 0x%x max %u s\r\n",
+		char v[256];
+		app_reply("[talk] %s%s%s engine %s | speak: %u calls, last %u ms (in %u Hz), %u bytes in | mic: %u calls, %u bytes out, %u Hz | last http %d | gain %s0x%x micgain 0x%x max %u s\r\n",
 			  s_talk_speaking ? "speaking" : "", s_talk_listening ? (s_talk_speaking ? "+listening" : "listening") : "",
-			  !s_talk_speaking && !s_talk_listening ? "idle" : "", s_speak_calls, s_speak_last_ms, s_speak_last_rate,
+			  !s_talk_speaking && !s_talk_listening ? "idle" : "", voc_active() ? "voc" : "raw", s_speak_calls, s_speak_last_ms, s_speak_last_rate,
 			  s_speak_in_bytes, s_mic_calls, s_mic_out_bytes, aud_mic_rate(), s_talk_last_err,
 			  s_talk_gain ? "" : "auto=", s_talk_gain ? s_talk_gain : aud_spk_gain(), s_talk_micgain, s_talk_max_s);
+		voc_status(v, sizeof(v));
+		app_reply("%s", v);
+	} else if (argc >= 3 && os_strcmp(argv[1], "aec") == 0) {
+		bool on = os_strcmp(argv[2], "on") == 0;
+		if (!on && os_strcmp(argv[2], "off") != 0) {
+			app_reply("[talk] aec on|off\r\n");
+			return;
+		}
+		voc_set_aec(on);
+		app_reply("[talk] aec %s%s\r\n", on ? "on" : "off", voc_active() ? " (applied to the running voc engine)" : " (next voc start)");
+	} else if (argc >= 3 && os_strcmp(argv[1], "vocmic") == 0) {
+		uint32_t g = (uint32_t)os_strtoul(argv[2], NULL, 0);
+		if (g > 0x3f) {
+			app_reply("[talk] vocmic 0..0x3f (ADC gain for the voc engine / RTSP audio; 0 = default 0x3f)\r\n");
+			return;
+		}
+		voc_set_mic_gain(g);
+		app_reply("[talk] voc mic gain 0x%x%s\r\n", voc_mic_gain(), voc_active() ? " (applied)" : "");
+	} else if (argc >= 3 && os_strcmp(argv[1], "voc") == 0) {
+		if (os_strcmp(argv[2], "on") == 0) {
+			int r = voc_start(NULL);
+			app_reply("[talk] voc start -> %d%s\r\n", r, r == 0 ? " (manual: mic frames dropped until an RTSP audio client joins; /speak and /mic.wav go through it)" :
+				  r == -1 ? " (raw engine busy: chime, spk, mic, /speak or /mic.wav running)" : " (sdk error, see talk status)");
+		} else if (os_strcmp(argv[2], "off") == 0) {
+			voc_stop();
+			app_reply("[talk] voc stopped (an RTSP audio client restarts it within 0.5 s)\r\n");
+		} else {
+			app_reply("[talk] voc on|off\r\n");
+		}
 	} else if (argc >= 3 && os_strcmp(argv[1], "gain") == 0) {
 		uint32_t g = os_strcmp(argv[2], "auto") == 0 ? 0 : (uint32_t)os_strtoul(argv[2], NULL, 0);
 		if (g > 0x3f) {
@@ -1031,7 +1063,7 @@ void cli_talk_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **arg
 		s_talk_abort = true;
 		app_reply("[talk] stop requested (speaking %d listening %d)\r\n", s_talk_speaking, s_talk_listening);
 	} else {
-		app_reply("talk status | gain N|auto | micgain N | max SECONDS | stop   (http://IP:8080/speak /mic.wav /talk)\r\n");
+		app_reply("talk status | gain N|auto | micgain N | max SECONDS | stop | aec on|off | vocmic N | voc on|off   (http://IP:8080/speak /mic.wav /talk; rtsp audio = voc engine)\r\n");
 	}
 }
 

@@ -4,6 +4,37 @@ Versions are the `FW_VERSION` in `project/main/app_main.c` (also in every report
 `sys info`). Dates are 2026 unless stated; most of this was written between 2026-10-01 and
 2026-10-03.
 
+## 0.26.0
+- **Full-duplex two-way audio over RTSP with echo cancellation** (2026-10-04, feature "duplex"). New
+  `project/main/audio_voc.c`: the SDK's `aud_intf` voice mode (ADC/DAC, AEC, noise suppression and
+  G.711 on CPU1, API on CPU0 over the media mailbox) as a second audio engine, 8 kHz G.711 A-law in
+  20 ms frames. The RTSP stream now has three tracks: `track0` H.264, `track1` PCMA/8000 microphone
+  (`a=recvonly`), and, when the client asks with `Require: www.onvif.org/ver20/backchannel` (go2rtc
+  does), `track2` PCMA/8000 `a=sendonly` = the ONVIF backchannel into the speaker. Each track has its
+  own transport (TCP interleaved or UDP), aggregate PLAY/PAUSE. The engine starts with the first
+  audio track set up (retried every 0.5 s while the chime holds the hardware) and stops with the last
+  client. The SDK's PA control is off for CPU1 (`CONFIG_AUD_TRAS_DAC_PA_CTRL=n`: it would drive
+  GPIO 5, a camera rail); CPU0 switches the real amplifier pin around start/stop.
+- **One engine at a time, nothing lost**: while the voc engine runs, `/speak`, `spk tone|play|net`
+  and the ring chime play through its speaker tap (PCM -> A-law, paced to real time; the far end is
+  muted for that moment) and `/mic.wav` reads its microphone tap (an **8 kHz** WAV while a session
+  is live, 16 kHz otherwise). The half-duplex "mute the mic while the speaker plays" rule only
+  applies to the raw engine; with the AEC on, both directions run at once.
+- Commands: `talk aec on|off` (KV `db_talk_aec`, default on, switches live), `talk vocmic N` (KV
+  `db_voc_mic`, ADC gain for the voice engine, default 0x3f), `talk voc on|off` (start the engine by
+  hand for bench tests), `talk status` shows `engine raw|voc` plus a `[voc]` line with frame counters;
+  `rtsp status` gained an audio line (engine, clients, mic/backchannel counters) and per-track client
+  state (`v:tcp a:tcp b:tcp`).
+- Sleep: a connected RTSP client and a running voice engine count as busy.
+- `tools/rtsp_backchannel.py`: stdlib RTSP client that does what go2rtc does (DESCRIBE with the
+  Require header, SETUP mic + backchannel interleaved, PLAY, 20 ms G.711 frames from a tone or a WAV)
+  and records the mic track with a Goertzel/rms analysis, for the echo-attenuation measurement.
+- Simulator: the new `talk` subcommands and reply lines; the ffmpeg RTSP stand-in advertises a
+  PCMA/8000 track (note: `ffmpeg -rtsp_flags listen` is broken in FFmpeg 8.0 on macOS; the stand-in
+  needs an older ffmpeg).
+- Home Assistant: `docs/homeassistant/` two-way audio notes (go2rtc view, the HA frontend is still
+  listen-only) and an `Answer` action on the ring push.
+
 ## 0.24.4
 - **microSD: the ring that wakes the device from deep sleep is saved** (2026-10-04). First real wake on
   0.24.3: the ring job ran at ~0.5 s uptime, before the media pipeline existed, the mount failed

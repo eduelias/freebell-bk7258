@@ -31,6 +31,7 @@
 #include "power.h"   /* feat/power: battery, charger, deep sleep */
 #include "aud_engine.h"   /* engine API implemented below, used by talk.c */
 #include "talk.h"         /* two-way audio over HTTP (/speak, /mic.wav) */
+#include "audio_voc.h"    /* full-duplex voice engine (SDK aud_intf voice mode, AEC) for the RTSP audio tracks */
 #include "sdcard.h"   /* optional microSD storage (feature "sd") */
 #endif
 #ifdef DOORBELL_AVDK   /* all cores: media_service_init() runs on CPU0/1/2 */
@@ -68,7 +69,7 @@ void db_reply(const char *fmt, ...)
 	REPLY("%s", buf);
 }
 
-#define FW_VERSION "0.24.4"
+#define FW_VERSION "0.26.0"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -933,6 +934,21 @@ static void spk_ring_write(const uint8_t *p, uint32_t n)
 	}
 }
 
+/* While the voc engine (audio_voc.c) owns the hardware for an RTSP audio session, `spk` and the
+ * chime play through its speaker tap instead of the raw DAC path, so a ring during a live call is
+ * still heard at the door. */
+static bool s_spk_voc;
+
+static void spk_out(const uint8_t *p, uint32_t n)
+{
+	if (s_spk_voc) {
+		if (voc_tap_write(p, n) != 0)
+			s_spk_stop = true;
+	} else {
+		spk_ring_write(p, n);
+	}
+}
+
 static void spk_task(beken_thread_arg_t arg)
 {
 	aud_dac_config_t cfg = DEFAULT_AUD_DAC_CONFIG();
@@ -940,6 +956,13 @@ static void spk_task(beken_thread_arg_t arg)
 	uint32_t i, n, phase = 0, step, total = 0;
 	int rc;
 
+	if (s_spk_voc) {
+		if (voc_tap_open() != 0) {
+			os_printf("[spk] voc tap busy (a /speak is playing): skipped\r\n");
+			goto out;
+		}
+		goto feed;
+	}
 	cfg.samp_rate = s_dac_rate;
 	cfg.clk_src = s_dac_clk;
 	cfg.dac_chl = s_dac_chl;
@@ -966,12 +989,13 @@ static void spk_task(beken_thread_arg_t arg)
 	pa_set(1);
 	rtos_delay_milliseconds(PA_SETTLE_MS);   /* the amplifier's own turn-on transient, on silence */
 	s_spk_feeding = true;
+feed:
 	if (s_spk_net_port) {   /* s16le mono PCM streamed from a TCP peer */
 		int sock = tcp_connect(s_net_host, s_spk_net_port), r;
 		if (sock < 0)
 			os_printf("[spk] connect %s:%u failed\r\n", s_net_host, s_spk_net_port);
 		while (sock >= 0 && !s_spk_stop && (r = recv(sock, buf, sizeof(buf), 0)) > 0) {
-			spk_ring_write(buf, r);
+			spk_out(buf, r);
 			total += r / 2;
 		}
 		if (sock >= 0)
@@ -981,7 +1005,7 @@ static void spk_task(beken_thread_arg_t arg)
 		for (i = 0; i < s_spk_len && !s_spk_stop; i += n) {
 			n = s_spk_len - i < sizeof(buf) ? s_spk_len - i : sizeof(buf);
 			bk_flash_read_bytes(s_spk_addr + i, buf, n);
-			spk_ring_write(buf, n);
+			spk_out(buf, n);
 			total += n / 2;
 		}
 	} else {                   /* tone: 32-step sine, 12-bit phase accumulator */
@@ -995,9 +1019,14 @@ static void spk_task(beken_thread_arg_t arg)
 				phase += step;
 				n++;
 			}
-			spk_ring_write(buf, 2 * n);
+			spk_out(buf, 2 * n);
 			total += n;
 		}
+	}
+	if (s_spk_voc) {
+		voc_tap_close();
+		os_printf("[spk] done via voc tap, %u samples\r\n", total);
+		goto out;
 	}
 	s_spk_feeding = false;
 	for (i = 0; i < 100 && s_spk_w != s_spk_r && !s_spk_stop; i++)   /* let the DMA drain the ring */
@@ -1011,6 +1040,7 @@ static void spk_task(beken_thread_arg_t arg)
 	bk_aud_dac_deinit();
 	os_printf("[spk] done, %u samples, %u dma frames, %u underruns\r\n", total, s_dac_frames, s_spk_underrun);
 out:
+	s_spk_voc = false;
 	s_spk_busy = false;
 	s_spk_thread = NULL;
 	rtos_delete_thread(NULL);
@@ -1018,11 +1048,18 @@ out:
 
 static void spk_start(uint32_t hz, uint32_t ms, uint32_t addr, uint32_t len)
 {
-	if (s_spk_busy) {
+	GLOBAL_INT_DECLARATION();
+
+	GLOBAL_INT_DISABLE();
+	if (s_spk_busy || (voc_busy() && !voc_active())) {   /* voc starting or stopping: nobody owns the DAC yet */
+		GLOBAL_INT_RESTORE();
 		REPLY("[spk] busy\r\n");
 		return;
 	}
-	s_spk_hz = hz; s_spk_ms = ms; s_spk_addr = addr; s_spk_len = len; s_spk_stop = false; s_spk_busy = true;
+	s_spk_busy = true;
+	s_spk_voc = voc_active();   /* live RTSP audio session: play through the voc speaker tap */
+	GLOBAL_INT_RESTORE();
+	s_spk_hz = hz; s_spk_ms = ms; s_spk_addr = addr; s_spk_len = len; s_spk_stop = false;
 	if (rtos_create_thread(&s_spk_thread, BEKEN_APPLICATION_PRIORITY, "spk", spk_task, 4096, NULL) != BK_OK) {
 		s_spk_busy = false;
 		REPLY("[spk] thread failed\r\n");
@@ -1179,7 +1216,7 @@ static void cli_mic_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 	}
 	if (argc >= 5 && os_strcmp(argv[1], "rec") == 0) {
 		beken_thread_t t;
-		if (s_mic_busy) { REPLY("[mic] busy\r\n"); return; }
+		if (s_mic_busy || voc_busy()) { REPLY("[mic] busy%s\r\n", voc_busy() ? " (voc engine active: rtsp audio / talk voc)" : ""); return; }
 		s_net_ms = os_strtoul(argv[2], NULL, 10);
 		if (s_net_ms > 60000) s_net_ms = 60000;
 		os_strncpy(s_net_host, argv[3], sizeof(s_net_host) - 1);
@@ -1194,6 +1231,10 @@ static void cli_mic_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 	}
 	if (argc < 2 || os_strcmp(argv[1], "level") != 0) {
 		REPLY("mic rec MS HOST PORT | mic level [MS] [HZ] | cfg [mic 1|2|both] [mode diff|se] [gain N] [chl L|R|LR] [rate HZ] [clk xtal|apll]\r\n");
+		return;
+	}
+	if (s_mic_busy || voc_busy()) {
+		REPLY("[mic] busy%s\r\n", voc_busy() ? " (voc engine active)" : "");
 		return;
 	}
 	if (ms > 4000)
@@ -1255,6 +1296,15 @@ static void cli_mic_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
  * and closed by the caller's thread (the HTTP client thread) instead of spk_task / micnet_task.
  * Mutual exclusion is the existing s_spk_busy / s_mic_busy, so the ring chime, `spk tone`, `mic rec`
  * and talk never drive the hardware at the same time. ---- */
+/* While the voc engine runs (RTSP audio session / `talk voc on`), the talk.c users go through its
+ * taps: /speak -> voc speaker tap (A-law encoded, AEC reference included), /mic.wav -> voc mic tap
+ * (decoded, 8 kHz). s_spk_busy / s_mic_busy are set either way, so the chime, `spk` and `mic` see
+ * the same exclusion as before. */
+static bool s_talk_spk_voc, s_talk_mic_voc;
+
+bool aud_raw_busy(void) { return s_spk_busy || s_mic_busy; }
+void aud_pa_set(int on) { pa_set(on); }
+
 int aud_spk_open(uint16_t gain)
 {
 	aud_dac_config_t cfg = DEFAULT_AUD_DAC_CONFIG();
@@ -1262,13 +1312,23 @@ int aud_spk_open(uint16_t gain)
 	GLOBAL_INT_DECLARATION();
 
 	GLOBAL_INT_DISABLE();
-	if (s_spk_busy) {
+	if (s_spk_busy || (voc_busy() && !voc_active())) {
 		GLOBAL_INT_RESTORE();
 		return -1;
 	}
 	s_spk_busy = true;
+	s_talk_spk_voc = voc_active();
 	GLOBAL_INT_RESTORE();
 	s_spk_stop = false;
+	if (s_talk_spk_voc) {
+		if (voc_tap_open() != 0) {
+			s_spk_busy = false;
+			return -1;
+		}
+		if (gain)
+			voc_set_spk_gain(gain);
+		return 0;
+	}
 	cfg.samp_rate = s_dac_rate;
 	cfg.clk_src = s_dac_clk;
 	cfg.dac_chl = s_dac_chl;
@@ -1300,6 +1360,8 @@ int aud_spk_open(uint16_t gain)
 
 int aud_spk_write(const uint8_t *s16le, uint32_t bytes)
 {
+	if (s_talk_spk_voc)
+		return voc_tap_write(s16le, bytes) != 0 || s_spk_stop ? -1 : 0;
 	spk_ring_write(s16le, bytes);
 	return s_spk_stop ? -1 : 0;
 }
@@ -1308,6 +1370,13 @@ void aud_spk_close(void)
 {
 	uint32_t i;
 
+	if (s_talk_spk_voc) {
+		voc_tap_close();
+		voc_set_spk_gain(s_dac_gain);   /* back to the session's gain */
+		s_talk_spk_voc = false;
+		s_spk_busy = false;
+		return;
+	}
 	s_spk_feeding = false;
 	for (i = 0; i < 250 && s_spk_w != s_spk_r && !s_spk_stop; i++)   /* drain the ring (<= 1 s of audio) */
 		rtos_delay_milliseconds(10);
@@ -1323,7 +1392,15 @@ void aud_spk_close(void)
 bool aud_spk_busy(void) { return s_spk_busy; }
 uint32_t aud_spk_rate(void) { return s_dac_rate; }
 uint16_t aud_spk_gain(void) { return s_dac_gain; }
-void aud_spk_stats(uint32_t *dma_frames, uint32_t *underruns) { *dma_frames = s_dac_frames; *underruns = s_spk_underrun; }
+void aud_spk_stats(uint32_t *dma_frames, uint32_t *underruns)
+{
+	if (s_talk_spk_voc) {
+		voc_tap_stats(dma_frames, underruns);
+		return;
+	}
+	*dma_frames = s_dac_frames;
+	*underruns = s_spk_underrun;
+}
 
 int aud_mic_open(uint32_t gain)
 {
@@ -1332,12 +1409,20 @@ int aud_mic_open(uint32_t gain)
 	GLOBAL_INT_DECLARATION();
 
 	GLOBAL_INT_DISABLE();
-	if (s_mic_busy) {
+	if (s_mic_busy || (voc_busy() && !voc_active())) {
 		GLOBAL_INT_RESTORE();
 		return -1;
 	}
 	s_mic_busy = true;
+	s_talk_mic_voc = voc_active();
 	GLOBAL_INT_RESTORE();
+	if (s_talk_mic_voc) {
+		if (voc_mic_tap_open() != 0) {
+			s_mic_busy = false;
+			return -1;
+		}
+		return 0;
+	}
 	cfg.samp_rate = s_adc_rate;
 	cfg.clk_src = s_adc_clk;
 	cfg.adc_chl = s_adc_chl;
@@ -1365,6 +1450,8 @@ uint32_t aud_mic_read(uint8_t *dst, uint32_t cap)
 {
 	uint32_t n = s_mic_w - s_mic_r;
 
+	if (s_talk_mic_voc)
+		return voc_mic_tap_read(dst, cap);
 	if (n > cap)
 		n = cap;
 	n &= ~3u;   /* whole 32-bit FIFO words */
@@ -1377,6 +1464,12 @@ uint32_t aud_mic_read(uint8_t *dst, uint32_t cap)
 
 void aud_mic_close(void)
 {
+	if (s_talk_mic_voc) {
+		voc_mic_tap_close();
+		s_talk_mic_voc = false;
+		s_mic_busy = false;
+		return;
+	}
 	bk_aud_adc_stop();
 	aud_dma_stop(1);
 	bk_aud_adc_deinit();
@@ -1384,8 +1477,17 @@ void aud_mic_close(void)
 }
 
 bool aud_mic_busy(void) { return s_mic_busy; }
-uint32_t aud_mic_rate(void) { return 2 * s_adc_rate; }   /* measured 2026-10-03: the ADC delivers twice the configured rate */
-void aud_mic_stats(uint32_t *dma_frames, uint32_t *overruns) { *dma_frames = s_adc_frames; *overruns = s_mic_overrun; }
+/* raw: measured 2026-10-03, the ADC delivers twice the configured rate; voc tap: decoded 8 kHz */
+uint32_t aud_mic_rate(void) { return s_talk_mic_voc || (!s_mic_busy && voc_active()) ? VOC_RATE : 2 * s_adc_rate; }
+void aud_mic_stats(uint32_t *dma_frames, uint32_t *overruns)
+{
+	if (s_talk_mic_voc) {
+		voc_mic_tap_stats(dma_frames, overruns);
+		return;
+	}
+	*dma_frames = s_adc_frames;
+	*overruns = s_mic_overrun;
+}
 
 /* ---- TCP command channel: the same commands as the UART shell, over the LAN ----
  * One line per connection: "<token> <command...>\n". The token is the KV string db_token
@@ -2261,6 +2363,8 @@ static void cli_rtsp_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, cha
 	} else if (argc >= 2 && os_strcmp(argv[1], "status") == 0) {
 		rtsp_status(buf, sizeof(buf));
 		REPLY("%s", buf);
+		rtsp_status_audio(buf, sizeof(buf));
+		REPLY("%s", buf);
 		if (rtsp_status_clients(buf, sizeof(buf)) > 0)
 			REPLY("%s", buf);
 	} else if (argc >= 3 && os_strcmp(argv[1], "port") == 0) {
@@ -2468,10 +2572,11 @@ bool app_power_got_ip(void)
 /* anything that must finish before the device may sleep */
 bool app_power_busy(void)
 {
-	bool busy = s_spk_busy || s_mic_busy || s_fx_running || ota_thread != NULL;
+	bool busy = s_spk_busy || s_mic_busy || s_fx_running || ota_thread != NULL || voc_busy();
 
 #if defined(DOORBELL_AVDK)
 	busy = busy || s_cam_http_clients > 0;   /* a snapshot or MJPEG stream client (HA) */
+	busy = busy || rtsp_clients(NULL) > 0;   /* a live RTSP viewer / two-way audio session */
 #endif
 	if (s_got_ip && (s_pend_boot || s_pend_ring || s_pend_motion || s_pend_test || s_pend_fx))
 		busy = true;
@@ -2560,7 +2665,7 @@ static const struct cli_command s_doorbell_commands[] = {
 #endif
 	{"spk", "spk tone [HZ] [MS] | play beepa|beepb|bell|ADDR LEN | net HOST PORT | stop", cli_spk_cmd},
 	{"mic", "mic level [MS] [HZ] | rec MS HOST PORT (on-board ADC mic)", cli_mic_cmd},
-	{"talk", "talk status | gain N|auto | micgain N | max S | stop (two-way audio over HTTP :8080 /speak /mic.wav)", cli_talk_cmd},
+	{"talk", "talk status | gain N|auto | micgain N | max S | stop | aec on|off | vocmic N | voc on|off (two-way audio: HTTP :8080 /speak /mic.wav, RTSP voc engine)", cli_talk_cmd},
 #endif
 };
 #if (CONFIG_SYS_CPU0)
@@ -2591,6 +2696,7 @@ void user_app_main(void)
 
 #if (CONFIG_SYS_CPU0)
 	pa_set(0);   /* amplifier enable floats at boot and half-turns the speaker on: park it low */
+	voc_init();  /* KV: db_talk_aec / db_voc_mic; the engine itself starts with the first RTSP audio track */
 	pin_configure(9, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);   /* sensor rail: light sensor (ADC10) reads ~25 mV dead without it */
 	bk_gpio_set_output_high(9);
 #if defined(DOORBELL_AVDK)

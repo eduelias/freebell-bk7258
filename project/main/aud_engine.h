@@ -35,5 +35,12 @@ bool aud_mic_busy(void);
 uint32_t aud_mic_rate(void);      /* real sample rate of the words: 2x the configured ADC rate (measured) */
 void aud_mic_stats(uint32_t *dma_frames, uint32_t *overruns);
 
+/* Arbitration with the voc engine (audio_voc.c): true while the raw engine drives the DAC or ADC
+ * (chime, `spk`, `mic`, /speak, /mic.wav on the raw path). The raw opens above refuse while
+ * voc_busy(); while voc runs they are routed through its taps instead. */
+bool aud_raw_busy(void);
+/* Speaker amplifier enable (GPIO 46, active high): voc switches it around its start/stop. */
+void aud_pa_set(int on);
+
 /* Command output: os_printf + the TCP command channel's REPLY buffer (640 bytes per command). */
 void app_reply(const char *fmt, ...);

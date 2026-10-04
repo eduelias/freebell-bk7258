@@ -1,4 +1,4 @@
-# Audio: speaker, microphone, two-way talk
+# Audio: speaker, microphone, two-way talk, full duplex over RTSP
 
 ## Engine (v0.13, `aud_engine.h`)
 
@@ -78,3 +78,65 @@ entity and a long-lived token in `/config/.doorbell_ha_token`, then the core con
 the first time (no reload service); scripts and rest commands reload. Listening from HA:
 `http://<device-ip>:8080/mic.wav` in VLC/ffplay, or an iframe card on `/talk` (the camera entity has
 no audio). Files: [`../homeassistant/`](../homeassistant/README.md).
+
+## Full duplex over RTSP (v0.26, `project/main/audio_voc.c`, `rtsp.c`)
+
+The raw engine above is half duplex: a listener hears silence while the speaker plays, because
+the microphone would otherwise feed the speaker back. For real two-way talk the firmware now has a
+second engine, Beken's **`aud_intf` voice mode** (`bk_avdk/components/multimedia`, the same code
+the reference doorbell projects use):
+
+- CPU1 (where the camera/H.264 pipeline already runs) owns the ADC (MIC1, differential) and DAC at
+  **8 kHz**, runs the **AEC** (`libaec`, reference = the decoded speaker PCM as it is queued into the
+  DAC ring, `aec_proc` per 20 ms frame), **noise suppression** and **G.711 A-law** encode/decode.
+  CPU0 only sees A-law bytes: `bk_aud_intf_drv_init` -> `set_mode(VOICE)` -> `voc_init` ->
+  `voc_start`; mic frames arrive in a callback on the SDK task `aud_tras` as **320 bytes = 40 ms**;
+  speaker frames go in with `bk_aud_intf_write_spk_data()` into a ring of `frame_num` x 320 bytes
+  (we use 10, prefilled with 4 frames = 160 ms of silence at start; a write that does not fit is
+  dropped silently). Everything crosses the cores through shared PSRAM rings; the API calls are
+  synchronous mailbox messages (~ms each).
+- The SDK's own amplifier control (`CONFIG_AUD_TRAS_DAC_PA_CTRL`) is **off** for CPU1: its pin is
+  GPIO 5 (`AUD_DAC_PA_CTRL_GPIO` default), which on this board is a camera rail. `audio_voc.c`
+  switches the real PA (GPIO 46) 50 ms after `voc_start` and 50 ms before `voc_stop`.
+- Format on the wire: RTP payload type 8 (PCMA), 8 kHz clock, 160 bytes per 20 ms packet. The SDK
+  delivers 40 ms per callback, which rtsp.c splits into two packets. Mic latency device -> client is
+  therefore ~40-60 ms plus the network; speaker latency client -> DAC is the ring prefill (160 ms)
+  plus whatever the sender buffers.
+- Settings: `talk aec on|off` (KV `db_talk_aec`, default on; `bk_aud_intf_voc_aec_ctrl` switches it
+  live, so the two can be compared within one session), `talk vocmic N` (KV `db_voc_mic`, ADC gain
+  for voice mode, default 0x3f like `/mic.wav`), the speaker gain follows `spk cfg gain` (0x1c:
+  above it the amplifier clips). AEC parameters are the SDK defaults (`ec_depth` 20, `TxRxThr` 30,
+  `TxRxFlr` 6, `ref_scale` 0, `ns_level` 2, `ns_para` 1, `mic_delay` 0).
+
+### One engine at a time
+
+`aud_raw_busy()` (chime, `spk`, `mic`, /speak, /mic.wav on the raw path) blocks `voc_start`; the
+raw opens refuse while voc is starting or stopping. **While voc runs** the raw users are routed
+through two taps so nothing stops working during a call:
+
+| User | Raw engine idle | voc engine running (RTSP audio client or `talk voc on`) |
+|---|---|---|
+| `/speak`, `spk tone|play|net`, ring chime | DAC + DMA ring as before | voc **speaker tap**: PCM 8 kHz -> A-law, paced against the wall clock (<= 200 ms ahead), backchannel frames dropped while the tap is open |
+| `/mic.wav` | ADC ring, 16 kHz words | voc **mic tap**: decoded A-law as the same 32-bit word format, **8 kHz** WAV header |
+| `mic rec`, `mic level` | ADC direct | refused (`[mic] busy (voc engine active)`) |
+
+The voc engine is started by rtsp.c when the first client sets up an audio track (SETUP of
+`track1` or `track2`), retried every 500 ms while the chime holds the hardware, and stopped when
+the last client leaves (`rtsp off` stops it too). `talk voc on` starts it by hand (mic frames are
+dropped until an RTSP client joins); rtsp.c uses but does not stop a manually started engine.
+
+### RTSP tracks (rtsp.c)
+
+```
+m=video 0 RTP/AVP 96   a=rtpmap:96 H264/90000 ... a=control:track0
+m=audio 0 RTP/AVP 8    a=rtpmap:8 PCMA/8000  a=ptime:20  a=recvonly  a=control:track1
+m=audio 0 RTP/AVP 8    a=rtpmap:8 PCMA/8000  a=ptime:20  a=sendonly  a=control:track2   (only with Require: www.onvif.org/ver20/backchannel)
+```
+
+Directions are from the client's point of view (ONVIF Streaming Spec 5.3): go2rtc treats a media
+without a direction as one it receives and `a=sendonly` as the one it sends into, so the microphone
+track must **not** say `sendonly`. Each track has its own transport: TCP interleaved channels (the
+backchannel RTP comes back as `$`-framed packets on its channel, parsed in `process_rx`) or UDP
+(server ports `6970 + 6*slot + 2*track`; the backchannel's server port receives). PLAY/PAUSE are
+aggregate; `RTP-Info` lists every set-up track. go2rtc numbers interleaved channels by media index
+(0-1 video, 2-3 mic, 4-5 backchannel); `tools/rtsp_backchannel.py` does the same.

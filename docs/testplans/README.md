@@ -17,3 +17,4 @@ Device commands are `python3 tools/dbcmd.py <cmd>` unless marked UART.
 | [TESTPLAN-rtsp.md](TESTPLAN-rtsp.md) | H.264 RTSP server, camera mode policy, HA camera entry options | 0.22.x |
 | [TESTPLAN-talk.md](TESTPLAN-talk.md) | two-way audio over HTTP (`/speak`, `/mic.wav`, `/talk`), HA talk scripts | 0.23.x |
 | [TESTPLAN-sd.md](TESTPLAN-sd.md) | optional microSD storage (`sd`), SNTP time | 0.24.0 |
+| [TESTPLAN-duplex.md](TESTPLAN-duplex.md) | full-duplex two-way audio over RTSP (voice engine with AEC, PCMA mic track, ONVIF backchannel), go2rtc/HA | 0.26.0 |

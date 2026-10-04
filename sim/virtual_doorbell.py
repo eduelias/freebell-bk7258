@@ -94,6 +94,7 @@ TALK_MAX_LIMIT_S = 120
 TALK_MAX_DEFAULT_S = 30
 TALK_MIC_MAX_S = 600
 TALK_MIC_RATE = 16000            # the ADC runs at 2x the configured 8 kHz
+VOC_RATE = 8000                  # voc engine (aud_intf voice mode): 8 kHz G.711 A-law, RTP PT 8
 SPK_RATE = 8000
 SPK_GAIN_DEFAULT = 0x1C
 BELL_MS = (66450 - 16) * 1000 // (SPK_RATE * 2)   # the stock bell chime, s16le 8 kHz
@@ -500,6 +501,11 @@ class Device:
         self.talk_gain = int(kv("db_talk_gain", "0"))
         self.talk_micgain = int(kv("db_talk_micgain", "63"))
         self.talk_max_s = int(kv("db_talk_max", str(TALK_MAX_DEFAULT_S)))
+        self.talk_aec = kv("db_talk_aec", "1") == "1"          # feat/duplex: voc engine AEC (audio_voc.c)
+        self.voc_mic = int(kv("db_voc_mic", "0"))               # 0 = default 0x3f
+        self.voc_on = False                                     # voc engine running (rtsp audio client or `talk voc on`)
+        self.voc_manual = False
+        self.voc_starts = 0
         self.sd_auto = kv("db_sd_auto", "1") != "0"
         self.hook = kv("db_hook", self.hook) or HOOK_DEFAULT
         stored_token = kv("db_token")
@@ -1347,6 +1353,9 @@ class Device:
             r.add("[rtsp] off (persisted; server stops within ~1 s, camera released if in H.264)\r\n")
         elif len(argv) >= 2 and argv[1] == "status":
             r.add(self.rtsp.status())
+            r.add("[rtsp] audio: voc %s%s aec %s | clients 0 | mic in 0 frames 0 B | back in 0 pkts 0 B | voc fails 0\r\n"
+                  % ("on" if self.voc_on else "off", (" (manual)" if self.voc_manual else " (rtsp)") if self.voc_on else "",
+                     "on" if self.talk_aec else "off"))
         elif len(argv) >= 3 and argv[1] == "port":
             p = int(argv[2]) if argv[2].isdigit() else 0
             if p == 0 or p > 65535:
@@ -1450,10 +1459,40 @@ class Device:
         if len(argv) >= 2 and argv[1] == "status":
             st = ("speaking" if t.speaking else "") + (("+listening" if t.speaking else "listening") if t.listening else "") \
                 + ("idle" if not t.speaking and not t.listening else "")
-            r.add("[talk] %s | speak: %u calls, last %u ms (in %u Hz), %u bytes in | mic: %u calls, %u bytes out, %u Hz | last http %d"
-                  " | gain %s0x%x micgain 0x%x max %u s\r\n" % (st, t.speak_calls, t.speak_last_ms, t.speak_last_rate, t.speak_in_bytes,
-                                                              t.mic_calls, t.mic_out_bytes, TALK_MIC_RATE, t.last_err,
+            r.add("[talk] %s engine %s | speak: %u calls, last %u ms (in %u Hz), %u bytes in | mic: %u calls, %u bytes out, %u Hz | last http %d"
+                  " | gain %s0x%x micgain 0x%x max %u s\r\n" % (st, "voc" if self.voc_on else "raw", t.speak_calls, t.speak_last_ms,
+                                                              t.speak_last_rate, t.speak_in_bytes, t.mic_calls, t.mic_out_bytes,
+                                                              VOC_RATE if self.voc_on else TALK_MIC_RATE, t.last_err,
                                                               "" if self.talk_gain else "auto=", gain, self.talk_micgain, self.talk_max_s))
+            r.add(self.voc_status())
+        elif len(argv) >= 3 and argv[1] == "aec":
+            if argv[2] not in ("on", "off"):
+                r.add("[talk] aec on|off\r\n")
+                return
+            self.talk_aec = argv[2] == "on"
+            self.store.kv_set("db_talk_aec", "1" if self.talk_aec else "0")
+            r.add("[talk] aec %s%s\r\n" % (argv[2], " (applied to the running voc engine)" if self.voc_on else " (next voc start)"))
+        elif len(argv) >= 3 and argv[1] == "vocmic":
+            try:
+                g = int(argv[2], 0)
+            except ValueError:
+                g = 0x40
+            if g > 0x3F:
+                r.add("[talk] vocmic 0..0x3f (ADC gain for the voc engine / RTSP audio; 0 = default 0x3f)\r\n")
+                return
+            self.voc_mic = g
+            self.store.kv_set("db_voc_mic", str(g))
+            r.add("[talk] voc mic gain 0x%x%s\r\n" % (g or 0x3F, " (applied)" if self.voc_on else ""))
+        elif len(argv) >= 3 and argv[1] == "voc":
+            if argv[2] == "on":
+                rc = self.voc_start(manual=True)
+                r.add("[talk] voc start -> %d%s\r\n" % (rc, " (manual: mic frames dropped until an RTSP audio client joins; /speak and /mic.wav go through it)"
+                                                        if rc == 0 else " (raw engine busy: chime, spk, mic, /speak or /mic.wav running)"))
+            elif argv[2] == "off":
+                self.voc_stop()
+                r.add("[talk] voc stopped (an RTSP audio client restarts it within 0.5 s)\r\n")
+            else:
+                r.add("[talk] voc on|off\r\n")
         elif len(argv) >= 3 and argv[1] == "gain":
             try:
                 g = 0 if argv[2] == "auto" else int(argv[2], 0)
@@ -1488,7 +1527,28 @@ class Device:
             t.abort = True
             r.add("[talk] stop requested (speaking %d listening %d)\r\n" % (int(t.speaking), int(t.listening)))
         else:
-            r.add("talk status | gain N|auto | micgain N | max SECONDS | stop   (http://IP:8080/speak /mic.wav /talk)\r\n")
+            r.add("talk status | gain N|auto | micgain N | max SECONDS | stop | aec on|off | vocmic N | voc on|off   (http://IP:8080/speak /mic.wav /talk; rtsp audio = voc engine)\r\n")
+
+    # ---- voc engine (audio_voc.c): the SDK voice mode with AEC behind the RTSP audio tracks
+    def voc_start(self, manual: bool = False) -> int:
+        if self.voc_on:
+            return 0
+        if self.spk_busy or self.mic_busy or self.talk.speaking or self.talk.listening:
+            return -1
+        self.voc_on, self.voc_manual = True, manual
+        self.voc_starts += 1
+        log.info("[voc] on: 8 kHz G711A, aec %s, mic gain 0x%x spk gain 0x%x, ring 10 x 320 B (prefill 4)",
+                 "on" if self.talk_aec else "off", self.voc_mic or 0x3F, self.talk_gain or self.spk_gain)
+        return 0
+
+    def voc_stop(self) -> None:
+        if self.voc_on:
+            log.info("[voc] off")
+        self.voc_on = self.voc_manual = False
+
+    def voc_status(self) -> str:
+        return ("[voc] %s aec %s mic 0x%x spk 0x%x | mic 0 cb 0 B | spk 0 frames 0 B drop-tap 0 err 0 | tap - 0 frames 0 late | mictap - 0 ovr | starts %u\r\n"
+                % ("on" if self.voc_on else "off", "on" if self.talk_aec else "off", self.voc_mic or 0x3F, self.talk_gain or self.spk_gain, self.voc_starts))
 
     # ---- sd
     def cmd_sd(self, argv: list[str], r: Reply) -> None:
@@ -1675,7 +1735,8 @@ def play_pcm_on_host(pcm: bytes, rate: int) -> None:
 # ---------------------------------------------------------------- RTSP stand-in (ffmpeg)
 class RtspStandIn:
     """`rtsp on` with --rtsp and ffmpeg present: ffmpeg serves one RTSP client at rtsp://HOST:PORT/live
-    (testsrc H.264). Without ffmpeg the server is "stopped" and `rtsp status` says why."""
+    (testsrc H.264 + a PCMA/8000 sine as the microphone track, like the firmware's SDP; no backchannel).
+    Without ffmpeg the server is "stopped" and `rtsp status` says why."""
 
     def __init__(self, dev: Device) -> None:
         self.dev = dev
@@ -1700,9 +1761,10 @@ class RtspStandIn:
             log.info("[rtsp] ffmpeg not found: no RTSP stand-in")
             return -1
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi",
-               "-i", "testsrc=size=1280x720:rate=15", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-               "-g", "30", "-b:v", "1500k", "-pix_fmt", "yuv420p", "-f", "rtsp", "-rtsp_flags", "listen",
-               "rtsp://0.0.0.0:%d/live" % port]
+               "-i", "testsrc=size=1280x720:rate=15", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=8000",
+               "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+               "-g", "30", "-b:v", "1500k", "-pix_fmt", "yuv420p", "-c:a", "pcm_alaw", "-ar", "8000", "-ac", "1",
+               "-f", "rtsp", "-rtsp_flags", "listen", "rtsp://0.0.0.0:%d/live" % port]
         try:
             self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as e:

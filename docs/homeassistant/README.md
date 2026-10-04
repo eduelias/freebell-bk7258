@@ -100,5 +100,72 @@ curl -o /dev/null -w '%{http_code}\n' http://192.168.2.89:8080/snapshot.jpg
 and the event `doorbell_bk7258_report` for your own automations. Snapshots are written to
 `/config/www/doorbell/last_ring.jpg`, `last_motion.jpg` and `wake_latest.jpg`.
 
-Listening to the doorbell's microphone from HA: an iframe card on `http://<device-ip>:8080/talk`,
-or `http://<device-ip>:8080/mic.wav` in VLC/ffplay (the camera entity has no audio).
+## Two-way audio (fw 0.26+)
+
+The RTSP stream carries a PCMA microphone track and an ONVIF backchannel into the speaker, with the
+SDK's echo canceller on the device ([`../notes/audio.md`](../notes/audio.md)). Home Assistant 2026.9
+streams cameras through its embedded **go2rtc**, which supports ONVIF backchannels out of the box:
+for an `rtsp://` source without options it sends `Require: www.onvif.org/ver20/backchannel` on
+DESCRIBE and sets up the `a=sendonly` track as its audio sink. Nothing needs to be configured for
+that: the generic camera's stream source `rtsp://<device-ip>:554/live` is registered by HA as the
+go2rtc stream `camera.doorbell_bk7258`, and HA adds a second producer
+(`ffmpeg:camera.doorbell_bk7258#audio=opus`) so browsers get the microphone as Opus over WebRTC.
+Only if you give the source `#` options yourself (e.g. a `streams:` entry in `/config/go2rtc.yaml`
+with `#media=video+audio`) must you add `#backchannel=1`, because go2rtc turns the backchannel off
+as soon as any option is present.
+
+What you get where:
+
+| Client | Listen (mic track) | Talk (backchannel) |
+|---|---|---|
+| HA frontend camera more-info / picture card (WebRTC) | yes (unmute the player) | **no**: the HA frontend's WebRTC player only adds a `recvonly` audio transceiver (`ha-web-rtc-player.ts`), there is no microphone button in 2026.9 |
+| go2rtc's own UI (`debug_ui` in `configuration.yaml`, port 11984, basic auth) `webrtc.html?src=camera.doorbell_bk7258&media=video+audio+microphone` | yes | yes (browser microphone, HTTPS or localhost) |
+| [WebRTC Camera custom card](https://github.com/AlexxIT/WebRTC) with `media: video,audio,microphone` | yes | yes |
+| `tools/rtsp_backchannel.py`, VLC/ffmpeg (listen only) | yes | tool only |
+
+Checking go2rtc's view of the stream (optional, needs a core restart twice): add to `configuration.yaml`
+
+```yaml
+go2rtc:
+  debug_ui: true
+  username: <pick one>
+  password: <pick one>
+```
+
+restart, then `curl -u user:pass http://<ha-ip>:11984/api/streams` while someone views the camera:
+the `camera.doorbell_bk7258` producer lists the three medias (`video, recvonly, H264`; `audio,
+recvonly, PCMA/8000`; `audio, sendonly, PCMA/8000`). Remove the three lines and restart again
+afterwards: the debug UI exposes every stream source (with credentials) to the LAN.
+
+### "Answer" on the ring push
+
+The ring notification carries an `Answer` action that opens the camera's more-info dialog in the
+Companion app (live video + microphone audio, listen-only as noted above); Android gets the
+`doorbell` channel at high importance so it rings through Do Not Disturb exceptions you grant it:
+
+```yaml
+      - action: notify.doorbell_family
+        data:
+          title: Doorbell
+          message: Someone is at the door ({{ now().strftime("%H:%M") }})
+          data:
+            ttl: 0
+            priority: high
+            channel: doorbell
+            importance: high
+            tag: doorbell_ring
+            clickAction: entityId:camera.doorbell_bk7258
+            actions:
+              - action: DOORBELL_ANSWER
+                title: Answer
+                uri: entityId:camera.doorbell_bk7258
+```
+
+`entityId:<entity>` is the Companion app's deep link to an entity's more-info dialog (both Android
+and iOS); replace it with a dashboard path (`/dashboard-prototype1/home`) if you prefer a view with
+a WebRTC card. The full automation is in
+[`automations/doorbell_bk7258_webhook.yaml`](automations/doorbell_bk7258_webhook.yaml).
+
+Listening without the stream: an iframe card on `http://<device-ip>:8080/talk`, or
+`http://<device-ip>:8080/mic.wav` in VLC/ffplay (8 kHz while an RTSP audio session is live, 16 kHz
+otherwise).

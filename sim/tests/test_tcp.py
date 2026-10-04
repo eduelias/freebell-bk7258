@@ -50,7 +50,23 @@ def test_reply_formats(sim):
     assert re.match(r"ok\n\[cam\] open [01] \S+ \(mode auto\) frames \d+ h264 \d+ dropped \d+ last jpeg \d+ bytes \d+x\d+ seq \d+ age \d+ ms$",
                     sim.cmd("cam stat"))
     assert re.match(r"ok\n\[rtsp\] stopped port \d+ clients 0/3 \(0 playing\) in 0\.0 fps 0 kbps frames 0 key 0 drop busy 0 big 0 "
-                    r"sps 0 pps 0 age 0 ms$", sim.cmd("rtsp status"))
+                    r"sps 0 pps 0 age 0 ms\r\n\[rtsp\] audio: voc off aec on \| clients 0 \| mic in 0 frames 0 B \| back in 0 pkts 0 B \| voc fails 0$",
+                    sim.cmd("rtsp status"))
+    # feat/duplex: the voc engine (SDK voice mode with AEC) behind the RTSP audio tracks
+    assert re.match(r"ok\n\[talk\] idle engine raw \| speak: .* \| gain auto=0x1c micgain 0x3f max 30 s\r\n"
+                    r"\[voc\] off aec on mic 0x3f spk 0x1c \| mic 0 cb 0 B \| spk 0 frames 0 B drop-tap 0 err 0 \| tap - 0 frames 0 late \| mictap - 0 ovr \| starts 0$",
+                    sim.cmd("talk status"))
+    assert sim.cmd("talk aec off") == "ok\n[talk] aec off (next voc start)"
+    assert sim.cmd("talk aec on") == "ok\n[talk] aec on (next voc start)"
+    assert sim.cmd("talk aec maybe") == "ok\n[talk] aec on|off"
+    assert sim.cmd("talk vocmic 0x2d") == "ok\n[talk] voc mic gain 0x2d"
+    assert sim.cmd("talk vocmic 0x40").startswith("ok\n[talk] vocmic 0..0x3f")
+    assert sim.cmd("talk vocmic 0") == "ok\n[talk] voc mic gain 0x3f"
+    assert sim.cmd("talk voc on").startswith("ok\n[talk] voc start -> 0 (manual")
+    assert "engine voc" in sim.cmd("talk status") and "[voc] on aec on" in sim.cmd("talk status")
+    assert sim.cmd("rtsp status").endswith("[rtsp] audio: voc on (manual) aec on | clients 0 | mic in 0 frames 0 B | back in 0 pkts 0 B | voc fails 0")
+    assert sim.cmd("talk voc off") == "ok\n[talk] voc stopped (an RTSP audio client restarts it within 0.5 s)"
+    assert "engine raw" in sim.cmd("talk status")
     assert re.match(r"ok\nADC9 raw=\d+ mv=30\d\d$", sim.cmd("adc 9"))
     assert sim.cmd("mem 28001000 2").startswith("ok\n[mem] 28001000: ")
     assert sim.cmd("sim nothing-like-this").startswith("ok\nsim press | motion |")

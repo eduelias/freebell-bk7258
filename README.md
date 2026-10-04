@@ -3,8 +3,8 @@
 Open firmware for the Tuya "Smart Visual Doorbell" built on the Beken **BK7258** (board
 `IP108_MAIN_V05`, Tuya product IP10B), plus the Home Assistant glue that turns it into a fully
 local video doorbell: ring and motion events to a webhook, JPEG snapshots and an H.264 RTSP stream,
-two-way audio over HTTP, chime and night light, battery reporting and deep sleep, optional microSD
-recording, and over-the-air updates. It is built on Beken's open Armino SDK (bk_idk + bk_avdk,
+full-duplex two-way audio with echo cancellation over RTSP (plus the HTTP intercom), chime and
+night light, battery reporting and deep sleep, optional microSD recording, and over-the-air updates. It is built on Beken's open Armino SDK (bk_idk + bk_avdk,
 `release/v2.0.1`) with a handful of patches and an OV9650 camera driver.
 
 Why: the author's unit shipped without a Tuya licence and could never be paired, and the licence
@@ -67,7 +67,7 @@ streams of `FF`. *(`docs/img/`: add a photo of the UART header.)*
 | Network | Wi-Fi station (credentials in the device's KV flash, auto-reconnect), JSON reports to a Home Assistant webhook: `boot`, `ring`, `motion`, `heartbeat` (5 min), `wake` (with `reason`), `test`; each carries battery, light, USB/charging, counters |
 | Doorbell | button on GPIO 53 with debounce and a 10 s report rate limit; bell chime on the speaker; blue ring blinks; white night light when dark; PIR on/off, sensitivity and cooldown |
 | Camera | JPEG snapshot `http://<device-ip>:8080/snapshot.jpg`, MJPEG `/stream`, H.264 720p over RTSP `rtsp://<device-ip>:554/live` (TCP/UDP, 3 clients) |
-| Audio | half-duplex two-way audio over HTTP: `POST /speak` (raw/WAV), `/speak?url=`, `/speak?tone=`, `/mic.wav`, a `/talk` browser page |
+| Audio | **full-duplex two-way audio over RTSP**: a G.711 microphone track and an ONVIF backchannel into the speaker, echo cancellation and noise suppression in the SDK's voice engine (what go2rtc / Home Assistant use); plus the HTTP intercom: `POST /speak` (raw/WAV), `/speak?url=`, `/speak?tone=`, `/mic.wav`, a `/talk` browser page |
 | Power | battery voltage/percent, USB and charging state, deep sleep with wake on button, PIR, USB, UART or RTC alarm (periodic snapshot) |
 | Storage | optional microSD: a JPEG per ring/motion with SNTP-synced names; mounted only around saves |
 | Updates | OTA over Wi-Fi from any HTTP URL (`ota`), cable-free `scripts/release.sh`; UART flashing via the ROM for the first time and as a last resort |
@@ -160,7 +160,7 @@ flash and survive OTA.
 | `rtsp` | `on\|off` \| `status` \| `port N` \| `q IMB PMB` \| `idr` | on/off (off), port (554), q (120/24) |
 | `spk` | `tone [HZ] [MS]` \| `play beepa\|beepb\|bell\|ADDR LEN` \| `net HOST PORT` \| `stop` \| `pa PIN\|off` \| `cfg [chl L\|R\|LR] [mode diff\|se] [gain N] [rate HZ] [clk xtal\|apll]` | gain 0x1c, PA 46 |
 | `mic` | `level [MS] [HZ]` \| `rec MS HOST PORT` \| `cfg [mic 1\|2\|both] [mode diff\|se] [gain N] [chl L\|R\|LR] [rate HZ] [clk xtal\|apll]` | |
-| `talk` | `status` \| `gain N\|auto` \| `micgain N` \| `max S` \| `stop` | `db_talk_gain` (auto), `db_talk_micgain` (0x3f), `db_talk_max` (30) |
+| `talk` | `status` \| `gain N\|auto` \| `micgain N` \| `max S` \| `stop` \| `aec on\|off` \| `vocmic N` \| `voc on\|off` | `db_talk_gain` (auto), `db_talk_micgain` (0x3f), `db_talk_max` (30), `db_talk_aec` (on), `db_voc_mic` (0x3f) |
 | `sd` | `status` \| `mount` (pins the card mounted) \| `umount [keep]` \| `format [TOKEN]` \| `ls [DIR] [SKIP]` \| `save [EVENT]` \| `auto on\|off` \| `keep S` \| `pre FLAGS [GAP_MS]` \| `pwr PIN\|none` \| `power on\|off` \| `probe [cmd\|pins\|lines\|regs]` \| `ntp HOST` \| `tz MIN` \| `time EPOCH` \| `sync` | `db_sd_auto` (on), `db_sd_keep` (30), `db_sd_pre` (0,10), `db_sd_pwr` (none), `db_sd_ntp` (pool.ntp.org), `db_sd_tz` (0) |
 | `pin` | `all` \| `mux` \| `dump` \| `get N` \| `in N [up\|down\|none]` \| `hiz N` \| `out N 0\|1` \| `raw N HEX` \| `blink N [count]` \| `watch SECONDS` (refuses 10/11) | |
 | `adc` | `adc CHANNEL` (one calibrated SARADC reading) | |
@@ -184,16 +184,18 @@ plus `"reason":"button|pir|usb|uart|rtc|gpioNN"` on `wake`.
 | `GET :8080/stream` | MJPEG (`multipart/x-mixed-replace`); 503 while an RTSP client plays |
 | `POST :8080/speak` | play raw s16le 8 kHz or a PCM WAV; replies after playback |
 | `GET :8080/speak?tone=HZ&ms=MS` / `?url=http://...` | test tone / fetch and play a WAV |
-| `GET :8080/mic.wav[?seconds=N]` | 16 kHz mono WAV from the microphone, live or N seconds |
+| `GET :8080/mic.wav[?seconds=N]` | mono WAV from the microphone, live or N seconds (16 kHz; 8 kHz while an RTSP audio session is live) |
 | `GET :8080/talk` | browser page for listen / tone / upload / URL |
-| `rtsp://<device-ip>:554/live` | H.264 720p (`rtsp on` first; TCP transport recommended) |
+| `rtsp://<device-ip>:554/live` | `track0` H.264 720p, `track1` PCMA/8000 microphone, `track2` PCMA/8000 ONVIF backchannel into the speaker (advertised to clients that send `Require: www.onvif.org/ver20/backchannel`, as go2rtc does); `rtsp on` first, TCP transport recommended. The audio tracks run the SDK voice engine with AEC ([docs/notes/audio.md](docs/notes/audio.md)); `tools/rtsp_backchannel.py` is a test client |
 
 ## Home Assistant
 
 1. Create the webhook automation with your own random `<webhook-id>` and a Text helper for the
    last report; `hook set <ha-ip>:8123/api/webhook/<webhook-id>` on the device.
 2. Add a *Generic Camera*: still `http://<device-ip>:8080/snapshot.jpg`, stream
-   `rtsp://<device-ip>:554/live`, RTSP transport `tcp` (UI or `tools/ha_generic_camera.py`).
+   `rtsp://<device-ip>:554/live`, RTSP transport `tcp` (UI or `tools/ha_generic_camera.py`). HA's
+   go2rtc picks up the microphone track and the backchannel by itself; the HA frontend plays the
+   audio (listen only), go2rtc's UI or the WebRTC custom card talk back.
 3. Install the package (notify group with your phones, battery/light sensors, low-battery alert).
 4. Optional: the talk scripts (`script.doorbell_say` via HA TTS, `script.doorbell_play`), which
    need a token file on the HA host and `doorbell_tts_wav.py` in `/config`.
@@ -245,11 +247,11 @@ PIR cooldown, night-light arbiter, sleep/wake cycle, OTA version bump and KV per
 
 | Path | What |
 |---|---|
-| `project/main/` | the application: `app_main.c` (Wi-Fi, webhook, TCP channel, HTTP server, camera, OTA, audio engine, commands), `night.c`, `pir.c`, `power.c`, `rtsp.c`, `talk.c`, `sdcard.c`; `vendor_flash*.{c,h}` are Beken's partition table (see NOTICE) |
+| `project/main/` | the application: `app_main.c` (Wi-Fi, webhook, TCP channel, HTTP server, camera, OTA, raw audio engine, commands), `night.c`, `pir.c`, `power.c`, `rtsp.c` (H.264 + audio tracks), `audio_voc.c` (SDK voice engine with AEC), `talk.c`, `sdcard.c`; `vendor_flash*.{c,h}` are Beken's partition table (see NOTICE) |
 | `project/`, `project-avdk/` | build glue and Kconfig for the bare-SDK and the AVDK (camera) flavours; both compile the same `project/main` |
 | `patches/`, `patches-avdk/`, `avdk-overlay/` | changes to bk_idk / bk_avdk, applied by the build scripts ([docs/notes/sdk-patches.md](docs/notes/sdk-patches.md)); the OV9650 driver lives in the overlay |
 | `scripts/` | `build.sh`, `build-avdk.sh`, `flash.sh`, `release.sh`, `env.example` |
-| `tools/` | host-side Python: ROM flasher (`bkwrite.py`, `bkread.py`, `bkdump.py`, `bkreboot.py`, `linkcheck.py`), serial (`shell.py`, `serial_capture.py`), LAN (`dbcmd.py`), HA (`ha_generic_camera.py`), audio and pin-mapping helpers |
+| `tools/` | host-side Python: ROM flasher (`bkwrite.py`, `bkread.py`, `bkdump.py`, `bkreboot.py`, `linkcheck.py`), serial (`shell.py`, `serial_capture.py`), LAN (`dbcmd.py`), HA (`ha_generic_camera.py`), RTSP two-way audio test client (`rtsp_backchannel.py`), audio and pin-mapping helpers |
 | `sim/` | virtual doorbell + tests |
 | `docs/homeassistant/` | HA automation, package, TTS helper, setup guide |
 | `docs/notes/` | technical notes: [flashing](docs/notes/flashing.md), [camera](docs/notes/camera.md), [gpio-irq](docs/notes/gpio-irq.md), [pir](docs/notes/pir.md), [audio](docs/notes/audio.md), [night-light](docs/notes/night-light.md), [power](docs/notes/power.md), [sdcard](docs/notes/sdcard.md), [pin-mapping](docs/notes/pin-mapping.md), [sdk-patches](docs/notes/sdk-patches.md), [bench-setup](docs/notes/bench-setup.md) |

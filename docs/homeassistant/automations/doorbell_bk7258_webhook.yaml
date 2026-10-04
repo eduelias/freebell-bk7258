@@ -50,7 +50,16 @@
             ttl: 0
             priority: high
             channel: doorbell
+            importance: high
             tag: doorbell_ring
+            # fw 0.26+: the camera stream carries the microphone (and an ONVIF backchannel for
+            # go2rtc-based talk clients); tapping the push or "Answer" opens the camera's more-info
+            # dialog in the Companion app (entityId: deep link, Android + iOS)
+            clickAction: entityId:camera.doorbell_bk7258
+            actions:
+              - action: DOORBELL_ANSWER
+                title: Answer
+                uri: entityId:camera.doorbell_bk7258
         continue_on_error: true
       # second message with the picture, so the first push is not delayed by the camera (~2-4 s)
       - action: camera.snapshot

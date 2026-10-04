@@ -6,6 +6,7 @@ set(srcs
     power.c
     rtsp.c
     talk.c
+    audio_voc.c
     sdcard.c
     )
 
