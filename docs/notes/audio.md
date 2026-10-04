@@ -140,3 +140,20 @@ backchannel RTP comes back as `$`-framed packets on its channel, parsed in `proc
 (server ports `6970 + 6*slot + 2*track`; the backchannel's server port receives). PLAY/PAUSE are
 aggregate; `RTP-Info` lists every set-up track. go2rtc numbers interleaved channels by media index
 (0-1 video, 2-3 mic, 4-5 backchannel); `tools/rtsp_backchannel.py` does the same.
+
+### Measured on the device (2026-10-04, fw 0.26.0)
+
+1 kHz tone at -12 dBFS through the backchannel, speaker gain 0x1c, mic gain 0x3f, recorded from the
+mic track (`tools/rtsp_backchannel.py --tone 1000 --seconds 3 --record x.wav --analyze 1000`):
+
+| | 1 kHz in the mic track | broadband rms |
+|---|---|---|
+| `talk aec off` | **-10.2 dBFS** (the speaker sits ~10 cm from the capsule) | -11.1 dBFS |
+| `talk aec on` | **-100.6 / -109.2 dBFS** (two runs; floor) | -37.5 / -55.2 dBFS |
+
+Attenuation at the tone: > 90 dB (floor-limited); broadband 26-44 dB. The canceller gates the
+residual, i.e. the mic goes nearly silent while the far end plays: fine for a doorbell, double-talk
+is still to be judged with a person at the door. Timing: first mic RTP packet 225-230 ms after
+PLAY, 0 lost packets in all runs; speaker path = 160 ms prefill + sender buffering. Heap 85-88 KB
+with the camera open and a session live (0.25.0: ~97 KB idle). Full log:
+[`../testplans/TESTPLAN-duplex.md`](../testplans/TESTPLAN-duplex.md).

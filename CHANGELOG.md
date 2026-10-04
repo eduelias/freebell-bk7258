@@ -26,6 +26,10 @@ Versions are the `FW_VERSION` in `project/main/app_main.c` (also in every report
   `rtsp status` gained an audio line (engine, clients, mic/backchannel counters) and per-track client
   state (`v:tcp a:tcp b:tcp`).
 - Sleep: a connected RTSP client and a running voice engine count as busy.
+- Measured: echo of a -12 dBFS 1 kHz tone in the mic track -10 dBFS with the AEC off, below the floor
+  (-100 dBFS, broadband -37..-55 dBFS) with it on; first mic packet 225 ms after PLAY; go2rtc (HA
+  2026.9.4) lists the producer as `video recvonly H264`, `audio recvonly PCMA/8000`, `audio sendonly
+  PCMA/8000`. Heap at boot 87 KB (0.25.0: 97 KB; 10 KB of new rings/buffers).
 - `tools/rtsp_backchannel.py`: stdlib RTSP client that does what go2rtc does (DESCRIBE with the
   Require header, SETUP mic + backchannel interleaved, PLAY, 20 ms G.711 frames from a tone or a WAV)
   and records the mic track with a Goertzel/rms analysis, for the echo-attenuation measurement.

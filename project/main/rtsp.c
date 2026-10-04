@@ -51,7 +51,7 @@
 #define RTSP_NDESC 32
 #define RTSP_MTU 1400                    /* RTP packet size incl. the 12-byte header */
 #define RTSP_RTP_PAYLOAD (RTSP_MTU - 12)
-#define RTSP_RX_MAX 2048                 /* one RTSP request, or one interleaved backchannel frame */
+#define RTSP_RX_MAX 1536                 /* one RTSP request, or one interleaved backchannel frame (<= 1.5 KB) */
 #define RTSP_TX_BUF 8192                 /* per-client staging buffer (TCP: ~5 packets per send) */
 #define RTSP_UDP_BASE_PORT 6970          /* server_port for UDP clients: base + 6 * slot + 2 * track */
 #define RTSP_SESSION_TIMEOUT_S 60        /* advertised; UDP sessions are dropped after it + 15 s without a request */
@@ -61,7 +61,7 @@
 #define TRK_VIDEO 0
 #define TRK_MIC 1
 #define TRK_BACK 2
-#define RTSP_ARING 4800                  /* microphone ring: 600 ms of G.711 at 8 kHz; must be a multiple of 160 */
+#define RTSP_ARING 3200                  /* microphone ring: 400 ms of G.711 at 8 kHz; must be a multiple of 160 */
 #define RTSP_BC_BUF 1500                 /* UDP backchannel datagram buffer (per client, on demand) */
 #define RTSP_VOC_RETRY_MS 500            /* retry voc_start while the raw engine (chime) is busy */
 #define ONVIF_BACKCHANNEL "www.onvif.org/ver20/backchannel"
@@ -543,7 +543,7 @@ static int send_audio(rtsp_client_t *c)
 
 	if (!t->setup || avail < VOC_FRAME_BYTES)
 		return 0;
-	if (avail > RTSP_ARING) {   /* we fell behind by more than the ring: skip to the newest 400 ms */
+	if (avail > RTSP_ARING) {   /* we fell behind by more than the ring: skip to the newest 200 ms */
 		c->aud_lost += (avail - RTSP_ARING + 1600) / VOC_FRAME_BYTES;
 		c->aud_r = s_aw - 1600;
 		avail = 1600;

@@ -36,7 +36,7 @@ extern int bk_get_env_enhance(const char *key, void *value, int value_len);
 #define VOC_PA_SETTLE_MS 50
 #define VOC_MIC_DEFAULT_GAIN 0x3f
 #define TAP_LEAD_BYTES 1600           /* the speaker tap may run 200 ms ahead of real time */
-#define MICTAP_WORDS (2048)           /* 256 ms of 32-bit words at 8 kHz */
+#define MICTAP_WORDS (1024)           /* 128 ms of 32-bit words at 8 kHz (/mic.wav drains it every 10 ms) */
 
 enum { VOC_OFF = 0, VOC_STARTING, VOC_ON, VOC_STOPPING };
 

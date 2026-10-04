@@ -1379,10 +1379,9 @@ void aud_spk_close(void)
 {
 	uint32_t i;
 
-	if (s_talk_spk_voc) {
+	if (s_talk_spk_voc) {   /* the flag stays set until the next open so aud_spk_stats() still reports the tap */
 		voc_tap_close();
 		voc_set_spk_gain(spk_gain_now());   /* back to the session's gain (vol / raw override) */
-		s_talk_spk_voc = false;
 		s_spk_busy = false;
 		return;
 	}
