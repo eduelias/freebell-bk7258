@@ -4,6 +4,18 @@ Versions are the `FW_VERSION` in `project/main/app_main.c` (also in every report
 `sys info`). Dates are 2026 unless stated; most of this was written between 2026-10-01 and
 2026-10-03.
 
+## 0.24.4
+- **microSD: the ring that wakes the device from deep sleep is saved** (2026-10-04). First real wake on
+  0.24.3: the ring job ran at ~0.5 s uptime, before the media pipeline existed, the mount failed
+  (`fail 1`) and the old "skip the card for 60 s after a failed mount" rule then dropped the next
+  events (`drop 2`). Now automatic saves are deferred until uptime 3 s, a mount/frame failure is
+  retried 3 times with 2/4/8 s backoff (jobs keep the event's tick: file name = event time, `up<N>`
+  before SNTP), a fresh event during a pending retry joins it, and the 60 s skip only follows an
+  exhausted chain. The same event twice within 2 s saves once. Every drop has a reason in `sd status`
+  (`drop N (ring: duplicate +812 ms)`), plus `defer`/`retry`/`pending` counters.
+- TCP command reply buffer 320 -> 640 bytes: `sd status` (3 lines) was cut off after line 2, the
+  `bringup:` trace never reached `dbcmd.py`.
+
 ## 0.24.3
 - **microSD power corrected** (2026-10-04): the slot is on the **camera supply (GPIO 28)**, GPIO 13 is the
   battery ADC only (0.24.2's "GPIO 13 powers the card" came from the stock SDK glue and HA snapshots

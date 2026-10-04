@@ -108,7 +108,13 @@ extern void bk_sdio_clk_gate_config(uint32_t enable);
 #define SD_WORKER_PRIO 8                /* BEKEN_APPLICATION_PRIORITY = 7; higher number = lower priority (native 9 - n) */
 #define SD_WORKER_STACK 4096
 #define SD_QUEUE_LEN 6
-#define SD_AUTOMOUNT_RETRY_MS (60 * 1000)   /* after a failed on-demand mount, auto events skip the card for this long */
+#define SD_AUTOMOUNT_RETRY_MS (60 * 1000)   /* after an automatic save gave up (all retries failed), new auto events skip the card for this long */
+#define SD_EARLY_MS 3000                /* no automatic save before this uptime: after a (wake) boot the media pipeline / camera is
+                                         * still coming up and the SDK card init fails (0.24.3, first real deep-sleep ring); defer instead */
+#define SD_RETRY_MAX 3                  /* automatic save: attempts after the first one, SD_RETRY_BASE_MS << n apart (2, 4, 8 s) */
+#define SD_RETRY_BASE_MS 2000
+#define SD_RETRY_SLOTS 3                /* deferred / retried automatic saves waiting in the worker */
+#define SD_DEDUPE_MS 2000               /* the same automatic event twice within this window saves once */
 #define SD_PWR_DEFAULT_PIN (-1)         /* none: GPIO 13 turned out to be the battery ADC only (2026-10-04), the slot is on the camera supply */
 #define SD_PWR_SETTLE_MS 500            /* card VDD ramp + card power-up after the pin goes high (the stock waited too) */
 #define SD_PWR_OFF_PULSE_MS 200         /* pin driven low before it is released: a definite "off" edge for the enable */
@@ -136,8 +142,23 @@ enum { JOB_MOUNT = 1, JOB_UMOUNT, JOB_UMOUNT_OFF, JOB_FORMAT, JOB_SAVE, JOB_AUTO
 typedef struct {
 	uint32_t id;
 	uint8_t type;
+	uint8_t retry;      /* automatic saves: failed attempts so far (0 = fresh event) */
 	char arg[16];
+	uint32_t ev_ms;     /* tick of the event itself: the file name stamp survives deferral and retries */
 } sd_job_t;
+
+/* Automatic saves that could not run yet wait here (not in the queue, so `sd save` and friends
+ * keep flowing): too early after boot, a mount/frame failure with retries left, or a fresh event
+ * that joins a pending retry. Worker-only. Result codes of sd_do_save(). */
+typedef struct {
+	sd_job_t job;
+	uint32_t due_ms;
+	bool used;
+} sd_retry_t;
+#define SD_SAVE_OK 0
+#define SD_SAVE_FAIL (-1)       /* final: counted in `fail` */
+#define SD_SAVE_TRANSIENT (-2)  /* mount or camera frame failed: worth a retry */
+#define SD_SAVE_NOCARD (-3)     /* slot empty (cd=1): nothing to retry */
 
 /* settings */
 static bool s_auto = true;
@@ -160,13 +181,19 @@ static volatile bool s_pinned;          /* `sd mount` / `sd power on`: stay powe
 static volatile bool s_sleep;           /* sd_prepare_sleep() ran: no more mounts */
 static uint32_t s_keep_until_ms;        /* worker: power the card down once this tick has passed (0 = no window) */
 static uint32_t s_sectors, s_free_mb;   /* from the last successful mount (shown while unmounted too) */
-static volatile uint32_t s_saved, s_save_fail, s_dropped;
+static volatile uint32_t s_saved, s_save_fail, s_dropped, s_deferred, s_retried;
 static uint32_t s_mounts, s_mount_fail, s_last_mount_ms, s_last_cold_save_ms;
 static char s_last_file[48];
 static char s_result[112] = "idle";
 static char s_probe[300];               /* `sd probe` output, filled by the worker, replied by the caller */
 static char s_trace[150];               /* last card bring-up: pre-condition results, init return codes, timings */
-static uint32_t s_last_mount_fail_ms;
+static char s_drop_why[40] = "-";       /* why the last automatic save was dropped (`sd status`) */
+static uint32_t s_giveup_ms;            /* tick when an automatic save exhausted its retries (0 = never): SD_AUTOMOUNT_RETRY_MS window */
+#if SD_HAVE_HOST
+static sd_retry_t s_retry[SD_RETRY_SLOTS];
+#endif
+static uint32_t s_last_ev_ms;           /* dedupe: last accepted automatic event */
+static char s_last_ev[16];
 static uint8_t *s_jpg;
 static uint32_t s_fmt_token, s_fmt_token_ms;
 
@@ -831,7 +858,6 @@ static int sd_do_mount(void)
 	if (ret != BK_OK) {
 		s_present = false;
 		s_mount_fail++;
-		s_last_mount_fail_ms = rtos_get_time() ? rtos_get_time() : 1;
 		rtos_unlock_mutex(&s_fs_mutex);
 		sd_power(0);
 		if (s_cpu_voted) {
@@ -853,7 +879,6 @@ static int sd_do_mount(void)
 		if (!nofs)
 			s_present = false;
 		s_mount_fail++;
-		s_last_mount_fail_ms = rtos_get_time() ? rtos_get_time() : 1;
 		rtos_unlock_mutex(&s_fs_mutex);
 		sd_power(0);
 		sd_set_result(nofs ? "card %u MB has no FAT filesystem (fr=%d): `sd format`" : "card %u MB: mount failed fr=%d",
@@ -944,18 +969,22 @@ static void sd_sanitize(char *out, int cap, const char *in)
 	out[n] = 0;
 }
 
-static void sd_make_name(char *out, int cap, const char *event, int suffix)
+/* Name for the event that happened at tick ev_ms: wall-clock stamp of the EVENT (not of the write,
+ * which may come seconds later after deferral/retries) when the clock is valid by then, else the
+ * uptime at the event (`up<N>-ring.jpg`, a ring that woke the device from deep sleep is handled
+ * before SNTP). */
+static void sd_make_name(char *out, int cap, const char *event, uint32_t ev_ms, int suffix)
 {
 	char stamp[24], ev[13];
-	uint32_t now = sd_time_now();
+	uint32_t now = sd_time_now(), age_s = (rtos_get_time() - ev_ms) / 1000;
 
 	sd_sanitize(ev, sizeof(ev), event);
 	if (now) {
 		int y, m, d, hh, mm, ss;
-		sd_civil(now + (uint32_t)(s_tz_min * 60), &y, &m, &d, &hh, &mm, &ss);
+		sd_civil(now - age_s + (uint32_t)(s_tz_min * 60), &y, &m, &d, &hh, &mm, &ss);
 		snprintf(stamp, sizeof(stamp), "%04d%02d%02d-%02d%02d%02d", y, m, d, hh, mm, ss);
 	} else {
-		snprintf(stamp, sizeof(stamp), "up%08u", rtos_get_time() / 1000);
+		snprintf(stamp, sizeof(stamp), "up%08u", ev_ms / 1000);
 	}
 	if (suffix)
 		snprintf(out, cap, SD_DIR "/%s-%s-%d.jpg", stamp, ev, suffix);
@@ -963,7 +992,9 @@ static void sd_make_name(char *out, int cap, const char *event, int suffix)
 		snprintf(out, cap, SD_DIR "/%s-%s.jpg", stamp, ev);
 }
 
-static int sd_do_save_inner(const char *event, bool automatic)
+/* SD_SAVE_OK / SD_SAVE_FAIL (counted here) / SD_SAVE_TRANSIENT (mount or frame: not counted, the
+ * automatic path retries) / SD_SAVE_NOCARD. */
+static int sd_do_save_inner(const char *event, uint32_t ev_ms, bool automatic)
 {
 	uint32_t t0 = rtos_get_time(), off = 0;
 	char path[72];
@@ -972,21 +1003,20 @@ static int sd_do_save_inner(const char *event, bool automatic)
 
 	if (!s_mounted) {   /* on demand: power on, pre-condition, init, mount */
 		if (automatic && (!s_auto || s_sleep))
-			return -1;
-		if (automatic && s_last_mount_fail_ms && rtos_get_time() - s_last_mount_fail_ms < SD_AUTOMOUNT_RETRY_MS) {
-			s_dropped++;   /* no/odd card: do not spend seconds on every event */
-			return -1;
+			return SD_SAVE_FAIL;
+		if (sd_cd_level()) {   /* GPIO 6 = 1: slot empty, nothing to retry */
+			s_present = false;
+			sd_set_result("no card (cd=1)");
+			return SD_SAVE_NOCARD;
 		}
-		if (sd_do_mount() != 0) {
-			s_save_fail++;
-			return -1;
-		}
+		if (sd_do_mount() != 0)
+			return SD_SAVE_TRANSIENT;
 	}
 	if (!s_jpg)
 		s_jpg = psram_malloc(SD_JPG_MAX);
 	if (!s_jpg) {
 		sd_set_result("save: no PSRAM for the frame");
-		return -1;
+		return SD_SAVE_TRANSIENT;
 	}
 #ifdef DOORBELL_AVDK
 	n = app_cam_grab(s_jpg, SD_JPG_MAX, automatic ? 3000 : 4000);
@@ -994,13 +1024,12 @@ static int sd_do_save_inner(const char *event, bool automatic)
 	n = -100;   /* bare SDK build: no camera pipeline */
 #endif
 	if (n <= 0) {
-		s_save_fail++;
 		sd_set_result("save: no camera frame (%d)", n);
-		return -1;
+		return SD_SAVE_TRANSIENT;
 	}
 	rtos_lock_mutex(&s_fs_mutex);
 	for (i = 0; i < 10; i++) {   /* two saves within one second: -1, -2, ... */
-		sd_make_name(path, sizeof(path), event, i);
+		sd_make_name(path, sizeof(path), event, ev_ms, i);
 		fr = f_open(&s_fil, path, FA_CREATE_NEW | FA_WRITE);
 		if (fr != FR_EXIST)
 			break;
@@ -1016,7 +1045,7 @@ static int sd_do_save_inner(const char *event, bool automatic)
 		} else {
 			sd_set_result("save: open %s failed fr=%d", path, fr);
 		}
-		return -1;
+		return SD_SAVE_FAIL;
 	}
 	while (off < (uint32_t)n) {
 		UINT chunk = (uint32_t)n - off > 16384 ? 16384 : (uint32_t)n - off, bw = 0;
@@ -1033,24 +1062,25 @@ static int sd_do_save_inner(const char *event, bool automatic)
 			sd_drop_card();
 		rtos_unlock_mutex(&s_fs_mutex);
 		sd_set_result("save: write failed fr=%d after %u/%d bytes%s", fr, off, n, s_mounted ? " (card full?)" : ", card dropped");
-		return -1;
+		return SD_SAVE_FAIL;
 	}
 	sd_update_free_locked();
 	rtos_unlock_mutex(&s_fs_mutex);
 	s_saved++;
 	os_strlcpy(s_last_file, path + sizeof(SD_DIR), sizeof(s_last_file));   /* skip "1:/doorbell/" */
-	sd_set_result("saved %s (%d B, %u ms, %u MB free)", s_last_file, n, rtos_get_time() - t0, s_free_mb);
-	return 0;
+	sd_set_result("saved %s (%d B, %u ms, event +%u s, %u MB free)", s_last_file, n, rtos_get_time() - t0,
+		      (rtos_get_time() - ev_ms) / 1000, s_free_mb);
+	return SD_SAVE_OK;
 }
 
 /* The 200 KB PSRAM frame buffer lives only for the duration of one save: holding it (0.24.0/1 did)
  * starved cam_http_client_task's own psram_malloc(CAM_BUF_MAX) and every HTTP request on :8080
  * died with an empty reply after the first card write (found 2026-10-04 with the first real card). */
-static int sd_do_save(const char *event, bool automatic)
+static int sd_do_save(const char *event, uint32_t ev_ms, bool automatic)
 {
 	uint32_t t0 = rtos_get_time();
 	bool cold = !s_mounted;
-	int r = sd_do_save_inner(event, automatic);
+	int r = sd_do_save_inner(event, ev_ms, automatic);
 
 	if (s_jpg) {
 		psram_free(s_jpg);
@@ -1058,12 +1088,146 @@ static int sd_do_save(const char *event, bool automatic)
 	}
 	if (s_mounted)
 		s_keep_until_ms = rtos_get_time() + s_keep_s * 1000;   /* bursts share one mount */
-	if (cold && r == 0)
+	if (cold && r == SD_SAVE_OK)
 		s_last_cold_save_ms = rtos_get_time() - t0;
 	return r;
 }
 
-/* `sd ls [DIR] [SKIP]`: runs in the caller (TCP/UART task), bounded by the 320-byte reply buffer */
+/* ---- automatic saves: deferral, retries, dedupe (worker task) ---- */
+
+static void sd_drop(const sd_job_t *j, const char *why)
+{
+	s_dropped++;
+	snprintf(s_drop_why, sizeof(s_drop_why), "%s: %s", j->arg, why);
+	sd_set_result("drop %s", s_drop_why);
+}
+
+static bool sd_retry_pending(void)
+{
+	int i;
+
+	for (i = 0; i < SD_RETRY_SLOTS; i++)
+		if (s_retry[i].used)
+			return true;
+	return false;
+}
+
+/* latest due tick among the pending entries (callers check sd_retry_pending() first) */
+static uint32_t sd_retry_latest_due(void)
+{
+	uint32_t due = 0;
+	int i, have = 0;
+
+	for (i = 0; i < SD_RETRY_SLOTS; i++)
+		if (s_retry[i].used && (!have || (int32_t)(s_retry[i].due_ms - due) > 0)) {
+			due = s_retry[i].due_ms;
+			have = 1;
+		}
+	return due;
+}
+
+/* Park an automatic save until `due`. `failed` = this attempt failed (counts towards SD_RETRY_MAX),
+ * otherwise the job is only deferred (too early / joins a pending retry). */
+static void sd_defer(const sd_job_t *j, uint32_t due, bool failed, const char *why)
+{
+	int i;
+
+	for (i = 0; i < SD_RETRY_SLOTS; i++)
+		if (!s_retry[i].used)
+			break;
+	if (i == SD_RETRY_SLOTS) {
+		sd_drop(j, "retry slots full");
+		return;
+	}
+	s_retry[i].job = *j;
+	s_retry[i].job.retry = failed ? j->retry + 1 : j->retry;
+	s_retry[i].due_ms = due ? due : 1;
+	s_retry[i].used = true;
+	if (failed)
+		s_retried++;
+	else
+		s_deferred++;
+	os_printf("[sd] %s %s: %s, again in %u ms (attempt %u)\r\n", failed ? "retry" : "defer", j->arg, why,
+		  (uint32_t)(due - rtos_get_time()), s_retry[i].job.retry + 1);
+}
+
+/* the earliest due entry, if its time has come */
+static bool sd_retry_pop(uint32_t now, sd_job_t *out)
+{
+	int i, best = -1;
+
+	for (i = 0; i < SD_RETRY_SLOTS; i++)
+		if (s_retry[i].used && (best < 0 || (int32_t)(s_retry[i].due_ms - s_retry[best].due_ms) < 0))
+			best = i;
+	if (best < 0 || (int32_t)(now - s_retry[best].due_ms) < 0)
+		return false;
+	*out = s_retry[best].job;
+	s_retry[best].used = false;
+	return true;
+}
+
+/* ms until the earliest pending entry is due (cap = nothing pending or later than cap) */
+static uint32_t sd_retry_wait_ms(uint32_t now, uint32_t cap)
+{
+	int i;
+
+	for (i = 0; i < SD_RETRY_SLOTS; i++)
+		if (s_retry[i].used) {
+			int32_t d = (int32_t)(s_retry[i].due_ms - now);
+			if (d <= 0)
+				return 0;
+			if ((uint32_t)d < cap)
+				cap = (uint32_t)d;
+		}
+	return cap;
+}
+
+/* One automatic save (ring/motion). Never before SD_EARLY_MS of uptime (the ring that woke the
+ * device from deep sleep arrives at ~0.5 s, before the media pipeline exists); a mount or frame
+ * failure is retried SD_RETRY_MAX times with 2/4/8 s backoff instead of being dropped; a fresh
+ * event during a pending retry joins it (shares the mount) rather than being dropped; only after a
+ * chain has given up do fresh events skip the card for SD_AUTOMOUNT_RETRY_MS (one drop each, with
+ * the reason in `sd status`). */
+static void sd_autosave(const sd_job_t *j)
+{
+	uint32_t now = rtos_get_time();
+	int r;
+
+	if (s_sleep) {
+		sd_drop(j, "sleeping");
+		return;
+	}
+	if (now < SD_EARLY_MS) {
+		sd_defer(j, SD_EARLY_MS, false, "boot, media not ready");
+		return;
+	}
+	if (j->retry == 0 && !s_mounted && sd_retry_pending()) {
+		sd_defer(j, sd_retry_latest_due(), false, "joins the pending retry");
+		return;
+	}
+	if (j->retry == 0 && !s_mounted && s_giveup_ms && now - s_giveup_ms < SD_AUTOMOUNT_RETRY_MS) {
+		char why[32];
+		snprintf(why, sizeof(why), "gave up %us ago", (now - s_giveup_ms) / 1000);
+		sd_drop(j, why);
+		return;
+	}
+	r = sd_do_save(j->arg, j->ev_ms, true);
+	if (r == SD_SAVE_NOCARD) {
+		sd_drop(j, "no card (cd=1)");
+	} else if (r == SD_SAVE_TRANSIENT) {
+		if (j->retry < SD_RETRY_MAX) {
+			sd_defer(j, rtos_get_time() + (SD_RETRY_BASE_MS << j->retry), true, s_result);
+		} else {
+			char last[64];
+			os_strlcpy(last, s_result, sizeof(last));
+			s_save_fail++;
+			s_giveup_ms = rtos_get_time() ? rtos_get_time() : 1;
+			sd_set_result("save %s failed after %u attempts (%s)", j->arg, j->retry + 1, last);
+		}
+	}
+}
+
+/* `sd ls [DIR] [SKIP]`: runs in the caller (TCP/UART task), bounded by the 640-byte reply buffer */
 static void sd_cmd_ls(const char *dir, uint32_t skip)
 {
 	static FILINFO fno;   /* 280 bytes with LFN: keep it off the 4 KB command task stack */
@@ -1116,6 +1280,7 @@ static uint32_t sd_submit(int type, const char *arg, uint32_t timeout_ms)
 		return 0;
 	os_memset(&j, 0, sizeof(j));
 	j.type = (uint8_t)type;
+	j.ev_ms = rtos_get_time();
 	if (arg)
 		os_strlcpy(j.arg, arg, sizeof(j.arg));
 	j.id = ++s_job_seq;
@@ -1123,6 +1288,7 @@ static uint32_t sd_submit(int type, const char *arg, uint32_t timeout_ms)
 		j.id = ++s_job_seq;
 	if (rtos_push_to_queue(&s_queue, &j, timeout_ms) != BK_OK) {
 		s_dropped++;
+		snprintf(s_drop_why, sizeof(s_drop_why), "%s: queue full", j.arg[0] ? j.arg : "job");
 		return 0;
 	}
 	return j.id;
@@ -1150,8 +1316,13 @@ static void sd_run_job(const sd_job_t *j)
 	case JOB_UMOUNT: sd_do_umount(false); break;
 	case JOB_UMOUNT_OFF: sd_do_umount(true); break;
 	case JOB_FORMAT: sd_do_format(); break;
-	case JOB_SAVE: sd_do_save(j->arg, false); break;
-	case JOB_AUTOSAVE: sd_do_save(j->arg, true); break;
+	case JOB_SAVE: {
+		int r = sd_do_save(j->arg, j->ev_ms, false);
+		if (r == SD_SAVE_TRANSIENT || r == SD_SAVE_NOCARD)   /* SD_SAVE_FAIL is counted inside */
+			s_save_fail++;
+		break;
+	}
+	case JOB_AUTOSAVE: sd_autosave(j); break;
 #endif
 	case JOB_NTP: sd_ntp_sync(); break;
 	case JOB_PROBE: sd_do_probe(j->arg); break;
@@ -1186,7 +1357,17 @@ static void sd_worker(beken_thread_arg_t arg)
 	sd_job_t j;
 
 	while (1) {
-		if (rtos_pop_from_queue(&s_queue, &j, 1000) == BK_OK) {
+		uint32_t wait = 1000;
+
+		now = rtos_get_time();
+#if SD_HAVE_HOST
+		if (sd_retry_pop(now, &j)) {   /* a deferred/retried automatic save whose time has come (its id was reported done at the first run) */
+			sd_run_job(&j);
+			continue;
+		}
+		wait = sd_retry_wait_ms(now, wait);
+#endif
+		if (rtos_pop_from_queue(&s_queue, &j, wait) == BK_OK) {
 			sd_run_job(&j);
 			s_job_done_id = j.id;
 			continue;
@@ -1270,10 +1451,22 @@ void sd_prepare_sleep(void)
 		sd_power(0);
 }
 
+/* Reporter task (never an ISR). The same event twice within SD_DEDUPE_MS (a bounce past the ISR
+ * debounce, `ring test` twice) saves once; the second is a counted drop with its reason. */
 void sd_on_event(const char *event)
 {
+	uint32_t now = rtos_get_time();
+
 	if (!s_auto || !s_queue)
 		return;
+	if (s_last_ev_ms && now - s_last_ev_ms < SD_DEDUPE_MS && os_strcmp(event, s_last_ev) == 0) {
+		s_dropped++;
+		snprintf(s_drop_why, sizeof(s_drop_why), "%s: duplicate +%u ms", event, now - s_last_ev_ms);
+		os_printf("[sd] drop %s\r\n", s_drop_why);
+		return;
+	}
+	s_last_ev_ms = now ? now : 1;
+	os_strlcpy(s_last_ev, event, sizeof(s_last_ev));
 	sd_submit(JOB_AUTOSAVE, event, 0);
 }
 
@@ -1297,14 +1490,22 @@ static void sd_cmd_status(void)
 #else
 	int cam = -1;
 #endif
-	app_reply("[sd] %scard %s (cd=%d) cam %d vote %d pin %s%s %s%s | last mount %u MB, %u MB free, %u ms (%u ok %u fail) cold save %u ms | "
-		  "saved %u fail %u drop %u last %s\r\n",
-		  SD_HAVE_HOST ? "" : "NO-HOST-BUILD ", cd ? "out" : "in", cd, cam, s_cpu_voted ? 1 : 0,
-		  s_pwr_pin < 0 ? "none" : (s_pwr_on ? "on" : "off"),
-		  (s_pwr_pin >= 0 && !s_pwr_on && sd_adc_pin_blocked(s_pwr_pin)) ? " (adc settling)" : "",
-		  s_mounted ? "mounted" : (s_present ? "present" : "unmounted"), keep,
-		  s_sectors / 2048, s_free_mb, s_last_mount_ms, s_mounts, s_mount_fail, s_last_cold_save_ms,
-		  s_saved, s_save_fail, s_dropped, s_last_file[0] ? s_last_file : "-");
+	{
+		int pend = 0;
+#if SD_HAVE_HOST
+		int i;
+		for (i = 0; i < SD_RETRY_SLOTS; i++)
+			pend += s_retry[i].used ? 1 : 0;
+#endif
+		app_reply("[sd] %scard %s (cd=%d) cam %d vote %d pin %s%s %s%s | mount %u MB, %u MB free, %u ms (%u ok %u fail) cold %u ms | "
+			  "saved %u fail %u drop %u (%s) defer %u retry %u pending %d last %s\r\n",
+			  SD_HAVE_HOST ? "" : "NO-HOST-BUILD ", cd ? "out" : "in", cd, cam, s_cpu_voted ? 1 : 0,
+			  s_pwr_pin < 0 ? "none" : (s_pwr_on ? "on" : "off"),
+			  (s_pwr_pin >= 0 && !s_pwr_on && sd_adc_pin_blocked(s_pwr_pin)) ? " (adc settling)" : "",
+			  s_mounted ? "mounted" : (s_present ? "present" : "unmounted"), keep,
+			  s_sectors / 2048, s_free_mb, s_last_mount_ms, s_mounts, s_mount_fail, s_last_cold_save_ms,
+			  s_saved, s_save_fail, s_dropped, s_drop_why, s_deferred, s_retried, pend, s_last_file[0] ? s_last_file : "-");
+	}
 	app_reply("[sd] auto %s keep %u s pwr %d pre %u,%u pins %u/%u/%u time %s (%s, ntp %u/%u %s tz %d)%s%s: %s\r\n",
 		  s_auto ? "on" : "off", s_keep_s, s_pwr_pin, s_pre_flags, s_pre_gap_ms, p[0], p[1], p[2], ts, s_time_src, s_ntp_ok,
 		  s_ntp_tries, s_ntp_host, s_tz_min, s_busy ? " BUSY" : "", s_sleep ? " SLEEP" : "", s_result);

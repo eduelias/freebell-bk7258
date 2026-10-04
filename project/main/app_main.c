@@ -51,7 +51,7 @@
 
 #define FW_NAME "doorbell-bk7258-fw"
 /* ---- reply buffer: command output for the TCP channel (UART still gets everything) ---- */
-static char s_reply[320];
+static char s_reply[640];   /* one command's REPLY() text; `sd status` is three lines (0.24.4: 320 cut the trace off) */
 static bool s_reply_on;
 #define REPLY(...) do { os_printf(__VA_ARGS__); if (s_reply_on) { size_t _l = os_strlen(s_reply); \
 	if (_l < sizeof(s_reply) - 1) snprintf(s_reply + _l, sizeof(s_reply) - _l, __VA_ARGS__); } } while (0)
@@ -68,7 +68,7 @@ void db_reply(const char *fmt, ...)
 	REPLY("%s", buf);
 }
 
-#define FW_VERSION "0.24.3"
+#define FW_VERSION "0.24.4"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -393,7 +393,7 @@ static void kv_set_str(const char *key, const char *val)
 /* REPLY() for modules outside this file (talk.c, sdcard.c) */
 void app_reply(const char *fmt, ...)
 {
-	char tmp[256];
+	char tmp[320];
 	va_list ap;
 
 	va_start(ap, fmt);

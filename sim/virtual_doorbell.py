@@ -67,7 +67,7 @@ HEARTBEAT_MS = 5 * 60 * 1000
 RING_DEBOUNCE_MS = 800
 RING_REPORT_MS = 10000
 WHITE_LIGHT_MS = 30000
-REPLY_MAX = 319                  # s_reply[320]
+REPLY_MAX = 639                  # s_reply[640]
 TCP_LINE_MAX = 191               # char line[192]
 HOOK_DEFAULT = ""   # like the firmware (v0.24.1+): no webhook target until `hook set HOST:PORT/PATH`
 

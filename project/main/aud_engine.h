@@ -35,5 +35,5 @@ bool aud_mic_busy(void);
 uint32_t aud_mic_rate(void);      /* real sample rate of the words: 2x the configured ADC rate (measured) */
 void aud_mic_stats(uint32_t *dma_frames, uint32_t *overruns);
 
-/* Command output: os_printf + the TCP command channel's REPLY buffer (320 bytes per command). */
+/* Command output: os_printf + the TCP command channel's REPLY buffer (640 bytes per command). */
 void app_reply(const char *fmt, ...);

@@ -49,8 +49,20 @@ after a power cycle), `f_mount`, `mkdir /doorbell`. The 200 KB PSRAM frame buffe
 save (holding it starved the :8080 server, 0.24.0/1). After each save the keep window restarts
 (`sd keep S`, KV `db_sd_keep`, default 30 s, min 5); when it ends the worker unmounts, deinits the
 card, releases the vote and the power pin. `sd mount` pins the card ("manual" in `sd status`) until
-`sd umount`. A failed on-demand mount makes automatic events skip the card for 60 s (counted as
-`drop`). `sd_prepare_sleep()` (called from `app_power_prepare_sleep()`) unmounts before deep sleep.
+`sd umount`.
+
+**Automatic saves (0.24.4):** a ring/motion job carries the tick of its event. The worker never
+runs one before uptime 3 s (`SD_EARLY_MS`: after a deep-sleep button wake the ring is handled at
+~0.5 s, before `media_service_init()`/the camera exist, and the SDK card init fails); such a job is
+*deferred* to 3 s. A mount or camera-frame failure is *retried* with 2/4/8 s backoff (3 retries),
+not dropped; deferred/retried jobs wait in 3 worker-side slots (not in the queue) and keep the
+event name and tick, so the file name is the event's time (`up<N>-ring.jpg` while the clock is
+unsynced, the real stamp if SNTP finished before the retry succeeded). A fresh event while a retry
+is pending joins it (one mount for both). Only when a chain has given up (`fail` +1) do fresh
+events skip the card for 60 s. Everything not saved is a counted `drop` with the reason in
+`sd status`: `duplicate +N ms` (same event within 2 s, e.g. a bounce past the ISR debounce or
+`ring test` twice), `gave up Ns ago`, `no card (cd=1)`, `sleeping`, `retry slots full`, `queue
+full`. `sd save` (manual) is unchanged: synchronous, one attempt. `sd_prepare_sleep()` (called from `app_power_prepare_sleep()`) unmounts before deep sleep.
 FAT timestamps are real thanks to SDK patch 0008; SDK patch 0009 makes the host driver's response
 wait (30 ms) outlast the 25 ms hardware timeout so the ISR queue cannot get out of step. A tiny SNTP
 client (UDP/123, needs DNS for host names) runs once the network is up.
@@ -59,7 +71,7 @@ client (UDP/123, needs DNS for host names) runs once the network is up.
 
 | Command | What it does | KV, default |
 |---|---|---|
-| `sd` / `sd status` | line 1: card in/out (`cd`), `cam` open, CPU `vote` held, power `pin` state, mounted / `manual` / `keep N s left`, last mount capacity/free/time + mount ok/fail counts, cold save time, saved/fail/drop, last file; line 2: auto, keep, pwr, pre, pins, time + source, NTP stats, BUSY/SLEEP, last worker result; line 3: `bringup:` trace of the last mount (cam/vote/pre results, init return and ms) | |
+| `sd` / `sd status` | line 1: card in/out (`cd`), `cam` open, CPU `vote` held, power `pin` state, mounted / `manual` / `keep N s left`, last mount capacity/free/time + mount ok/fail counts, cold save time, saved/fail/drop (+ last drop reason), defer/retry counts, pending retries, last file; line 2: auto, keep, pwr, pre, pins, time + source, NTP stats, BUSY/SLEEP, last worker result; line 3: `bringup:` trace of the last mount (cam/vote/pre results, init return and ms) | |
 | `sd mount` / `sd umount [keep]` | mount (see "Design") and pin the card until `sd umount`; `umount keep` leaves the power pin high | |
 | `sd save [EVENT]` | mount on demand if needed, write the latest camera JPEG as `/doorbell/<stamp>-EVENT.jpg`, restart the keep window | |
 | `sd keep S` | seconds the card stays mounted after the last save (min 5) | `db_sd_keep`, 30 |
@@ -72,6 +84,32 @@ client (UDP/123, needs DNS for host names) runs once the network is up.
 | `sd probe [cmd\|pins\|lines\|regs]` | host-level diagnostics without FatFs, run in the worker. `pins`: apply the SDIO pins and reply the AON config word / function-select nibble of CLK/CMD/DAT0, GPIO 6 (+ level) and GPIO 13 (+ level), plus the sys clock registers. `lines`: each SDIO pin as a plain input with pull-up then pull-down (1/0 = floating, 0/0 = held low = unpowered card or short, 1/1 = held high). `cmd` (default): power pin high 500 ms if set, pins, `bk_sdio_host_init` 100 kHz 1-bit, SDIO host registers, then CMD0, CMD0, CMD8 (0x1AA), CMD55, CMD1 (MMC), each with its return code (`-14594` = response timeout), response word or raw status register, `LATE` when the response arrived after the driver's wait; `regs` = init + registers only. Needs the card unmounted and the camera open (or `pin out 28 1`), otherwise the card is unpowered and every command but CMD0 times out | |
 | `sd ntp HOST` / `sd sync` | SNTP server / query now | `db_sd_ntp`, pool.ntp.org |
 | `sd tz MIN` / `sd time EPOCH` | minutes east of UTC for names and FAT timestamps (e.g. Amsterdam 120 in summer, 60 in winter) / set the clock by hand | `db_sd_tz`, 0 |
+
+## Status (2026-10-04 evening, v0.24.4)
+
+First real deep-sleep button wake on 0.24.3: wake reason, chime, HA boot/wake/ring webhooks and the HA
+ring photo all fine, but `sd status` said `saved 1 fail 1 drop 2`: the ring save failed, two entries were
+dropped, only a PIR motion at +70 s saved. Root cause: `power_init()` -> `app_power_wake_input()` sets
+`s_pend_fx`, the reporter task's first loop runs `sd_on_event("ring")` at ~0.5 s uptime, the worker
+mounts at once, but `media_service_init()` has not run yet (it follows `bk_init()` in `main()`), so the
+camera cannot open, the card has no supply (camera rail) and `bk_sd_card_init` fails -> `fail 1` and
+the old "skip the card for 60 s after a failed mount" rule; the next two automatic events inside that
+minute (PIR edges while the visitor stood there) were counted as `drop` without a reason. Fix = the
+"Automatic saves" paragraph in Design. 2 builds (111/96 s, -Werror clean), 1 OTA (back in 42 s).
+
+Tests (owner present, battery, sleep off; `tools/dbcmd.py` only):
+- Post-boot ring (`reboot`, `ring test` the instant the TCP channel answered = uptime 3-4 s; the
+  channel is never up before ~3 s so the <3 s deferral itself could only be exercised through the
+  same slot mechanism as "joins"): 4/4 saved, cold save 1854-2058 ms (mount ~1.56 s incl. camera
+  open), fail 0, drop 0, `up00000003-ring.jpg` (-1/-2 suffixes across reboots: uptime stamps collide)
+  and `20261004-164449-ring.jpg` once NTP had already synced (stamp = event time, "event +2 s").
+- Dedupe: `ring test` twice 1.3 s apart -> one save, `drop 1 (ring: duplicate +1330 ms)`. `motion test`
+  twice is already filtered by pir.c (10 s cooldown / 5.5 s warm-up after boot).
+- Induced failure (`sd umount`, `cam close`, `sd pre 16` = card unpowered like the wake): attempts at
+  T+0/+3/+8/+17 s (950 ms each, `init -14594`), a second ring at T+5 joined (`defer 1`), give-up at
+  T+18 -> `fail 1`, joined ring `drop (ring: gave up 0s ago)`, a ring at T+30 `drop (ring: gave up 11s
+  ago)`, `retry 3`. `sd pre 0 10` restored, reboot, next ring saved normally.
+- HTTP `/snapshot.jpg` 200 (0.05-0.10 s) during the keep window; heap 106.8-107.2 KB across 5 reboots.
 
 ## Status (2026-10-04, v0.24.3)
 
