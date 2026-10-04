@@ -69,7 +69,7 @@ streams of `FF`. *(`docs/img/`: add a photo of the UART header.)*
 | Camera | JPEG snapshot `http://<device-ip>:8080/snapshot.jpg`, MJPEG `/stream`, H.264 720p over RTSP `rtsp://<device-ip>:554/live` (TCP/UDP, 3 clients) |
 | Audio | half-duplex two-way audio over HTTP: `POST /speak` (raw/WAV), `/speak?url=`, `/speak?tone=`, `/mic.wav`, a `/talk` browser page |
 | Power | battery voltage/percent, USB and charging state, deep sleep with wake on button, PIR, USB, UART or RTC alarm (periodic snapshot) |
-| Storage | optional microSD: a JPEG per ring/motion with SNTP-synced names |
+| Storage | optional microSD: a JPEG per ring/motion with SNTP-synced names; mounted only around saves |
 | Updates | OTA over Wi-Fi from any HTTP URL (`ota`), cable-free `scripts/release.sh`; UART flashing via the ROM for the first time and as a last resort |
 | Control | serial shell on UART0 and the same commands over TCP 2323 with a token (`tools/dbcmd.py`) |
 | Development | `sim/`: a virtual doorbell with the same TCP/HTTP/webhook interfaces, pytest suite, CI |
@@ -161,7 +161,7 @@ flash and survive OTA.
 | `spk` | `tone [HZ] [MS]` \| `play beepa\|beepb\|bell\|ADDR LEN` \| `net HOST PORT` \| `stop` \| `pa PIN\|off` \| `cfg [chl L\|R\|LR] [mode diff\|se] [gain N] [rate HZ] [clk xtal\|apll]` | gain 0x1c, PA 46 |
 | `mic` | `level [MS] [HZ]` \| `rec MS HOST PORT` \| `cfg [mic 1\|2\|both] [mode diff\|se] [gain N] [chl L\|R\|LR] [rate HZ] [clk xtal\|apll]` | |
 | `talk` | `status` \| `gain N\|auto` \| `micgain N` \| `max S` \| `stop` | `db_talk_gain` (auto), `db_talk_micgain` (0x3f), `db_talk_max` (30) |
-| `sd` | `status` \| `mount` \| `umount [off]` \| `format [TOKEN]` \| `ls [DIR] [SKIP]` \| `save [EVENT]` \| `auto on\|off` \| `pwr PIN\|none` \| `pins 1\|0` \| `power on\|off` \| `ntp HOST` \| `tz MIN` \| `time EPOCH` \| `sync` | `db_sd_auto` (on), `db_sd_pwr` (6), `db_sd_pins` (1), `db_sd_ntp` (pool.ntp.org), `db_sd_tz` (0) |
+| `sd` | `status` \| `mount` (pins the card mounted) \| `umount [keep]` \| `format [TOKEN]` \| `ls [DIR] [SKIP]` \| `save [EVENT]` \| `auto on\|off` \| `keep S` \| `pre FLAGS [GAP_MS]` \| `pwr PIN\|none` \| `power on\|off` \| `probe [cmd\|pins\|lines\|regs]` \| `ntp HOST` \| `tz MIN` \| `time EPOCH` \| `sync` | `db_sd_auto` (on), `db_sd_keep` (30), `db_sd_pre` (0,10), `db_sd_pwr` (none), `db_sd_ntp` (pool.ntp.org), `db_sd_tz` (0) |
 | `pin` | `all` \| `mux` \| `dump` \| `get N` \| `in N [up\|down\|none]` \| `hiz N` \| `out N 0\|1` \| `raw N HEX` \| `blink N [count]` \| `watch SECONDS` (refuses 10/11) | |
 | `adc` | `adc CHANNEL` (one calibrated SARADC reading) | |
 | `mem` | `mem HEXADDR [N<=16]` (raw 32-bit reads; a bad address faults) | |
@@ -207,7 +207,7 @@ Step-by-step instructions, the sanitized YAML and the helper script:
 | GPIO | Function | Notes |
 |---|---|---|
 | 0, 1 | camera I2C1 SCL/SDA | sensor at 0x30 |
-| 2, 3, 4 | SD CLK / CMD / DAT0 | SDIO 1-bit, SDK pin group 1 |
+| 2, 3, 4 | SD CLK / CMD / DAT0 | SDIO 1-bit, SDK pin group 1; the slot is powered from the camera supply (GPIO 28), so the card is mounted with the camera open |
 | 5 | camera-related rail | cut on camera close; exact function unverified |
 | 6 | SD card detect | input with pull-up, 0 = card inserted (was wrongly listed as SD power until 0.24.1) |
 | 7 (ADC9) | regulated rail sense | reported as `mv` |
@@ -215,7 +215,7 @@ Step-by-step instructions, the sanitized YAML and the helper script:
 | 9 | sensor/LED rail enable | active high |
 | 10, 11 | UART0 | console, never touch |
 | 12 (ADC14) | light sensor | ~700 mV lit, ~2100 mV dark; higher = darker |
-| 13 (ADC15) | battery voltage | x2 divider |
+| 13 (ADC15) | battery voltage | x2 divider. Not the SD power despite the stock SDK glue driving it as `SDCARD_LDO_CTRL_GPIO` (checked 0.24.3); never driven by this firmware unless `sd pwr 13` is set |
 | 15 | charging status | from the shipped firmware; polarity unverified |
 | 19 | USB present | from the shipped firmware; polarity unverified (follows the internal pull on the bench) |
 | 24 | PIR output | rising edge, 2-4 s hold |
@@ -271,7 +271,9 @@ PIR cooldown, night-light arbiter, sleep/wake cycle, OTA version bump and KV per
 - **Battery ADC is bimodal** (about 2.5 % swing under load): calibrate `pwr ratio` against a meter.
 - **Amplifier click**: the DAC now starts on zeros before the PA; a residual click is possible and
   was not measurable on the bench.
-- **microSD writes** are implemented but were not yet exercised with a card when v0.24.0 shipped.
+- **microSD**: verified with one 32 GB card (FAT). The slot is on the camera supply and the SDK's card
+  init only works with the camera open, so every save brings the camera up first and the card is
+  mounted only around saves ([docs/notes/sdcard.md](docs/notes/sdcard.md)).
 - `/snapshot.jpg` right after an RTSP session can return the previous JPEG once.
 
 ## Contributing and credits

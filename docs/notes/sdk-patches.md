@@ -33,6 +33,14 @@ them are derivative works of Beken's Apache-2.0 code (see `NOTICE`).
   [gpio-irq.md](gpio-irq.md).
 - `0008-fatfs-weak-get-fattime.patch`: `components/fatfs/ff.c` returns a fixed 2017-05-01 for every
   FAT timestamp; the patch only adds `__attribute__((weak))` so `sdcard.c` can supply the SNTP time.
+- `0009-sdio-cmd-wait-outlasts-hw-timeout.patch`: `bk_sdio_host_wait_cmd_response()` pops the ISR's
+  completion message with a 4 ms timeout while the hardware response timeout at the 100 kHz init
+  clock is 2500 clocks = 25 ms. A response that lands between 4 and 25 ms is queued after the caller
+  has returned "timeout"; the next command then pops the stale message at once and every later wait
+  is out of step (seen 2026-10-04 after a burst of unanswered CMD8 retries: CMD0 "timing out" in
+  84 ms, stale response words). The patch raises the wait to 30 ms (one define). Normal commands are
+  unaffected (the message is already queued when the wait starts); only failing commands take 30 ms
+  instead of 4 ms per retry. Story in [sdcard.md](sdcard.md).
 
 `0005-dvp-camera-mclk-settle.patch` was only captured on 2026-10-03 (it had lived as an uncommitted change in the author's SDK tree): a 600 ms settle after MCLK starts in `bk_dvp_camera_enumerate()`, which the OV9650 needs before it answers on SCCB.
 

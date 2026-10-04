@@ -30,6 +30,7 @@
 #include <driver/aon_rtc.h>
 #include <modules/pm.h>
 #include <modules/wifi.h>
+#include "sdcard.h"   /* sd_adc_pin_blocked(): only with `sd pwr 13` set (not the default) is the ADC node driven */
 
 #define PIN_USB_PRESENT 19
 #define PIN_CHARGING    15
@@ -102,14 +103,30 @@ static bool charging(void)
 	return usb_present() && bk_gpio_get_input(PIN_CHARGING) != 0;
 }
 
+/* The battery ADC15 node is GPIO 13. With an `sd pwr 13` setting (not the default: the pin turned
+ * out not to power the card, sdcard.c) the node is driven while the card is in use and needs ~10 s
+ * to settle after release; the last valid median is returned then and `pwr status` shows "(cached)". */
+static uint32_t s_batt_last_adc;
+static bool s_batt_cached;
+
 static uint32_t batt_adc_mv(void)
 {
-	uint32_t a = db_adc_mv(s_bchan), b = db_adc_mv(s_bchan), c = db_adc_mv(s_bchan), t;
+	uint32_t a, b, c, t;
 
+	if (s_bchan == 15 && sd_adc_pin_blocked(13)) {
+		s_batt_cached = true;
+		return s_batt_last_adc;
+	}
+	a = db_adc_mv(s_bchan);
+	b = db_adc_mv(s_bchan);
+	c = db_adc_mv(s_bchan);
 	/* median of three */
 	if (a > b) { t = a; a = b; b = t; }
 	if (b > c) { t = b; b = c; c = t; }
 	if (a > b) { t = a; a = b; b = t; }
+	if (b)
+		s_batt_last_adc = b;
+	s_batt_cached = false;
 	return b;
 }
 
@@ -246,7 +263,7 @@ static void power_do_sleep(const char *why)
 	os_printf("[pwr] sleeping (%s): wake on button%s%s, rtc in %u min, batt %u mV\r\n", why,
 		  s_wake_pir ? " + pir" : "", ", usb plug, uart rx", minutes, power_batt_mv());
 
-	/* 1. peripherals off: amp, LEDs, camera, sensor rails (app side), then Wi-Fi */
+	/* 1. peripherals off: amp, microSD (sd_prepare_sleep), LEDs, camera, sensor rails (app side), then Wi-Fi */
 	app_power_prepare_sleep();
 	bk_wifi_sta_stop();
 	rtos_delay_milliseconds(500);
@@ -409,9 +426,9 @@ static void pwr_status(void)
 	bool chg = charging();
 	uint32_t hold = now < POWER_BOOT_HOLD_MS ? (POWER_BOOT_HOLD_MS - now) / 1000 : 0;
 
-	db_reply("[pwr] batt %u mV %u%% (adc%u %u mV x%u.%02u) usb %d chg %d | sleep %s force %s idle %u s wake_pir %s snap_min %u"
+	db_reply("[pwr] batt %u mV %u%% (adc%u %u mV x%u.%02u)%s usb %d chg %d | sleep %s force %s idle %u s wake_pir %s snap_min %u"
 		 " | up %u s hold %u s idle %u s busy %d%s%s%s | boot %s%s%s\r\n",
-		 mv, batt_pct(mv, chg), s_bchan, adc, s_bratio / 100, s_bratio % 100, usb_present(), chg,
+		 mv, batt_pct(mv, chg), s_bchan, adc, s_bratio / 100, s_bratio % 100, s_batt_cached ? " (cached: sd power)" : "", usb_present(), chg,
 		 s_sleep_en ? "on" : "off", s_force ? "on" : "off", s_idle_s, s_wake_pir ? "on" : "off", s_snap_min,
 		 now / 1000, hold, (now - s_last_activity_ms) / 1000, app_power_busy(),
 		 s_inhibit ? " INHIBITED " : "", s_inhibit ? s_inhibit_why : "",

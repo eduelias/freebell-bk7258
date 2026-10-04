@@ -7,13 +7,29 @@
  *   GPIO_DEFAULT_DEV_CONFIG in middleware/soc/bk7258/soc/gpio_map.h; the stock ran the same SDK
  *   drivers: its strings contain bk_sd_card_init / sdio_host / mount on sdcard).
  *   GPIO 6 = card detect (stock firmware: input with pull-up, 0 = card present; verified on the
- *   board 2026-10-04). Never driven. Card power: none by default; `sd pwr 13` drives GPIO 13 the
- *   way the stock's bk_gpio_ctrl_external_ldo(GPIO_CTRL_LDO_MODULE_SDIO, GPIO_13, HIGH) did
- *   (GPIO 13 is also the battery ADC15 input: app_main.c skips that read while we hold the pin).
+ *   board 2026-10-04). Never driven. Card power: the slot hangs off the CAMERA supply (GPIO 28 rail,
+ *   verified 2026-10-04: bus lines clamped low and no CMD8 answer while GPIO 28 is low, answers with
+ *   it high, whatever GPIO 13 does). GPIO 13 is the battery ADC15 node only: the stock SDK glue drove
+ *   it as "SD LDO enable" and 0.24.2 copied that, but it has no effect on the card. `sd pwr PIN`
+ *   remains for other boards (default none); when set, power.c caches the battery read while the pin
+ *   is driven and for SD_ADC_SETTLE_MS after.
+ *   Second dependency: the SDK's bk_sd_card_init() only completes while the media pipeline is up
+ *   (camera open: CPU at full clock + VIDP domain; with it down the 100 kHz probe commands work but
+ *   the init times out, -14594). So a mount opens the camera (JPEG) first, which the save needs
+ *   anyway, and votes PM_DEV_ID_SDIO -> 320 MHz for the duration.
  * Software: SDK sd_card driver (CONFIG_SDCARD, CONFIG_SDIO_HOST) + FatFs (CONFIG_FATFS,
  *   volume "1:" = DISK_NUMBER_SDIO_SD in components/fatfs/disk_io.c). CONFIG_SDCARD_POWER_GPIO_CTRL
  *   is turned OFF in the project config: with it the SDK would drive GPIO 13 (SDCARD_LDO_CTRL_GPIO)
  *   and power the card down from a timer after 10 s idle.
+ *
+ * Power policy (0.24.3): nothing is mounted while idle. A ring/motion event or `sd save` opens the
+ *   camera, votes the CPU clock, pre-conditions the bus (host at 100 kHz, CMD0 x2, CMD8: a silent
+ *   card fails fast instead of the SDK's 128 blind CMD8 retries), inits, mounts, saves, then keeps
+ *   the card mounted for `sd keep S` (default 30 s) after the last save so bursts share one mount;
+ *   then umount, card deinit, vote released, power pin (if any) released. `sd mount` pins it
+ *   ("manual") until `sd umount`. power.c calls sd_prepare_sleep() before deep sleep. The camera's
+ *   own lifetime is not touched: when it closes while the card is mounted the card loses its supply,
+ *   the next write fails and the card is dropped; the next event mounts again.
  *
  * Threads: one low-priority worker owns every card operation (mount/umount/format/save/NTP).
  *   The ring/motion paths only push a job into its queue (never block). `sd ls` and `sd status`
@@ -39,6 +55,7 @@ typedef int sdcard_translation_unit_is_never_empty_t;
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
 #include "lwip/netdb.h"
+#include <modules/pm.h>   /* bk_pm_module_vote_cpu_freq(): the SDK card init only works at full CPU clock */
 
 #if (CONFIG_SDCARD && CONFIG_FATFS)
 #define SD_HAVE_HOST 1
@@ -76,7 +93,9 @@ extern void bk_sdio_clk_gate_config(uint32_t enable);
 #define SD_CD_PIN 6                   /* card detect, input with pull-up, 0 = card present */
 
 #define KV_SD_AUTO "db_sd_auto"   /* "1" (default) / "0": save a JPEG on ring and motion */
-#define KV_SD_PWR  "db_sd_pwr"    /* card power GPIO, default "none"; a stored 6 (pre-0.24.2) is migrated to none */
+#define KV_SD_PWR  "db_sd_pwr"    /* card power GPIO, default 13; "none" = no pin; a stored 6 (pre-0.24.2) is migrated to 13 */
+#define KV_SD_KEEP "db_sd_keep"   /* seconds the card stays powered + mounted after the last save, default 30, min 5 */
+#define KV_SD_PRE  "db_sd_pre"    /* "FLAGS,GAP_MS": pre-conditioning before bk_sd_card_init (SD_PRE_*), default "3,1000" */
 /* KV "db_sd_pins" (<= 0.24.1, SDIO pin group) is gone: GPIO 14/15/16 would double-map the SDIO functions
  * and GPIO 15 is the USB-present input (power.c). The slot is on GPIO 2/3/4, proven 2026-10-04. */
 #define KV_SD_NTP  "db_sd_ntp"    /* SNTP server, default pool.ntp.org */
@@ -89,9 +108,22 @@ extern void bk_sdio_clk_gate_config(uint32_t enable);
 #define SD_WORKER_PRIO 8                /* BEKEN_APPLICATION_PRIORITY = 7; higher number = lower priority (native 9 - n) */
 #define SD_WORKER_STACK 4096
 #define SD_QUEUE_LEN 6
-#define SD_BOOT_MOUNT_DELAY_MS 8000     /* let Wi-Fi/camera init first */
-#define SD_AUTOMOUNT_RETRY_MS (60 * 1000)
-#define SD_REDETECT_MS (10 * 60 * 1000) /* card inserted later: probe again every 10 min while auto is on */
+#define SD_AUTOMOUNT_RETRY_MS (60 * 1000)   /* after a failed on-demand mount, auto events skip the card for this long */
+#define SD_PWR_DEFAULT_PIN (-1)         /* none: GPIO 13 turned out to be the battery ADC only (2026-10-04), the slot is on the camera supply */
+#define SD_PWR_SETTLE_MS 500            /* card VDD ramp + card power-up after the pin goes high (the stock waited too) */
+#define SD_PWR_OFF_PULSE_MS 200         /* pin driven low before it is released: a definite "off" edge for the enable */
+#define SD_PWR_CYCLE_MS 100             /* off time inside a mount retry */
+#define SD_ADC_SETTLE_MS 10000          /* battery ADC15 node recovery after GPIO 13 is released (measured ~10 s) */
+#define SD_PRE_CMD55 1                  /* pre-condition also sends CMD55 (what `sd probe` does) */
+#define SD_PRE_CMD1  2                  /* ... and CMD1 (MMC op cond: times out on an SD card, what `sd probe` does) */
+#define SD_PRE_SKIP  4                  /* no pre-conditioning at all (bare bk_sd_card_init) */
+#define SD_PRE_CYCLE 8                  /* power cycle before the first attempt */
+#define SD_PRE_NOCAM 16                 /* do not open the camera first (test: the card is on the camera supply) */
+#define SD_PRE_NOVOTE 32                /* do not vote the CPU to 320 MHz first (test) */
+#define SD_PRE_DEFAULT_FLAGS 0          /* CMD0 x2 + CMD8 only, camera opened, CPU voted */
+#define SD_PRE_DEFAULT_GAP_MS 10        /* host deinit -> bk_sd_card_init gap */
+#define SD_KEEP_DEFAULT_S 30
+#define SD_KEEP_MIN_S 5
 #define SD_NTP_FIRST_MS 15000
 #define SD_NTP_RETRY_MS (60 * 1000)
 #define SD_NTP_RESYNC_MS (6 * 3600 * 1000)
@@ -109,8 +141,12 @@ typedef struct {
 
 /* settings */
 static bool s_auto = true;
-static int s_pwr_pin = -1;              /* -1 = none */
+static int s_pwr_pin = SD_PWR_DEFAULT_PIN;   /* -1 = none */
 static volatile bool s_pwr_on;          /* power pin currently driven high */
+static volatile uint32_t s_pwr_release_ms;   /* tick when the pin was last released (ADC settle), 0 = never driven */
+static uint32_t s_keep_s = SD_KEEP_DEFAULT_S;
+static uint32_t s_pre_flags = SD_PRE_DEFAULT_FLAGS, s_pre_gap_ms = SD_PRE_DEFAULT_GAP_MS;
+static bool s_cpu_voted;                /* PM_DEV_ID_SDIO vote held while the card is in use */
 static char s_ntp_host[40] = "pool.ntp.org";
 static int s_tz_min;
 
@@ -120,12 +156,17 @@ static beken_thread_t s_thread;
 static beken_mutex_t s_fs_mutex;
 static volatile uint32_t s_job_seq, s_job_done_id;
 static volatile bool s_present, s_mounted, s_busy;
-static uint32_t s_sectors, s_free_mb;
+static volatile bool s_pinned;          /* `sd mount` / `sd power on`: stay powered + mounted until `sd umount` */
+static volatile bool s_sleep;           /* sd_prepare_sleep() ran: no more mounts */
+static uint32_t s_keep_until_ms;        /* worker: power the card down once this tick has passed (0 = no window) */
+static uint32_t s_sectors, s_free_mb;   /* from the last successful mount (shown while unmounted too) */
 static volatile uint32_t s_saved, s_save_fail, s_dropped;
+static uint32_t s_mounts, s_mount_fail, s_last_mount_ms, s_last_cold_save_ms;
 static char s_last_file[48];
 static char s_result[112] = "idle";
 static char s_probe[300];               /* `sd probe` output, filled by the worker, replied by the caller */
-static uint32_t s_last_automount_ms;
+static char s_trace[150];               /* last card bring-up: pre-condition results, init return codes, timings */
+static uint32_t s_last_mount_fail_ms;
 static uint8_t *s_jpg;
 static uint32_t s_fmt_token, s_fmt_token_ms;
 
@@ -297,10 +338,28 @@ static FIL s_fil;
 
 /* ---- pins and power (plain GPIO: compiled in every build) ---- */
 
-/* Exactly what the SDK's bk_gpio_ctrl_external_ldo(GPIO_CTRL_LDO_MODULE_SDIO, pin, HIGH/LOW)
- * does (middleware/driver/gpio/gpio_driver_base.c): release the pin from any peripheral, no
- * pull, no interrupt, drive strength 0, input off, output on, level. The pin stays driven until
- * `sd umount off` / `sd power off`. */
+/* Drive the power pin like the SDK's bk_gpio_ctrl_external_ldo(GPIO_CTRL_LDO_MODULE_SDIO, pin, level)
+ * (middleware/driver/gpio/gpio_driver_base.c): release the pin from any peripheral, no pull, no
+ * interrupt, drive strength 0, input off, output on, level. */
+static void sd_pin_drive(gpio_id_t p, int high)
+{
+	gpio_dev_unmap(p);
+	bk_gpio_disable_output(p);
+	bk_gpio_disable_input(p);
+	bk_gpio_disable_pull(p);
+	bk_gpio_disable_interrupt(p);
+	bk_gpio_set_capacity(p, 0);
+	bk_gpio_enable_output(p);
+	if (high)
+		bk_gpio_set_output_high(p);
+	else
+		bk_gpio_set_output_low(p);
+}
+
+/* on: pin high (the caller waits SD_PWR_SETTLE_MS). off: pin low for SD_PWR_OFF_PULSE_MS, then released
+ * to hi-Z (no output, no input, no pull) = the boot state in which the pin is just the battery ADC15
+ * node; s_pwr_release_ms starts the SD_ADC_SETTLE_MS blackout for battery reads. Blocks up to 200 ms:
+ * worker or command task only. */
 static void sd_power(int on)
 {
 	gpio_id_t p;
@@ -308,19 +367,35 @@ static void sd_power(int on)
 	if (s_pwr_pin < 0)
 		return;
 	p = (gpio_id_t)s_pwr_pin;
+	if (on) {
+		sd_pin_drive(p, 1);
+		s_pwr_on = true;
+		return;
+	}
+	if (s_pwr_on) {
+		sd_pin_drive(p, 0);
+		rtos_delay_milliseconds(SD_PWR_OFF_PULSE_MS);
+	}
 	gpio_dev_unmap(p);
 	bk_gpio_disable_output(p);
 	bk_gpio_disable_input(p);
 	bk_gpio_disable_pull(p);
-	bk_gpio_disable_interrupt(p);
-	bk_gpio_set_capacity(p, 0);
-	bk_gpio_disable_input(p);
-	bk_gpio_enable_output(p);
-	if (on)
-		bk_gpio_set_output_high(p);
-	else
-		bk_gpio_set_output_low(p);
-	s_pwr_on = on != 0;
+	s_pwr_on = false;
+	s_pwr_release_ms = rtos_get_time() ? rtos_get_time() : 1;
+}
+
+bool sd_card_powered(void)
+{
+	return s_pwr_pin >= 0 && s_pwr_on;
+}
+
+bool sd_adc_pin_blocked(int gpio)
+{
+	if (s_pwr_pin != gpio)
+		return false;
+	if (s_pwr_on)
+		return true;
+	return s_pwr_release_ms && rtos_get_time() - s_pwr_release_ms < SD_ADC_SETTLE_MS;
 }
 
 /* GPIO 6: card detect. Input with pull-up, 0 = card present (stock firmware, verified). */
@@ -453,33 +528,112 @@ static void sd_probe_lines(void)
 }
 
 #if SD_HAVE_HOST
-/* one command at 100 kHz; returns the wait result, retries the wait once after 30 ms so a late
- * response (ISR message after the driver's 4 ms wait) is visible as "late" */
+/* One command on the (initialised) host. Returns the wait result; *rsp = R1/R3/R7 argument on
+ * success. Retries the wait once after 30 ms so a late response (ISR message after the driver's
+ * 4 ms wait) is visible: *late = true then. */
+static bk_err_t sd_host_cmd(uint32_t idx, uint32_t arg, int rsp_type, bool crc, uint32_t *rsp, bool *late)
+{
+	sdio_host_cmd_cfg_t c = {.cmd_index = idx, .argument = arg, .response = rsp_type, .wait_rsp_timeout = 2500, .crc_check = crc};
+	bk_err_t r;
+
+	*late = false;
+	bk_sdio_host_send_command(&c);
+	r = bk_sdio_host_wait_cmd_response(idx);
+	if (r != BK_OK) {
+		rtos_delay_milliseconds(30);
+		if (bk_sdio_host_wait_cmd_response(idx) == BK_OK) {
+			*late = true;
+			r = BK_OK;
+		}
+	}
+	*rsp = r == BK_OK ? bk_sdio_host_get_cmd_rsp_argument(SDIO_HOST_RSP0) : 0;
+	return r;
+}
+
 static int sd_probe_cmd1(int n, const char *tag, uint32_t idx, uint32_t arg, int rsp, bool crc)
 {
-	sdio_host_cmd_cfg_t c = {.cmd_index = idx, .argument = arg, .response = rsp, .wait_rsp_timeout = 2500, .crc_check = crc};
-	bk_err_t r1, r2 = BK_OK;
-	uint32_t st;
+	uint32_t r1 = 0;
+	bool late;
+	bk_err_t r = sd_host_cmd(idx, arg, rsp, crc, &r1, &late);
 
-	bk_sdio_host_send_command(&c);
-	r1 = bk_sdio_host_wait_cmd_response(idx);
-	if (r1 != BK_OK) {
-		rtos_delay_milliseconds(30);
-		r2 = bk_sdio_host_wait_cmd_response(idx);
+	if (r == BK_OK)
+		return sd_probe_add(n, " %s %s r=%08x", tag, late ? "LATE" : "ok", r1);
+	return sd_probe_add(n, " %s %d st=%06x", tag, r, SD_SDIO_REG(0x0d) & 0xffffff);
+}
+
+/* Host at 100 kHz 1-bit with a fresh driver (queue + ISR). Caller: bk_sdio_host_deinit() after. */
+static bk_err_t sd_host_bringup(void)
+{
+	sdio_host_config_t hc = {.clock_freq = SDIO_HOST_CLK_100K, .bus_width = SDIO_HOST_BUS_WIDTH_1LINE};
+	bk_err_t r;
+
+	bk_sdio_host_driver_deinit();
+	bk_sdio_host_driver_init();
+	bk_sdio_clk_gate_config(1);
+	r = bk_sdio_host_init(&hc);
+	if (r == BK_OK)
+		rtos_delay_milliseconds(30);   /* >= 74 clocks before the first command */
+	return r;
+}
+
+/* Pre-condition the card for bk_sd_card_init(): CMD0, CMD0, CMD8 (0x1AA) at 100 kHz, host deinit.
+ * Why: after a reboot the card is still powered (GPIO 13 released does not drop its VDD for a
+ * long time) and sits in transfer state; the SDK's init sends ONE CMD0 and then 128 blind CMD8
+ * retries, and a card that missed that first CMD0 (first command after the pins are re-mapped)
+ * never answers CMD8 (illegal outside idle state) -> -14594 after 0.7-3.7 s. A second CMD0 50 ms
+ * later always brought it back to idle (2026-10-04: "sd probe then sd mount" worked 3/3 while a
+ * plain mount failed 4/4 after every reboot). Returns 0 when CMD8 echoed 0x1AA (card idle, SD v2),
+ * 1 when CMD8 got no/odd answer (v1 card or still hung), <0 host failure. */
+static int sd_trace_add(int n, const char *fmt, ...)
+{
+	va_list ap;
+
+	if (n >= (int)sizeof(s_trace) - 1)
+		return n;
+	va_start(ap, fmt);
+	n += vsnprintf(s_trace + n, sizeof(s_trace) - n, fmt, ap);
+	va_end(ap);
+	return n < (int)sizeof(s_trace) ? n : (int)sizeof(s_trace) - 1;
+}
+
+static int sd_precondition(uint32_t flags, uint32_t *cmd8, int tn)
+{
+	uint32_t r55 = 0, r1 = 0;
+	bool late;
+	int r = 1;
+	bk_err_t e55 = 0, e1 = 0;
+
+	*cmd8 = 0;
+	if (sd_host_bringup() != BK_OK)
+		return -1;
+	sd_host_cmd(0, 0, SDIO_HOST_CMD_RSP_NONE, false, cmd8, &late);
+	rtos_delay_milliseconds(50);
+	sd_host_cmd(0, 0, SDIO_HOST_CMD_RSP_NONE, false, cmd8, &late);
+	rtos_delay_milliseconds(50);
+	if (sd_host_cmd(8, 0x1AA, SDIO_HOST_CMD_RSP_SHORT, true, cmd8, &late) == BK_OK && (*cmd8 & 0xfff) == 0x1AA)
+		r = 0;
+	if (flags & SD_PRE_CMD55) {
+		rtos_delay_milliseconds(10);
+		e55 = sd_host_cmd(55, 0, SDIO_HOST_CMD_RSP_SHORT, true, &r55, &late);
 	}
-	st = SD_SDIO_REG(0x0d);
-	if (r1 == BK_OK)
-		return sd_probe_add(n, " %s ok r=%08x", tag, bk_sdio_host_get_cmd_rsp_argument(SDIO_HOST_RSP0));
-	if (r2 == BK_OK)
-		return sd_probe_add(n, " %s LATE r=%08x", tag, bk_sdio_host_get_cmd_rsp_argument(SDIO_HOST_RSP0));
-	return sd_probe_add(n, " %s %d st=%06x", tag, r1, st & 0xffffff);
+	if (flags & SD_PRE_CMD1) {
+		rtos_delay_milliseconds(10);
+		e1 = sd_host_cmd(1, 0x40FF8000, SDIO_HOST_CMD_RSP_SHORT, false, &r1, &late);
+	}
+	bk_sdio_host_deinit();
+	sd_trace_add(tn, "c8=%x", *cmd8 & 0xfff);
+	if (flags & SD_PRE_CMD55)
+		sd_trace_add((int)os_strlen(s_trace), e55 == BK_OK ? " c55=%x" : " c55=to", r55);
+	if (flags & SD_PRE_CMD1)
+		sd_trace_add((int)os_strlen(s_trace), e1 == BK_OK ? " c1=%x" : " c1=to", r1);
+	return r;
 }
 
 /* CMD0 x2 (clock free-running in between), CMD8, CMD55, CMD1 (MMC); host regs; deinit. */
 static void sd_probe_cmd(bool regs_only)
 {
-	sdio_host_config_t hc = {.clock_freq = SDIO_HOST_CLK_100K, .bus_width = SDIO_HOST_BUS_WIDTH_1LINE};
 	uint32_t t0 = rtos_get_time();
+	bool was_off = s_pwr_pin >= 0 && !s_pwr_on;
 	bk_err_t r;
 	int n = 0;
 
@@ -487,20 +641,19 @@ static void sd_probe_cmd(bool regs_only)
 		snprintf(s_probe, sizeof(s_probe), "[sd] probe: card in use, `sd umount` first\r\n");
 		return;
 	}
-	if (s_pwr_pin >= 0 && !s_pwr_on) {
+	if (was_off) {
 		sd_power(1);
-		rtos_delay_milliseconds(500);
+		rtos_delay_milliseconds(SD_PWR_SETTLE_MS);
 	}
 	sd_pins_apply();
-	bk_sdio_host_driver_init();
-	bk_sdio_clk_gate_config(1);
-	r = bk_sdio_host_init(&hc);
+	r = sd_host_bringup();
 	n = sd_probe_add(n, "[sd] probe host_init %d", r);
 	if (r != BK_OK) {
 		sd_probe_add(n, "\r\n");
+		if (was_off)
+			sd_power(0);
 		return;
 	}
-	rtos_delay_milliseconds(30);
 	n = sd_probe_add(n, " regs id %08x ctl %08x cfg %08x st %06x sys %08x/%08x", SD_SDIO_REG(0), SD_SDIO_REG(2),
 			 SD_SDIO_REG(0x11), SD_SDIO_REG(0x0d) & 0xffffff, SD_SYS_CLK_DIV_MODE2, SD_SYS_DEV_CLK_EN);
 	if (!regs_only) {
@@ -517,7 +670,9 @@ static void sd_probe_cmd(bool regs_only)
 		n = sd_probe_add(n, " | st %06x", SD_SDIO_REG(0x0d) & 0xffffff);
 	}
 	bk_sdio_host_deinit();
-	sd_probe_add(n, " (%u ms)\r\n", rtos_get_time() - t0);
+	if (was_off && !s_pinned)
+		sd_power(0);   /* leave the pin as found: idle = unpowered, battery ADC usable */
+	sd_probe_add(n, " (%u ms)%s\r\n", rtos_get_time() - t0, was_off && !s_pinned ? " pwr off" : "");
 }
 #endif /* SD_HAVE_HOST */
 
@@ -573,45 +728,116 @@ static void sd_drop_card(void)
 	bk_sd_card_deinit();
 }
 
+/* power pin low SD_PWR_CYCLE_MS then high + settle (a pause without a power pin) */
+static void sd_power_cycle(void)
+{
+	if (s_pwr_pin >= 0) {
+		sd_power(0);
+		rtos_delay_milliseconds(SD_PWR_CYCLE_MS);
+		sd_power(1);
+		rtos_delay_milliseconds(SD_PWR_SETTLE_MS);
+	} else {
+		rtos_delay_milliseconds(300);
+	}
+}
+
+/* Power on (if needed), SDIO pins, pre-condition (s_pre_flags), gap, bk_sd_card_init; on failure one
+ * power cycle and a second attempt with the full pre-condition. Mutex held by the caller. The
+ * trace (`sd status`) shows what each step returned. */
+static bk_err_t sd_card_bringup(uint32_t *pre_ms)
+{
+	uint32_t cmd8, t0 = rtos_get_time(), t1;
+	bk_err_t ret = BK_FAIL;
+	int pre, attempt, tn = 0;
+
+	s_trace[0] = 0;
+	if (!(s_pre_flags & SD_PRE_NOCAM)) {
+#ifdef DOORBELL_AVDK
+		int c = app_sd_cam_ready();   /* JPEG camera open (or H.264 already running for RTSP) */
+		tn = sd_trace_add(tn, "cam%d(%u) ", c, rtos_get_time() - t0);
+#endif
+	}
+	if (!(s_pre_flags & SD_PRE_NOVOTE) && !s_cpu_voted) {
+		bk_pm_module_vote_cpu_freq(PM_DEV_ID_SDIO, PM_CPU_FRQ_320M);
+		s_cpu_voted = true;
+		tn = sd_trace_add(tn, "vote ");
+	}
+	if (s_pwr_pin >= 0 && !s_pwr_on) {
+		sd_power(1);
+		rtos_delay_milliseconds(SD_PWR_SETTLE_MS);
+		tn = sd_trace_add(tn, "pwr ");
+	}
+	if (s_pre_flags & SD_PRE_CYCLE) {
+		sd_power_cycle();
+		tn = sd_trace_add(tn, "cyc ");
+	}
+	for (attempt = 0; attempt < 2; attempt++) {
+		uint32_t flags = attempt ? (SD_PRE_CMD55 | SD_PRE_CMD1) : s_pre_flags;
+		uint32_t gap = attempt && s_pre_gap_ms < SD_PRE_DEFAULT_GAP_MS ? SD_PRE_DEFAULT_GAP_MS : s_pre_gap_ms;
+
+		sd_pins_apply();
+		pre = 0;
+		if (!(flags & SD_PRE_SKIP)) {
+			tn = sd_trace_add(tn, "pre%d ", attempt + 1);
+			pre = sd_precondition(flags, &cmd8, tn);
+			tn = (int)os_strlen(s_trace);
+			tn = sd_trace_add(tn, " r%d gap%u | ", pre, gap);
+			if (pre != 0 && attempt == 0) {   /* silent card: power cycle and look again before the slow SDK path */
+				sd_power_cycle();
+				tn = sd_trace_add(tn, "cyc ");
+				continue;
+			}
+			if (pre != 0) {
+				ret = BK_ERR_SDIO_HOST_CMD_RSP_TIMEOUT;
+				tn = sd_trace_add(tn, "silent");
+				break;
+			}
+			rtos_delay_milliseconds(gap);
+		}
+		*pre_ms = rtos_get_time() - t0;
+		t1 = rtos_get_time();
+		ret = sd_card_init_fresh();
+		tn = sd_trace_add(tn, "init %d %ums", ret, rtos_get_time() - t1);
+		if (ret == BK_OK)
+			return BK_OK;
+		os_printf("[sd] init %d after precondition %d, attempt %d\r\n", ret, pre, attempt + 1);
+		if (attempt == 0) {
+			sd_power_cycle();
+			tn = sd_trace_add(tn, " | cyc ");
+		}
+	}
+	return ret;
+}
+
 static int sd_do_mount(void)
 {
-	uint32_t t0 = rtos_get_time();
+	uint32_t t0 = rtos_get_time(), pre_ms = 0;
 	bk_err_t ret;
 	FRESULT fr;
 
 	if (s_mounted)
 		return 0;
+	if (s_sleep) {
+		sd_set_result("sleeping: no mount");
+		return -1;
+	}
 	if (sd_cd_level()) {   /* GPIO 6 = 1: slot empty, do not even clock the bus */
 		s_present = false;
 		sd_set_result("no card (cd=1)");
 		return -1;
 	}
-	if (s_pwr_pin >= 0 && !s_pwr_on) {
-		sd_power(1);
-		rtos_delay_milliseconds(500);   /* card VDD ramp + card power-up (the stock waited too) */
-	}
-	sd_pins_apply();
 	rtos_lock_mutex(&s_fs_mutex);
-	ret = sd_card_init_fresh();
-	if (ret != BK_OK) {
-		/* One retry after a real power cycle. A card left half-powered through a reboot (the power
-		 * pin floats for ~45 s) hangs and ignores CMD8 until VDD is dropped: on this board the first
-		 * mount after every boot failed that way, while pin low 2 s -> high 500 ms recovered it every
-		 * time (2026-10-04). Without a power pin the retry is just a pause. */
-		if (s_pwr_pin >= 0) {
-			sd_power(0);
-			rtos_delay_milliseconds(2000);
-			sd_power(1);
-			rtos_delay_milliseconds(500);
-			sd_pins_apply();
-		} else {
-			rtos_delay_milliseconds(300);
-		}
-		ret = sd_card_init_fresh();
-	}
+	ret = sd_card_bringup(&pre_ms);
 	if (ret != BK_OK) {
 		s_present = false;
+		s_mount_fail++;
+		s_last_mount_fail_ms = rtos_get_time() ? rtos_get_time() : 1;
 		rtos_unlock_mutex(&s_fs_mutex);
+		sd_power(0);
+		if (s_cpu_voted) {
+			bk_pm_module_vote_cpu_freq(PM_DEV_ID_SDIO, PM_CPU_FRQ_DEFAULT);
+			s_cpu_voted = false;
+		}
 		sd_set_result("no card (init %d, %u ms)", ret, rtos_get_time() - t0);
 		return -1;
 	}
@@ -626,21 +852,29 @@ static int sd_do_mount(void)
 		bk_sd_card_deinit();
 		if (!nofs)
 			s_present = false;
+		s_mount_fail++;
+		s_last_mount_fail_ms = rtos_get_time() ? rtos_get_time() : 1;
 		rtos_unlock_mutex(&s_fs_mutex);
+		sd_power(0);
 		sd_set_result(nofs ? "card %u MB has no FAT filesystem (fr=%d): `sd format`" : "card %u MB: mount failed fr=%d",
 			      mb, fr);
 		return -2;
 	}
 	s_mounted = true;
+	s_mounts++;
+	s_last_mount_ms = rtos_get_time() - t0;
 	fr = f_mkdir(SD_DIR);
 	if (fr != FR_OK && fr != FR_EXIST)
 		os_printf("[sd] mkdir %s fr=%d\r\n", SD_DIR, fr);
 	sd_update_free_locked();
 	rtos_unlock_mutex(&s_fs_mutex);
-	sd_set_result("mounted %u MB, %u MB free (%u ms)", s_sectors / 2048, s_free_mb, rtos_get_time() - t0);
+	s_keep_until_ms = rtos_get_time() + s_keep_s * 1000;
+	sd_set_result("mounted %u MB, %u MB free (%u ms, pre %u ms)", s_sectors / 2048, s_free_mb, s_last_mount_ms, pre_ms);
 	return 0;
 }
 
+/* Unmount, card + host deinit, power off (pin released). `power_off` false keeps the pin high
+ * (diagnostics: `sd umount keep`). */
 static void sd_do_umount(bool power_off)
 {
 	rtos_lock_mutex(&s_fs_mutex);
@@ -650,9 +884,15 @@ static void sd_do_umount(bool power_off)
 	s_present = false;
 	bk_sd_card_deinit();
 	rtos_unlock_mutex(&s_fs_mutex);
-	if (power_off)
+	s_keep_until_ms = 0;
+	if (power_off) {
 		sd_power(0);
-	sd_set_result(power_off ? "unmounted, power pin low" : "unmounted");
+		if (s_cpu_voted) {
+			bk_pm_module_vote_cpu_freq(PM_DEV_ID_SDIO, PM_CPU_FRQ_DEFAULT);
+			s_cpu_voted = false;
+		}
+	}
+	sd_set_result(power_off ? "unmounted, power off" : "unmounted, power kept");
 }
 
 static void sd_do_format(void)
@@ -730,16 +970,17 @@ static int sd_do_save_inner(const char *event, bool automatic)
 	FRESULT fr = FR_OK;
 	int n, i;
 
-	if (!s_mounted) {
-		if (!automatic) {
-			sd_set_result("save: not mounted (`sd mount`)");
+	if (!s_mounted) {   /* on demand: power on, pre-condition, init, mount */
+		if (automatic && (!s_auto || s_sleep))
+			return -1;
+		if (automatic && s_last_mount_fail_ms && rtos_get_time() - s_last_mount_fail_ms < SD_AUTOMOUNT_RETRY_MS) {
+			s_dropped++;   /* no/odd card: do not spend seconds on every event */
 			return -1;
 		}
-		if (!s_auto || rtos_get_time() - s_last_automount_ms < SD_AUTOMOUNT_RETRY_MS)
+		if (sd_do_mount() != 0) {
+			s_save_fail++;
 			return -1;
-		s_last_automount_ms = rtos_get_time();
-		if (sd_do_mount() != 0)
-			return -1;
+		}
 	}
 	if (!s_jpg)
 		s_jpg = psram_malloc(SD_JPG_MAX);
@@ -807,12 +1048,18 @@ static int sd_do_save_inner(const char *event, bool automatic)
  * died with an empty reply after the first card write (found 2026-10-04 with the first real card). */
 static int sd_do_save(const char *event, bool automatic)
 {
+	uint32_t t0 = rtos_get_time();
+	bool cold = !s_mounted;
 	int r = sd_do_save_inner(event, automatic);
 
 	if (s_jpg) {
 		psram_free(s_jpg);
 		s_jpg = NULL;
 	}
+	if (s_mounted)
+		s_keep_until_ms = rtos_get_time() + s_keep_s * 1000;   /* bursts share one mount */
+	if (cold && r == 0)
+		s_last_cold_save_ms = rtos_get_time() - t0;
 	return r;
 }
 
@@ -913,12 +1160,29 @@ static void sd_run_job(const sd_job_t *j)
 	s_busy = false;
 }
 
+/* keep window over (or sleep requested) and nobody pinned the card: power it down */
+static void sd_idle_check(uint32_t now)
+{
+#if SD_HAVE_HOST
+	bool in_use = s_mounted || s_present || s_pwr_on || s_cpu_voted;
+
+	if (!in_use || (s_pinned && !s_sleep))
+		return;
+	if (!s_sleep && s_keep_until_ms && (int32_t)(now - s_keep_until_ms) < 0)
+		return;
+	s_busy = true;
+	sd_do_umount(true);
+	s_busy = false;
+#else
+	(void)now;
+#endif
+}
+
 static void sd_worker(beken_thread_arg_t arg)
 {
 	uint32_t t_start = rtos_get_time(), now;
 	uint32_t last_ntp_try = t_start - SD_NTP_RETRY_MS + SD_NTP_FIRST_MS;
-	uint32_t last_redetect = t_start, last_rebase = t_start;
-	bool boot_mount_done = false;
+	uint32_t last_rebase = t_start;
 	sd_job_t j;
 
 	while (1) {
@@ -928,25 +1192,7 @@ static void sd_worker(beken_thread_arg_t arg)
 			continue;
 		}
 		now = rtos_get_time();
-#if SD_HAVE_HOST
-		if (!boot_mount_done && now - t_start > SD_BOOT_MOUNT_DELAY_MS) {
-			boot_mount_done = true;
-			last_redetect = now;
-			if (s_auto) {
-				s_busy = true;
-				sd_do_mount();
-				s_busy = false;
-			}
-		} else if (boot_mount_done && s_auto && !s_mounted && now - last_redetect > SD_REDETECT_MS) {
-			last_redetect = now;
-			s_busy = true;
-			sd_do_mount();
-			s_busy = false;
-		}
-#else
-		(void)boot_mount_done;
-		(void)last_redetect;
-#endif
+		sd_idle_check(now);
 		if (app_net_up() && now - last_ntp_try > SD_NTP_RETRY_MS
 		    && (!s_time_valid || now - s_time_sync_ms > SD_NTP_RESYNC_MS)) {
 			last_ntp_try = now;
@@ -971,11 +1217,23 @@ void sd_init(void)
 		s_auto = v[0] != '0';
 	if (kv_get(KV_SD_PWR, v, sizeof(v))) {
 		int p = os_strcmp(v, "none") == 0 ? -1 : sd_atoi(v);
-		if (p == SD_CD_PIN) {   /* < 0.24.2 default: GPIO 6 is the card-detect input, never drive it */
+		if (p == SD_CD_PIN || p == 13) {   /* 6 (< 0.24.2) is card detect, 13 (0.24.2 hand setting) is the battery ADC */
 			kv_set(KV_SD_PWR, "none");
 			p = -1;
 		}
 		s_pwr_pin = (p >= 0 && p < 56 && p != 10 && p != 11) ? p : -1;
+	}
+	if (kv_get(KV_SD_KEEP, v, sizeof(v))) {
+		int k = sd_atoi(v);
+		s_keep_s = k < SD_KEEP_MIN_S ? SD_KEEP_MIN_S : (uint32_t)k;
+	}
+	if (kv_get(KV_SD_PRE, v, sizeof(v))) {
+		char *c = strchr(v, ',');
+		s_pre_flags = (uint32_t)sd_atoi(v) & 0x3f;
+		if (c)
+			s_pre_gap_ms = (uint32_t)sd_atoi(c + 1);
+		if (s_pre_gap_ms > 5000)
+			s_pre_gap_ms = 5000;
 	}
 	sd_cd_init();
 	if (kv_get(KV_SD_NTP, v, sizeof(v)))
@@ -991,13 +1249,25 @@ void sd_init(void)
 		os_printf("[sd] worker thread failed\r\n");
 		return;
 	}
-	os_printf("[sd] %s, auto %s, pins 2/3/4, pwr %d, ntp %s, tz %d\r\n", SD_HAVE_HOST ? "sd host + fatfs" : "NO SD HOST IN THIS BUILD",
-		  s_auto ? "on" : "off", s_pwr_pin, s_ntp_host, s_tz_min);
+	os_printf("[sd] %s, auto %s, keep %u s, pins 2/3/4, pwr %d (card on the camera supply, mounted on demand), ntp %s, tz %d\r\n",
+		  SD_HAVE_HOST ? "sd host + fatfs" : "NO SD HOST IN THIS BUILD", s_auto ? "on" : "off", s_keep_s, s_pwr_pin,
+		  s_ntp_host, s_tz_min);
 }
 
-bool sd_power_pin_driven(int gpio)
+/* power.c, before deep sleep (power task context): unmount + power off through the worker so no
+ * FatFs call is cut mid-way; waits up to 4 s, then releases the pin regardless. */
+void sd_prepare_sleep(void)
 {
-	return s_pwr_pin == gpio && s_pwr_on;
+	uint32_t id;
+
+	s_sleep = true;
+	if (s_queue && (s_mounted || s_present || s_pwr_on)) {
+		id = sd_submit(JOB_UMOUNT_OFF, NULL, 100);
+		if (id)
+			sd_wait(id, 4000);
+	}
+	if (s_pwr_on)
+		sd_power(0);
 }
 
 void sd_on_event(const char *event)
@@ -1009,19 +1279,37 @@ void sd_on_event(const char *event)
 
 static void sd_cmd_status(void)
 {
-	char ts[24];
+	char ts[24], keep[24] = "";
 	uint8_t p[3] = {2, 3, 4};
+	uint32_t now = rtos_get_time();
+	int cd = sd_cd_level();
 
-	sd_time_str(ts, sizeof(ts));
 #if SD_HAVE_HOST
 	sd_pins(p);
 #endif
-	app_reply("[sd] %s card %s %s cap %u MB free %u MB auto %s saved %u fail %u drop %u last %s\r\n",
-		  SD_HAVE_HOST ? "" : "NO-HOST-BUILD", s_present ? "present" : "absent", s_mounted ? "mounted" : "unmounted",
-		  s_sectors / 2048, s_free_mb, s_auto ? "on" : "off", s_saved, s_save_fail, s_dropped, s_last_file[0] ? s_last_file : "-");
-	app_reply("[sd] pins %u/%u/%u cd=%d (%s) pwr %d%s time %s (%s, ntp %u/%u %s tz %d)%s: %s\r\n", p[0], p[1], p[2],
-		  sd_cd_level(), sd_cd_level() ? "absent" : "present", s_pwr_pin, s_pwr_on ? " on" : "", ts, s_time_src,
-		  s_ntp_ok, s_ntp_tries, s_ntp_host, s_tz_min, s_busy ? " BUSY" : "", s_result);
+	sd_time_str(ts, sizeof(ts));
+	if (s_pinned)
+		os_strlcpy(keep, " manual", sizeof(keep));
+	else if (s_mounted && s_keep_until_ms && (int32_t)(now - s_keep_until_ms) < 0)
+		snprintf(keep, sizeof(keep), " keep %u s left", (s_keep_until_ms - now + 999) / 1000);
+#ifdef DOORBELL_AVDK
+	int cam = app_cam_is_open() ? 1 : 0;
+#else
+	int cam = -1;
+#endif
+	app_reply("[sd] %scard %s (cd=%d) cam %d vote %d pin %s%s %s%s | last mount %u MB, %u MB free, %u ms (%u ok %u fail) cold save %u ms | "
+		  "saved %u fail %u drop %u last %s\r\n",
+		  SD_HAVE_HOST ? "" : "NO-HOST-BUILD ", cd ? "out" : "in", cd, cam, s_cpu_voted ? 1 : 0,
+		  s_pwr_pin < 0 ? "none" : (s_pwr_on ? "on" : "off"),
+		  (s_pwr_pin >= 0 && !s_pwr_on && sd_adc_pin_blocked(s_pwr_pin)) ? " (adc settling)" : "",
+		  s_mounted ? "mounted" : (s_present ? "present" : "unmounted"), keep,
+		  s_sectors / 2048, s_free_mb, s_last_mount_ms, s_mounts, s_mount_fail, s_last_cold_save_ms,
+		  s_saved, s_save_fail, s_dropped, s_last_file[0] ? s_last_file : "-");
+	app_reply("[sd] auto %s keep %u s pwr %d pre %u,%u pins %u/%u/%u time %s (%s, ntp %u/%u %s tz %d)%s%s: %s\r\n",
+		  s_auto ? "on" : "off", s_keep_s, s_pwr_pin, s_pre_flags, s_pre_gap_ms, p[0], p[1], p[2], ts, s_time_src, s_ntp_ok,
+		  s_ntp_tries, s_ntp_host, s_tz_min, s_busy ? " BUSY" : "", s_sleep ? " SLEEP" : "", s_result);
+	if (s_trace[0])
+		app_reply("[sd] bringup: %s\r\n", s_trace);
 }
 
 void cli_sd_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
@@ -1038,11 +1326,28 @@ void cli_sd_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
 		return;
 	}
 	if (os_strcmp(argv[1], "mount") == 0) {
+		s_pinned = true;   /* stays mounted + powered until `sd umount` */
 		id = sd_submit(JOB_MOUNT, NULL, 100);
-		app_reply(id && sd_wait(id, 4000) ? "[sd] %s\r\n" : "[sd] mount still running: %s\r\n", s_result);
+		app_reply(id && sd_wait(id, 8000) ? "[sd] %s (manual: pinned until `sd umount`)\r\n" : "[sd] mount still running: %s\r\n", s_result);
 	} else if (os_strcmp(argv[1], "umount") == 0) {
-		id = sd_submit(argc >= 3 && os_strcmp(argv[2], "off") == 0 ? JOB_UMOUNT_OFF : JOB_UMOUNT, NULL, 100);
+		s_pinned = false;
+		id = sd_submit(argc >= 3 && os_strcmp(argv[2], "keep") == 0 ? JOB_UMOUNT : JOB_UMOUNT_OFF, NULL, 100);
 		app_reply(id && sd_wait(id, 4000) ? "[sd] %s\r\n" : "[sd] umount still running: %s\r\n", s_result);
+	} else if (argc >= 3 && os_strcmp(argv[1], "pre") == 0) {
+		s_pre_flags = (uint32_t)sd_atoi(argv[2]) & 0x3f;
+		if (argc >= 4)
+			s_pre_gap_ms = (uint32_t)sd_atoi(argv[3]);
+		if (s_pre_gap_ms > 5000)
+			s_pre_gap_ms = 5000;
+		snprintf(buf, sizeof(buf), "%u,%u", s_pre_flags, s_pre_gap_ms);
+		kv_set(KV_SD_PRE, buf);
+		app_reply("[sd] pre-condition flags %u (1 cmd55, 2 cmd1, 4 skip, 8 power cycle first, 16 no camera, 32 no cpu vote) gap %u ms\r\n", s_pre_flags, s_pre_gap_ms);
+	} else if (argc >= 3 && os_strcmp(argv[1], "keep") == 0) {
+		int k = sd_atoi(argv[2]);
+		s_keep_s = k < SD_KEEP_MIN_S ? SD_KEEP_MIN_S : (uint32_t)k;
+		snprintf(buf, sizeof(buf), "%u", s_keep_s);
+		kv_set(KV_SD_KEEP, buf);
+		app_reply("[sd] keep the card mounted %u s after the last save\r\n", s_keep_s);
 	} else if (os_strcmp(argv[1], "format") == 0) {
 		uint32_t now = rtos_get_time();
 		if (argc >= 3 && s_fmt_token && now - s_fmt_token_ms < SD_FORMAT_TOKEN_TTL_MS
@@ -1069,7 +1374,7 @@ void cli_sd_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
 #endif
 	} else if (os_strcmp(argv[1], "save") == 0) {
 		id = sd_submit(JOB_SAVE, argc >= 3 ? argv[2] : "manual", 100);
-		app_reply(id && sd_wait(id, 5500) ? "[sd] %s\r\n" : "[sd] save still running: %s\r\n", s_result);
+		app_reply(id && sd_wait(id, 12000) ? "[sd] %s\r\n" : "[sd] save still running: %s\r\n", s_result);
 	} else if (argc >= 3 && os_strcmp(argv[1], "auto") == 0) {
 		s_auto = os_strcmp(argv[2], "on") == 0;
 		kv_set(KV_SD_AUTO, s_auto ? "1" : "0");
@@ -1084,13 +1389,10 @@ void cli_sd_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
 			app_reply("[sd] bad pin (6 = card detect, %u/%u/%u = SDIO, 10/11 = console)\r\n", sp[0], sp[1], sp[2]);
 			return;
 		}
-		if (s_pwr_on && s_pwr_pin != p) {
-#if SD_HAVE_HOST
+		if (s_pwr_on && s_pwr_pin != p)
 			sd_power(0);   /* release the old pin */
-#endif
-			s_pwr_on = false;
-		}
 		s_pwr_pin = p < 0 ? -1 : p;
+		s_pwr_release_ms = 0;
 		kv_set(KV_SD_PWR, s_pwr_pin < 0 ? "none" : argv[2]);
 		app_reply("[sd] power pin %d (takes effect at the next mount)\r\n", s_pwr_pin);
 	} else if (os_strcmp(argv[1], "probe") == 0) {
@@ -1103,12 +1405,14 @@ void cli_sd_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
 	} else if (os_strcmp(argv[1], "pins") == 0) {
 		app_reply("[sd] SDIO pins are fixed at GPIO 2/3/4 on this board (group 0 = 14/15/16 would double-map the host and steal the USB-present input)\r\n");
 	} else if (argc >= 3 && os_strcmp(argv[1], "power") == 0) {
-#if SD_HAVE_HOST
-		sd_power(os_strcmp(argv[2], "on") == 0);
-		app_reply("[sd] power pin %d driven %s\r\n", s_pwr_pin, os_strcmp(argv[2], "on") == 0 ? "high" : "low");
-#else
-		app_reply("[sd] no SD host in this build\r\n");
-#endif
+		bool on = os_strcmp(argv[2], "on") == 0;
+		if (s_mounted || s_present) {
+			app_reply("[sd] card in use: `sd umount` first\r\n");
+			return;
+		}
+		s_pinned = on;   /* a manually powered pin is not released by the keep window */
+		sd_power(on);
+		app_reply("[sd] power pin %d %s\r\n", s_pwr_pin, on ? "driven high (pinned: `sd power off` releases)" : "released");
 	} else if (argc >= 3 && os_strcmp(argv[1], "ntp") == 0) {
 		os_strlcpy(s_ntp_host, argv[2], sizeof(s_ntp_host));
 		kv_set(KV_SD_NTP, s_ntp_host);
@@ -1138,8 +1442,8 @@ void cli_sd_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
 			app_reply("[sd] ntp still running\r\n");
 		}
 	} else {
-		app_reply("sd status | mount | umount [off] | format [TOKEN] | ls [DIR] [SKIP] | save [EVENT] | auto on|off | "
-			  "pwr PIN|none | power on|off | probe [cmd|pins|lines|regs] | ntp HOST | tz MIN | time EPOCH | sync\r\n");
+		app_reply("sd status | mount | umount [keep] | format [TOKEN] | ls [DIR] [SKIP] | save [EVENT] | auto on|off | keep S | "
+			  "pre FLAGS [GAP_MS] | pwr PIN|none | power on|off | probe [cmd|pins|lines|regs] | ntp HOST | tz MIN | time EPOCH | sync\r\n");
 	}
 }
 

@@ -4,6 +4,27 @@ Versions are the `FW_VERSION` in `project/main/app_main.c` (also in every report
 `sys info`). Dates are 2026 unless stated; most of this was written between 2026-10-01 and
 2026-10-03.
 
+## 0.24.3
+- **microSD power corrected** (2026-10-04): the slot is on the **camera supply (GPIO 28)**, GPIO 13 is the
+  battery ADC only (0.24.2's "GPIO 13 powers the card" came from the stock SDK glue and HA snapshots
+  keeping the camera open). The SDK's `bk_sd_card_init` also only completes with the media pipeline up
+  (CPU at full clock, VIDP on): with the camera closed every 100 kHz probe command works but the init
+  times out. A mount now opens the JPEG camera first (`app_sd_cam_ready()`) and votes
+  `PM_DEV_ID_SDIO` -> 320 MHz. `sd pwr` default **none** (a stored 6 or 13 is migrated).
+- On-demand mount: nothing is mounted while idle; ring/motion/`sd save` mount, save and keep the card for
+  `sd keep S` (`db_sd_keep`, default 30 s, min 5) after the last save, then unmount, deinit and release
+  the vote. `sd mount` pins the card ("manual") until `sd umount`; `sd umount keep` leaves a power pin
+  high. Boot auto-mount and the 10-minute re-detect are gone; a failed on-demand mount makes automatic
+  events skip the card for 60 s. `sd_prepare_sleep()` is called from `app_power_prepare_sleep()`.
+- Pre-condition before the SDK init (`sd_precondition`: fresh host at 100 kHz, CMD0 x2, CMD8): a silent
+  card fails in ~1 s instead of the SDK's 128 blind CMD8 retries. `sd pre FLAGS [GAP_MS]` (`db_sd_pre`)
+  tunes it (1 CMD55, 2 CMD1, 4 skip, 8 power cycle first, 16 no camera, 32 no vote). SDK patch **0009**:
+  `SDIO_CMD_WAIT_TIME` 4 -> 30 ms so the response wait outlasts the 25 ms hardware timeout.
+- `sd status`: card in/out (cd), cam, vote, pin, mounted/manual/keep left, last-mount capacity/free/
+  time and counts, cold save time, saved/fail/drop, last file, `bringup:` trace of the last mount.
+- power.c: with a power pin on GPIO 13 the battery read is cached (`(cached: sd power)`) while the pin
+  is driven and 10 s after; not active with the default `none`.
+
 ## 0.24.2
 - microSD bring-up (2026-10-04): **GPIO 13 is the card power enable** (what the stock SDK glue drove via
   `bk_gpio_ctrl_external_ldo`), **GPIO 6 is card detect** (input, pull-up, 0 = inserted), not power.

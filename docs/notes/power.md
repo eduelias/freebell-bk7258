@@ -4,6 +4,10 @@
 
 **GPIO 19 = USB present (high)**, **GPIO 15 = charging (high, together with 19 high)**,
 **battery = ADC15 on GPIO 13, x2 divider** (ADC9 on GPIO 7 is a regulated rail, not the battery).
+GPIO 13 is not driven by default (0.24.2 briefly treated it as the SD power enable; it is not, see
+sdcard.md). If `sd pwr 13` is ever set, `power_batt_mv()` returns the last valid median while the
+pin is driven and for ~10 s after it is released, and `pwr status` shows `(cached: sd power)`. Before
+deep sleep `power_do_sleep()` -> `app_power_prepare_sleep()` -> `sd_prepare_sleep()` unmounts the card.
 Deep sleep uses the SDK's pm v2 (SoC reset on wake) and is **off by default**.
 
 ## Settings

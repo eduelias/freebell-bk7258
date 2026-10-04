@@ -68,7 +68,7 @@ void db_reply(const char *fmt, ...)
 	REPLY("%s", buf);
 }
 
-#define FW_VERSION "0.24.2"
+#define FW_VERSION "0.24.3"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -414,9 +414,10 @@ static uint32_t adc_read_mv(uint32_t chan)
 	uint16_t raw = 0;
 	uint32_t mv = 0;
 
-	/* ADC15 lives on GPIO 13; bk_adc_init() remaps the pin, which would cut a microSD card that
-	 * `sd pwr 13` is powering. Report the last reading while the card is powered. */
-	if (chan == 15 && sd_power_pin_driven(13))
+	/* ADC15 lives on GPIO 13; with `sd pwr 13` (not the default: the pin turned out not to power
+	 * the card) bk_adc_init() would remap the driven pin, and the node needs ~10 s to settle after
+	 * it is released. Report the last reading meanwhile (power.c marks it "cached"). */
+	if (chan == 15 && sd_adc_pin_blocked(13))
 		return s_adc15_last;
 	if (bk_adc_acquire() != BK_OK)
 		return 0;
@@ -2035,6 +2036,18 @@ static int cam_copy_latest(uint8_t *dst, uint32_t cap, uint32_t *seq)
 }
 
 /* For sdcard.c: latest JPEG, opening the camera on demand (first frame takes ~1 s). */
+/* For sdcard.c: the microSD slot is on the camera supply and the SDK card init only completes with
+ * the media pipeline up (2026-10-04), so a mount brings the JPEG camera up first. */
+int app_sd_cam_ready(void)
+{
+	return cam_want_jpeg();
+}
+
+bool app_cam_is_open(void)
+{
+	return s_cam_open;
+}
+
 int app_cam_grab(uint8_t *dst, uint32_t cap, uint32_t wait_ms)
 {
 	uint32_t seq = 0, t0 = rtos_get_time();
@@ -2472,6 +2485,7 @@ void app_power_prepare_sleep(void)
 	unsigned i;
 
 	pa_set(0);
+	sd_prepare_sleep();   /* unmount the card (its supply is the camera rail cut below) */
 	pin_configure(PIN_LED_WHITE, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
 	bk_gpio_set_output_low(PIN_LED_WHITE);
 	pin_configure(PIN_LED_RING, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
@@ -2538,7 +2552,7 @@ static const struct cli_command s_doorbell_commands[] = {
 #if (CONFIG_SYS_CPU0)
 	{"ring", "ring test | dark MV | fx on|off (local chime, ring LEDs, light when dark)", cli_ring_cmd},
 	{"pwr", "pwr status | sleep on|off | idle S | wake_pir on|off | snap_min M | sleepnow (battery, charger, deep sleep)", cli_pwr_cmd},
-	{"sd", "sd status | mount | umount | format | ls [DIR] | save [EVENT] | auto on|off | probe (microSD)", cli_sd_cmd},
+	{"sd", "sd status | mount | umount | format | ls [DIR] | save [EVENT] | auto on|off | keep S | probe (microSD)", cli_sd_cmd},
 #endif
 #if defined(DOORBELL_AVDK) && (CONFIG_SYS_CPU0)
 	{"cam", "cam open [W H] [h264] | close | stat | mode auto|jpeg|h264 | snap HOST PORT (AVDK build)", cli_cam_cmd},
@@ -2644,7 +2658,7 @@ void user_app_main(void)
 	bk_event_register_cb(EVENT_MOD_WIFI, EVENT_ID_ALL, wifi_event_cb, NULL);
 	inputs_init();
 	power_init();   /* before the reporter: a button wake from deep sleep must chime at once, before Wi-Fi */
-	sd_init();   /* microSD worker: auto-mount 8 s after boot when `sd auto` is on (default) */
+	sd_init();   /* microSD worker: card mounted on demand (ring/motion/`sd save`, opens the camera), unmounted when idle */
 	rtos_create_thread(&reporter, BEKEN_APPLICATION_PRIORITY, "reporter",
 			   reporter_task, 4096, NULL);
 	kv_get_str(KV_TOKEN, s_token, sizeof(s_token));

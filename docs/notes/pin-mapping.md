@@ -54,9 +54,9 @@ command).
 | 45 (ADC11) | high = the four blue LEDs around the button light up. Not infrared: the IR LED sits above the camera lens and is still unmapped; an earlier "kills the white LED" reading was a coincidence | blue button ring, active high |
 | 46 | GPIO sweep with a microphone listening: 1 kHz tone scored 108 with 46 high vs < 1 for the other pins; floating it leaks a faint output | speaker amplifier enable, active high |
 | 12 (ADC14) | about 700 mV lit room, about 2100 mV covered, powered from GPIO 28 | light sensor, higher = darker |
-| 13 (ADC15) | x2 divider, 3.9 V range; the shipped firmware's SDK glue also drives it high as the SD "LDO enable" (`bk_gpio_ctrl_external_ldo(GPIO_CTRL_LDO_MODULE_SDIO, GPIO_13, HIGH)`, the SDK's default `SDCARD_LDO_CTRL_GPIO`) before every card init | battery voltage (shipped firmware); SD power role unproven, see sdcard.md (`sd pwr 13`) |
+| 13 (ADC15) | x2 divider, 3.9 V range; the shipped firmware's SDK glue also drives it high as the SD "LDO enable" (`bk_gpio_ctrl_external_ldo(GPIO_CTRL_LDO_MODULE_SDIO, GPIO_13, HIGH)`, the SDK's default `SDCARD_LDO_CTRL_GPIO`) before every card init | battery voltage (shipped firmware). **Not** the SD power: with the camera supply (GPIO 28) up the card answers whether 13 is released, high or low; with 28 down it never answers (2026-10-04, sdcard.md) |
 | 0, 1 | I2C1 SCL/SDA (SDK default pins; the shipped firmware uses them too) | camera I2C |
-| 28 | camera power enable, active high (shipped firmware `.data`: pin 28, level 1) | camera power |
+| 28 | camera power enable, active high (shipped firmware `.data`: pin 28, level 1); also the microSD slot's supply (card silent with 28 low, answers with 28 high, 2026-10-04) and the LDR divider | camera power, SD card power |
 | 52 | shipped firmware pulses it low, 100 ms high, low before probing | camera PWDN/RESET |
 | 54, 55 | shipped firmware pulses 55 high 300 ms for night, 54 high 300 ms for day (plus sensor B/W registers) | IR-cut filter coil, unused (the white night light replaces it) |
 | 50, 25, 26 | shipped firmware PIR driver | PIR enable, sensitivity bit 0/1 |

@@ -2,21 +2,34 @@
 
 Optional: a FAT32/exFAT microSD card in the slot gets a JPEG per ring and motion
 (`/doorbell/YYYYMMDD-HHMMSS-<event>.jpg`, local time once SNTP has synced, `up<uptime>-...`
-before). Without a card the only activity is one probe 8 s after boot and every 10 min (a few CMD0
-timeouts, about 100 ms).
+before). The card is mounted only around a save (0.24.3): an event opens the camera, mounts, writes,
+keeps the card for `sd keep S` (30 s) after the last save, unmounts. Without a card nothing touches
+the bus (`cd` = GPIO 6 reads 1).
 
 ## Hardware
 
 SD host = the BK7258 SDIO host, 1-bit, **GPIO 2 = CLK, 3 = CMD, 4 = DAT0** (SDK default pin group,
 shared with the stock SDK build). **GPIO 6 = card detect**: input with pull-up, 0 = card inserted
-(stock firmware disassembly 2026-10-04, verified on the board; until 0.24.1 it was wrongly treated
-as the card power pin and driven high by the camera rail code). Card power: **no pin by default**.
-The stock's SDK glue (`disk_io.c` with `CONFIG_SDCARD_POWER_GPIO_CTRL=y`) drives **GPIO 13** high via
-`bk_gpio_ctrl_external_ldo(GPIO_CTRL_LDO_MODULE_SDIO, GPIO_13, HIGH)` before every card init; GPIO 13
-is also the battery ADC15 input, so whether it really powers the slot is unproven. `sd pwr 13`
-reproduces that drive exactly (unmap, no pull, drive strength 0, output high, held while the card
-is in use) and the battery read is skipped while the pin is held. FatFs volume `1:`. Our build has
-`CONFIG_SDCARD_POWER_GPIO_CTRL=n` and calls `bk_sd_card_init` itself.
+(stock firmware disassembly 2026-10-04, verified on the board).
+
+**Card power = the camera supply (GPIO 28 rail).** Verified 2026-10-04 with the camera closed: GPIO 28
+low -> `sd probe` gets no CMD8 answer (bus lines clamped low); `pin out 28 1` -> CMD8 `0x1AA`, CMD55
+`0x120`, with GPIO 13 released, driven high or driven low alike. **GPIO 13 does not power the card**:
+it is the battery ADC15 node only. The stock's SDK glue drives it as `SDCARD_LDO_CTRL_GPIO` via
+`bk_gpio_ctrl_external_ldo(GPIO_CTRL_LDO_MODULE_SDIO, GPIO_13, HIGH)` (SDK default pin for a board
+Beken never had), 0.24.2 copied that and the first card tests "worked" only because HA snapshots had
+the camera open. `sd pwr PIN` stays for other boards, default `none`; a stored 6 or 13 is migrated.
+
+**Second dependency: the SDK's `bk_sd_card_init()` only completes while the media pipeline is up.**
+With the camera closed and GPIO 28 held high the card answers every 100 kHz probe command, but the
+init times out (`-14594`) at some later step, with or without pre-conditioning, with or without the
+speaker (audio domain) running. With the camera open it completes in ~100 ms. Register dump camera
+closed vs open: sys `cpu_clk_div_mode1` `0x44100037` -> `0x44100030` (core divider 7 -> 0, i.e. the
+CPU runs at 1/8 clock when nothing votes), power domains `0x600001c8` -> `0x60000148` (`pwd_vidp`
+off -> on), `jpeg_cken` + reg 0x0d clocks on; the SDIO clock select itself (XTAL, reg 0x09) is the
+same in both. 0.24.3 therefore opens the JPEG camera (`app_sd_cam_ready()` = `cam_want_jpeg()`; the
+save needs the frame anyway) and votes `PM_DEV_ID_SDIO` -> 320 MHz before the init; `sd pre` bits 16
+and 32 disable either for experiments (results in "Status" below).
 
 SDIO pin setup (`sd_pins_apply()`) reproduces the SDK's `GPIO_DEFAULT_DEV_CONFIG` rows for GPIO 2/3/4
 exactly: release the pin (`gpio_dev_unmap`), `bk_gpio_set_config(GPIO_IO_DISABLE, PULL_UP_EN)`, then
@@ -27,67 +40,69 @@ again (the map clears `pull_en`) and drive strength 3. Expected config word `0x3
 ## Design
 
 One low-priority worker owns the card; ring/motion only enqueue a job and never block. `ring test`
-queues an SD snapshot like a real press. FAT timestamps are real thanks to SDK patch 0008 (the
-SDK's fixed-2017 `get_fattime()` becomes weak so `sdcard.c` can supply the SNTP time). A tiny SNTP
+queues an SD snapshot like a real press. On-demand mount (`sd_do_save` -> `sd_do_mount` ->
+`sd_card_bringup`): camera ready, CPU vote, power pin (if any) + 500 ms, SDIO pins, pre-condition
+(`sd_precondition`: fresh host driver at 100 kHz, CMD0, CMD0, CMD8 0x1AA; a silent card gets one
+power cycle and a second look, then fails fast with "silent" instead of the SDK's 128 blind CMD8
+retries), `bk_sd_card_init` (host driver deinit/init first = fresh ISR + completion queue; one retry
+after a power cycle), `f_mount`, `mkdir /doorbell`. The 200 KB PSRAM frame buffer lives only for one
+save (holding it starved the :8080 server, 0.24.0/1). After each save the keep window restarts
+(`sd keep S`, KV `db_sd_keep`, default 30 s, min 5); when it ends the worker unmounts, deinits the
+card, releases the vote and the power pin. `sd mount` pins the card ("manual" in `sd status`) until
+`sd umount`. A failed on-demand mount makes automatic events skip the card for 60 s (counted as
+`drop`). `sd_prepare_sleep()` (called from `app_power_prepare_sleep()`) unmounts before deep sleep.
+FAT timestamps are real thanks to SDK patch 0008; SDK patch 0009 makes the host driver's response
+wait (30 ms) outlast the 25 ms hardware timeout so the ISR queue cannot get out of step. A tiny SNTP
 client (UDP/123, needs DNS for host names) runs once the network is up.
 
 ## Commands
 
 | Command | What it does | KV, default |
 |---|---|---|
-| `sd` / `sd status` | card present/mounted, capacity/free MB, auto, saved/fail/drop counts, last file; pins, power pin, time + source, NTP stats, BUSY, last worker result | |
-| `sd mount` / `sd umount [off]` | mount: `cd` must read 0 (else "no card (cd=1)" without touching the bus), power pin high + 500 ms if it was off, SDIO pins, SDIO host driver deinit/init (fresh ISR + completion queue, see "Status"), `bk_sd_card_init` with one retry after 300 ms, `f_mount`, mkdir `/doorbell` / unmount; `off` also lowers the power pin | |
-| `sd save [EVENT]` | write the latest camera JPEG (opens the camera on demand) as `/doorbell/<stamp>-EVENT.jpg` | |
+| `sd` / `sd status` | line 1: card in/out (`cd`), `cam` open, CPU `vote` held, power `pin` state, mounted / `manual` / `keep N s left`, last mount capacity/free/time + mount ok/fail counts, cold save time, saved/fail/drop, last file; line 2: auto, keep, pwr, pre, pins, time + source, NTP stats, BUSY/SLEEP, last worker result; line 3: `bringup:` trace of the last mount (cam/vote/pre results, init return and ms) | |
+| `sd mount` / `sd umount [keep]` | mount (see "Design") and pin the card until `sd umount`; `umount keep` leaves the power pin high | |
+| `sd save [EVENT]` | mount on demand if needed, write the latest camera JPEG as `/doorbell/<stamp>-EVENT.jpg`, restart the keep window | |
+| `sd keep S` | seconds the card stays mounted after the last save (min 5) | `db_sd_keep`, 30 |
+| `sd pre FLAGS [GAP_MS]` | pre-condition tuning: 1 also CMD55, 2 also CMD1, 4 skip the pre-condition, 8 power cycle first, 16 do not open the camera, 32 do not vote the CPU clock; GAP = ms between the pre-condition's host deinit and `bk_sd_card_init` | `db_sd_pre`, 0,10 |
 | `sd ls [DIR] [SKIP]` | list `1:/doorbell` (or DIR relative to `1:/`), 6 entries per reply, `SKIP` pages | |
 | `sd format` | prints a token; `sd format TOKEN` within 120 s runs `f_mkfs` (FAT32 <= 32 GB, exFAT above) in the background, then remounts | |
-| `sd auto on\|off` | auto-save on ring and motion (also remounts at most once a minute when a card appears) | `db_sd_auto`, on |
-| `sd pwr PIN\|none` | card power GPIO (refuses 6 = card detect, the SDIO pins and 10/11); applied at the next mount. **13 on this board.** `sd pins` (the GPIO 14/15/16 group of <= 0.24.1) is gone: selecting it double-mapped the SDIO functions, so the host kept listening on the empty pins after switching back, and GPIO 15 is the charging input | `db_sd_pwr` none (a stored 6 from <= 0.24.1 is migrated to none) |
-| `sd power on\|off` | drive the power pin directly (diagnostic) | |
-| `sd probe [cmd\|pins\|lines\|regs]` | host-level diagnostics without FatFs, run in the worker. `pins`: apply the SDIO pins and reply the AON config word / function-select nibble of CLK/CMD/DAT0, GPIO 6 (+ level) and GPIO 13 (+ level), plus the sys clock registers. `lines`: each SDIO pin as a plain input with pull-up then pull-down (1/0 = floating, 0/0 = held low = unpowered card or short, 1/1 = held high). `cmd` (default): power pin high 500 ms if set, pins, `bk_sdio_host_init` 100 kHz 1-bit, SDIO host registers, then CMD0, CMD0, CMD8 (0x1AA), CMD55, CMD1 (MMC), each with its return code (`-14594` = response timeout), response word or raw status register, `LATE` when the response arrived after the driver's 4 ms wait; `regs` = init + registers only. Needs the card unmounted | |
+| `sd auto on\|off` | auto-save on ring and motion | `db_sd_auto`, on |
+| `sd pwr PIN\|none` | optional card power GPIO for other boards (refuses 6 = card detect, the SDIO pins and 10/11); driven high while the card is in use, low 200 ms then released after. **Not needed on this board** (the slot is on the camera supply; 13 is the battery ADC). `sd pins` (GPIO 14/15/16 group of <= 0.24.1) is gone: it double-mapped the SDIO functions and GPIO 15 is the charging input | `db_sd_pwr` none (a stored 6 or 13 is migrated to none) |
+| `sd power on\|off` | drive the power pin directly and pin it (diagnostic; refused while the card is in use) | |
+| `sd probe [cmd\|pins\|lines\|regs]` | host-level diagnostics without FatFs, run in the worker. `pins`: apply the SDIO pins and reply the AON config word / function-select nibble of CLK/CMD/DAT0, GPIO 6 (+ level) and GPIO 13 (+ level), plus the sys clock registers. `lines`: each SDIO pin as a plain input with pull-up then pull-down (1/0 = floating, 0/0 = held low = unpowered card or short, 1/1 = held high). `cmd` (default): power pin high 500 ms if set, pins, `bk_sdio_host_init` 100 kHz 1-bit, SDIO host registers, then CMD0, CMD0, CMD8 (0x1AA), CMD55, CMD1 (MMC), each with its return code (`-14594` = response timeout), response word or raw status register, `LATE` when the response arrived after the driver's wait; `regs` = init + registers only. Needs the card unmounted and the camera open (or `pin out 28 1`), otherwise the card is unpowered and every command but CMD0 times out | |
 | `sd ntp HOST` / `sd sync` | SNTP server / query now | `db_sd_ntp`, pool.ntp.org |
 | `sd tz MIN` / `sd time EPOCH` | minutes east of UTC for names and FAT timestamps (e.g. Amsterdam 120 in summer, 60 in winter) / set the clock by hand | `db_sd_tz`, 0 |
 
-## Status (2026-10-04, v0.24.2, first card ever mounted)
+## Status (2026-10-04, v0.24.3)
 
-Bring-up session with two cards (card A, blank; swapped mid-session for card B, a new 32 GB), no UART,
-everything through `tools/dbcmd.py`:
+Everything through `tools/dbcmd.py` (no UART), card B (new 32 GB, FAT as shipped), device on battery
+with sleep off. 3 builds (96-109 s), 3 OTAs (device back in ~60 s each).
 
-- **Pin mux was never the problem.** `pin cfg 2/3/4` = `0x378`, function select 1 = `SDIO_HOST_CLK/CMD/DATA0`
-  (identical to the SDK default rows); the SDIO block reads id `0x5344494f` ("SDIO"), `sdio_cken`
-  (bit 22 of sys reg 0x0c) comes on with `bk_sdio_host_init`, so the clock/power domain is fine too.
-- **The card was unpowered.** `sd probe lines` with GPIO 13 at its boot state: CLK/CMD/DAT0 all read 0
-  with pull-up *and* pull-down = clamped by an unpowered card; the SDK then "succeeds" CMD8 with an
-  all-zero response (CRC7 of zeros is 0) and times out on CMD55 (`-14594` after ~630 ms). Without a
-  card the same lines float and the SDK ends in `-14600` (bogus ACMD41 loop) after ~1170 ms.
-- **GPIO 13 high powers the card.** `sd pwr 13` + `sd power on`: lines become CMD/DAT0 1/1 (pulled up by
-  the card), CLK 1/0 (floating); `sd probe`: CMD8 `0x1AA`, CMD55 R1 `0x120`, CMD1 timeout (SD, not
-  MMC); `sd mount`: 29820 MB, 29808 MB free, FAT as shipped; `sd save` writes 30-58 KB JPEGs in
-  40-74 ms. Pin 13 low does *not* visibly cut the power within 60 s (card still answers CMD8 with
-  `sd pwr none`), but a 2 s low pulse does reset a hung card (see the mount retry). The ADC15 node
-  on the same pin reads ~1.9 V at rest, 240 mV right after being driven low, back to 1.9 V within
-  10 s: a slow RC node, so battery reads are skipped (last value kept) while the pin is held.
-- **Boot (open):** the auto-mount 8 s after every reboot failed on all 4 boots today (CMD8 retries,
-  `-14594` after 0.7-3.7 s), and manual `sd mount` right after a boot failed too (`-14594`/`-14601`),
-  with or without the power cycle the retry now does (pin low 2 s, high 500 ms). What recovered it
-  every time (3/3): one `sd probe` (host init, CMD0, CMD0, CMD8, CMD55, CMD1, host deinit) followed by
-  `sd mount` -> mounted in 114 ms; and once an `sd umount off` + 2 s + `sd mount`. The card answers the
-  probe normally even while `bk_sd_card_init` keeps failing, so the difference is in the SDK init path
-  (one CMD0 then 128 blind CMD8 retries every 4 ms against a 25 ms hardware timeout, which stacks
-  completion messages). **Next change:** run the probe's command sequence as a pre-conditioning step
-  in `sd_do_mount` before `bk_sd_card_init` (or patch `SDIO_CMD_WAIT_TIME` in the SDK), then re-test
-  the boot mount. Until then, after a reboot: `sd probe` then `sd mount`.
-- **Two firmware bugs found with the first real card:** (1) `sd_do_save` kept its 200 KB PSRAM frame
-  buffer forever, starving `cam_http_client_task`'s `psram_malloc` so every :8080 request died with an
-  empty reply after the first save (now freed per save; verified three saves with HTTP 200 between);
-  (2) `sd pins 0` double-mapped GPIO 14/15/16 to the SDIO functions, the host kept reading CMD on
-  GPIO 15 after switching back, and 15 is power.c's charging input (option removed).
-- SDK quirk (not patched): the host driver completes commands through an RTOS queue fed by its ISR with
-  a 4 ms software wait against a 25 ms hardware response timeout; after a burst of unanswered CMD8
-  retries the queue was out of step (stale response words, every wait "timing out" in 84 ms). The
-  mount now deinit/inits the host driver before `bk_sd_card_init` (fresh queue + ISR). A proper fix
-  would be a patch raising `SDIO_CMD_WAIT_TIME` in `sdio_host_driver.c` above the hardware timeout.
+- **Post-boot mount fixed, 4/4** (one OTA boot + three `reboot`s, cold `sd save` right after boot
+  with the defaults, no manual probe): mount 1554-1566 ms, of which ~1.2 s is the camera open, cold
+  save 1840-2042 ms end to end. Warm cold-saves (camera already open) mount in ~250-750 ms and save
+  in ~420-960 ms; a save on a mounted card takes 40-75 ms.
+- **What was wrong** (0.24.2 and build 1 of 0.24.3): the card has no power unless the camera supply
+  (GPIO 28) is up, and the SDK init only completes with the camera open. Every "it works after an
+  `sd probe`" today was an HA snapshot or an HTTP request opening the camera in between; GPIO 13 never
+  mattered (see "Hardware"). Isolation runs, camera closed: GPIO 28 low -> card silent; 28 high alone,
+  28+5, 28+5 with 13 low, 28+13 high: card answers CMD8/CMD55 at 100 kHz, `bk_sd_card_init` still
+  `-14594` after ~4 s per attempt (also while a speaker tone ran = audio domain up); camera open ->
+  init OK, with or without the pre-condition, with or without the CPU vote. CPU vote alone with 28
+  held high: still fails. Register dump camera closed vs open in "Hardware".
+- Keep window: `sd status` shows `mounted keep N s left`, then `unmounted`, vote released; the camera
+  stays open afterwards (its own lifetime, unchanged). HTTP `/snapshot.jpg` 200 during the keep window
+  (0.04-0.19 s) and after. `motion test` -> HA push + `...-motion.jpg` on the card. Heap 107.4-107.8 KB
+  with the camera open, 110.5 KB closed, stable across the reboots.
+- Battery: with `sd pwr none` GPIO 13 is never touched; `pwr status` adc15 1899-1903 mV at boot,
+  1898 mV during a mount, 1895 mV 15 s after the keep window (3790-3806 mV), never `(cached)`.
+- SDK patch 0009 (`SDIO_CMD_WAIT_TIME` 4 -> 30 ms) is in the build; it did not fix the mount by itself
+  but removes the out-of-step completion queue seen on 0.24.2 (every command "timing out" in 84 ms).
+- Device settings after the session: `db_sd_pwr` none (the hand-set 13 was migrated at boot), auto on,
+  keep 30, pre 0,10, tz 120, rtsp on, cam mode auto, sleep off.
 
-Open: a photo of the board around U? (which regulator GPIO 13 enables); whether to drop the card power
-between saves so the battery ADC works (the stock's SDK glue powered down after 10 s idle); an HTTP
-listing of the card (`/sd/`) and an `sd` field in the report JSON. Device settings after the session:
-`db_sd_pwr` = 13 (set by hand; the firmware default stays `none`), auto on, tz 120.
+Open: *why* the SDK init needs the camera (VIDP power domain vs the full CPU clock; the 320 MHz vote
+alone was not enough, the VIDP vote was not tried); a board photo around the slot and the GPIO 28
+regulator; the camera keeps running after a save (pre-existing behaviour, costs battery: an idle
+camera close would also unpower the card, which is fine when unmounted); an HTTP listing of the card
+(`/sd/`) and an `sd` field in the report JSON; `sd format` needs a pinned mount (`sd mount` first).
