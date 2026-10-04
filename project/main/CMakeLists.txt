@@ -8,6 +8,7 @@ set(srcs
     talk.c
     audio_voc.c
     sdcard.c
+    policy.c
     )
 
 if (CONFIG_OVERRIDE_FLASH_PARTITION)

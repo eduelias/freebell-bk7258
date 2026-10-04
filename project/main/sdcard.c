@@ -40,6 +40,7 @@
  */
 #include <common/bk_include.h>
 #include "sdcard.h"
+#include "applog.h"   /* last: our os_printf lines go to the RAM log ring (policy.c) */
 
 typedef int sdcard_translation_unit_is_never_empty_t;
 
@@ -241,6 +242,29 @@ static int sd_atoi(const char *s)
 }
 
 /* ---- wall clock ---- */
+
+static void sd_civil(uint32_t secs, int *y, int *m, int *d, int *hh, int *mm, int *ss);
+
+bool app_time_local(int *hh, int *mm)
+{
+	int y, m, d, ss;
+	uint32_t now = sd_time_now();
+
+	if (!s_time_valid || !now)
+		return false;
+	sd_civil(now + (uint32_t)(s_tz_min * 60), &y, &m, &d, hh, mm, &ss);
+	return true;
+}
+
+uint32_t sd_keep_get(void)
+{
+	return s_keep_s;
+}
+
+bool sd_auto_get(void)
+{
+	return s_auto;
+}
 
 uint32_t sd_time_now(void)
 {

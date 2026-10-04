@@ -22,6 +22,9 @@ Files:
   `script.doorbell_say`, `script.doorbell_play`).
 - [`doorbell_tts_wav.py`](doorbell_tts_wav.py): helper run by `shell_command.doorbell_tts_wav` inside
   the HA core container: text -> HA TTS -> 16 kHz mono WAV under `/config/www/doorbell/`.
+- [`doorbell_policy.py`](doorbell_policy.py) (fw 0.25): helper run by `shell_command.doorbell_policy_write`:
+  the seven setting helpers -> `/config/www/doorbell/policy.json` (with `rev` = timestamp), which the
+  device fetches and applies on every boot.
 
 ## Setup
 
@@ -72,7 +75,30 @@ Files:
    `/config/www/doorbell/say.wav` and the device fetches it from `http://<ha-ip>:8123/local/doorbell/`.
    `script.doorbell_play` plays any WAV you put in that folder (16 kHz mono is best; the device
    resamples 16/44.1/48 kHz).
-6. **OTA hosting (optional, recommended).** The same `/config/www/doorbell/` folder is a convenient
+6. **Settings from HA (fw 0.25, optional).** Create the helpers (Settings > Devices & services >
+   Helpers, or over the websocket `input_number/create` etc.; the entity ids must match the package):
+   `input_number.doorbell_volume` (0-100, step 5, %), `input_select.doorbell_pir_sens` (options `0 1 2`),
+   `input_boolean.doorbell_pir_wake`, `input_number.doorbell_day_interval` (5-120 min),
+   `input_number.doorbell_night_interval` (15-240 min), `input_number.doorbell_dark_mv` (500-2500 mV),
+   `input_boolean.doorbell_night_light`; set them to the device's current values (`vol`, `pir status`,
+   `pwr status`, `ring`, `night status` tell you). Copy `doorbell_policy.py` to `/config/` (`chmod 755`).
+   Put the device's TCP token into `/config/.doorbell_tcp_token` (`chmod 600`) and into `secrets.yaml`
+   as the full command URL:
+
+   ```yaml
+   doorbell_cmd_url: "http://<device-ip>:8080/cmd?t=<tcp-token>&c={{ cmd | urlencode }}"
+   ```
+
+   The package brings `shell_command.doorbell_policy_write`, `rest_command.doorbell_cmd`, the
+   automation `doorbell_bk7258_policy` (any helper change -> rewrite the file -> `pwr policy pull`
+   over `/cmd` in case the device is awake) and `sensor.doorbell_bk7258_policy` (state `applied` /
+   `none` / `error`, attribute `rev`, from the boot report). Reload rest/shell commands, automations
+   and templates (all have reload services in 2026.9), then call `shell_command.doorbell_policy_write`
+   once so the first boot after the 0.25 OTA finds a file; `curl http://<ha-ip>:8123/local/doorbell/policy.json`
+   must return the JSON. The device's default `pwr policy auto` derives the URL from the webhook host,
+   so nothing is configured on the device. The webhook automation's fan-out and the boot logbook line
+   carry `policy`, `policy_rev`, `sleep_min`, `wake_pir` (see the automation file).
+7. **OTA hosting (optional, recommended).** The same `/config/www/doorbell/` folder is a convenient
    image host: `OTA_URL_BASE=http://<ha-ip>:8123/local/doorbell` and
    `OTA_PUBLISH="scp {rbl} root@<ha-ip>:/config/www/doorbell/"` in `~/.config/doorbell-bk7258/env`
    make `scripts/release.sh` publish and flash over the air.
@@ -97,7 +123,9 @@ curl -o /dev/null -w '%{http_code}\n' http://192.168.2.89:8080/snapshot.jpg
 (attributes `reason`, `fw`, `ip`, `uptime_s`), `binary_sensor.doorbell_bk7258_usb_power`,
 `binary_sensor.doorbell_bk7258_charging`, `input_text.doorbell_bk7258_last_report`,
 `camera.doorbell_bk7258`, `notify.doorbell_family`, `script.doorbell_say`, `script.doorbell_play`,
-and the event `doorbell_bk7258_report` for your own automations. Snapshots are written to
+`sensor.doorbell_bk7258_policy` (fw 0.25) and the event `doorbell_bk7258_report` for your own
+automations; the seven setting helpers of step 6 and the `rest_command.doorbell_cmd` action
+(`data: {cmd: "vol 60"}`, reply text in `response_variable`, only while the device is awake). Snapshots are written to
 `/config/www/doorbell/last_ring.jpg`, `last_motion.jpg` and `wake_latest.jpg`.
 
 ## Two-way audio (fw 0.26+)

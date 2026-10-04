@@ -37,5 +37,6 @@ void night_on_motion(void);                        /* call from the reporter thr
 /* `led white|ring on|off|auto`: state 1/0 = manual override, -1 = back to automatic. */
 void night_led_manual(int which, int state);
 
+bool night_auto_get(void);                        /* the `night auto` setting (policy.c) */
 void night_cli_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv);
 void sys_cli_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv);

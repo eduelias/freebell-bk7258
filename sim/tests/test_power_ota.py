@@ -20,7 +20,8 @@ def test_fresh_device_status_page_is_503_until_the_camera_opened(fast_sim):
 
 def test_sleep_rtc_wake_cycle(fast_sim, sink):
     sim = fast_sim
-    assert sim.cmd("pwr snap_min 1") == "ok\n[pwr] rtc wake every 1 min"
+    assert sim.cmd("pwr snap_min 1") == "ok\n[pwr] rtc wake every 1 min (used only with `pwr sched off`; the schedule is on)"
+    assert sim.cmd("pwr sched off").startswith("ok\n[pwr] sched off (fixed snap_min 1) -> next rtc wake in 1 min (fixed snap_min)")
     r = sim.cmd("pwr sleepnow")
     assert r == "ok\n[pwr] sleeping in 10 s: wake on button, usb plug, uart rx, rtc in 1 min (cancel: pwr sleep off)"
     mark = sink.mark()
@@ -38,6 +39,7 @@ def test_sleep_rtc_wake_cycle(fast_sim, sink):
 
 def test_sleep_button_wake_rings(fast_sim, sink):
     sim = fast_sim
+    sim.cmd("pwr sched off")
     sim.cmd("pwr snap_min 10")
     sim.cmd("pwr sleepnow")
     assert wait_until(lambda: not port_open(sim.tcp), 5)

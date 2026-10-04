@@ -23,6 +23,7 @@
 #if (CONFIG_SYS_CPU0)
 #include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
 #include <os/os.h>
 #include <os/str.h>
 #include <components/system.h>
@@ -30,7 +31,9 @@
 #include <driver/aon_rtc.h>
 #include <modules/pm.h>
 #include <modules/wifi.h>
-#include "sdcard.h"   /* sd_adc_pin_blocked(): only with `sd pwr 13` set (not the default) is the ADC node driven */
+#include "sdcard.h"   /* sd_adc_pin_blocked(): only with `sd pwr 13` set (not the default) is the ADC node driven; app_time_local() */
+#include "policy.h"   /* `pwr policy ...` (policy.c) */
+#include "applog.h"   /* last: our os_printf lines go to the RAM log ring */
 
 #define PIN_USB_PRESENT 19
 #define PIN_CHARGING    15
@@ -49,6 +52,7 @@
 #define KV_PWR_SNAP   "db_pwr_snap"     /* RTC wake every N minutes for a snapshot (default 0 = keepalive only) */
 #define KV_PWR_BCHAN  "db_pwr_bchan"    /* battery ADC channel (default 15) */
 #define KV_PWR_BRATIO "db_pwr_bratio"   /* divider ratio in percent (default 200 = x2.00) */
+#define KV_PWR_SCHED  "db_pwr_sched"    /* fw 0.25: "HH:MM HH:MM DAY_MIN NIGHT_MIN" or "off" (default 07:00 22:00 15 60) */
 
 #define POWER_KEEPALIVE_MIN   360       /* RTC wake when snap_min is 0, so a sleeping device still reports twice a day */
 #define POWER_IDLE_MIN_S      20
@@ -58,6 +62,15 @@
 
 static bool s_sleep_en, s_force, s_wake_pir, s_inhibit;
 static uint32_t s_idle_s = 60, s_snap_min, s_bchan = 15, s_bratio = 200;
+/* smart schedule (fw 0.25): day/night RTC intervals, local time from the SNTP clock + `sd tz`,
+ * light sensor when unsynced; `pwr sched off` = the fixed snap_min */
+static bool s_sched_on = true;
+static int s_day_start = 7 * 60, s_day_end = 22 * 60;   /* minutes after local midnight */
+static uint32_t s_day_min = 15, s_night_min = 60;
+static volatile bool s_low_batt;                         /* < 15 %: PIR wake forced off (set by power_wake_interval) */
+#define POWER_LOW_BATT_PCT     15
+#define POWER_LOW_BATT_MIN     180
+#define POWER_DERATE_PCT       30
 static volatile uint32_t s_last_activity_ms;
 static volatile uint32_t s_sleep_at_ms;      /* pending `pwr sleepnow` deadline, 0 = none */
 static uint32_t s_fail_until_ms;
@@ -108,15 +121,23 @@ static bool charging(void)
  * to settle after release; the last valid median is returned then and `pwr status` shows "(cached)". */
 static uint32_t s_batt_last_adc;
 static bool s_batt_cached;
+static uint32_t s_batt_read_ms;      /* tick of the last real burst: one reading per 2 s (below) */
+#define BATT_REUSE_MS 2000
 
+/* One median per 2 s. The divider cannot recharge the SARADC's sample capacitor between back-to-back
+ * bursts: a second burst right after the first reads ~160 mV lower on the cell (`pwr chan 15` showed
+ * "1903 mV x2.00 = 3486 mV", and 0.25.0's first build derated the schedule to 2 % from that), so every
+ * caller inside one status line / report / sleep decision shares the same reading. */
 static uint32_t batt_adc_mv(void)
 {
-	uint32_t a, b, c, t;
+	uint32_t a, b, c, t, now = rtos_get_time();
 
 	if (s_bchan == 15 && sd_adc_pin_blocked(13)) {
 		s_batt_cached = true;
 		return s_batt_last_adc;
 	}
+	if (s_batt_last_adc && s_batt_read_ms && now - s_batt_read_ms < BATT_REUSE_MS)
+		return s_batt_last_adc;
 	a = db_adc_mv(s_bchan);
 	b = db_adc_mv(s_bchan);
 	c = db_adc_mv(s_bchan);
@@ -124,8 +145,10 @@ static uint32_t batt_adc_mv(void)
 	if (a > b) { t = a; a = b; b = t; }
 	if (b > c) { t = b; b = c; c = t; }
 	if (a > b) { t = a; a = b; b = t; }
-	if (b)
+	if (b) {
 		s_batt_last_adc = b;
+		s_batt_read_ms = now ? now : 1;
+	}
 	s_batt_cached = false;
 	return b;
 }
@@ -163,9 +186,121 @@ int power_json(char *buf, int cap)
 {
 	bool chg = charging();
 	uint32_t mv = power_batt_mv();
+	uint32_t next = power_wake_interval(NULL, 0);
 
-	return snprintf(buf, cap, ",\"batt_mv\":%u,\"batt_pct\":%u,\"usb\":%u,\"charging\":%u",
-			mv, batt_pct(mv, chg), usb_present() ? 1 : 0, chg ? 1 : 0);
+	return snprintf(buf, cap, ",\"batt_mv\":%u,\"batt_pct\":%u,\"usb\":%u,\"charging\":%u,\"sleep_min\":%u,\"wake_pir\":%u",
+			mv, batt_pct(mv, chg), usb_present() ? 1 : 0, chg ? 1 : 0, next, (s_wake_pir && !s_low_batt) ? 1 : 0);
+}
+
+/* ---- smart RTC schedule (fw 0.25) ---- */
+static bool sched_is_day(int t)
+{
+	if (s_day_start == s_day_end)
+		return true;
+	if (s_day_start < s_day_end)
+		return t >= s_day_start && t < s_day_end;
+	return t >= s_day_start || t < s_day_end;   /* a day window across midnight */
+}
+
+uint32_t power_wake_interval(char *why, int cap)
+{
+	char w[64], d[40] = "";
+	uint32_t min, mv = power_batt_mv(), pct = batt_pct(mv, charging());
+	int hh, mm;
+
+	if (!s_sched_on) {
+		min = s_snap_min ? s_snap_min : POWER_KEEPALIVE_MIN;
+		snprintf(w, sizeof(w), "fixed snap_min%s", s_snap_min ? "" : " (keepalive)");
+	} else if (app_time_local(&hh, &mm)) {
+		bool day = sched_is_day(hh * 60 + mm);
+		min = day ? s_day_min : s_night_min;
+		snprintf(w, sizeof(w), "%s by clock %02d:%02d", day ? "day" : "night", hh, mm);
+	} else {
+		bool dark = app_light_is_dark();
+		min = dark ? s_night_min : s_day_min;
+		snprintf(w, sizeof(w), "%s by light (no clock)", dark ? "night" : "day");
+	}
+	s_low_batt = pct < POWER_LOW_BATT_PCT;
+	if (s_low_batt) {
+		if (min < POWER_LOW_BATT_MIN)
+			min = POWER_LOW_BATT_MIN;
+		snprintf(d, sizeof(d), ", batt %u%%<%u: %u min, pir wake off", pct, POWER_LOW_BATT_PCT, POWER_LOW_BATT_MIN);
+	} else if (pct < POWER_DERATE_PCT) {
+		min *= 2;
+		snprintf(d, sizeof(d), ", batt %u%%<%u: x2", pct, POWER_DERATE_PCT);
+	}
+	if (min < 1)
+		min = 1;
+	if (min > POWER_SNAP_MAX_MIN)
+		min = POWER_SNAP_MAX_MIN;
+	if (why && cap > 0)
+		snprintf(why, cap, "%s%s", w, d);
+	return min;
+}
+
+void power_sched_params(bool *on, int *day_start_min, int *day_end_min, uint32_t *day_min, uint32_t *night_min)
+{
+	if (on) *on = s_sched_on;
+	if (day_start_min) *day_start_min = s_day_start;
+	if (day_end_min) *day_end_min = s_day_end;
+	if (day_min) *day_min = s_day_min;
+	if (night_min) *night_min = s_night_min;
+}
+
+bool power_wake_pir_get(void)
+{
+	return s_wake_pir;
+}
+
+static bool parse_hhmm(const char *str, int *out)
+{
+	char *e;
+	uint32_t h = os_strtoul(str, &e, 10), m;
+
+	if (e == str || *e != ':')
+		return false;
+	m = os_strtoul(e + 1, &e, 10);
+	if (*e || h > 23 || m > 59)
+		return false;
+	*out = (int)(h * 60 + m);
+	return true;
+}
+
+/* "HH:MM HH:MM DAY NIGHT" (sched on) or "off"; false = unparsable (settings untouched) */
+static bool sched_parse(const char *str)
+{
+	char buf[40], *tok[4];
+	int n = 0, st, en;
+	uint32_t dm, nm;
+
+	if (os_strcmp(str, "off") == 0) {
+		s_sched_on = false;
+		return true;
+	}
+	os_strlcpy(buf, str, sizeof(buf));
+	for (char *t = strtok(buf, " "); t && n < 4; t = strtok(NULL, " "))
+		tok[n++] = t;
+	if (n != 4 || !parse_hhmm(tok[0], &st) || !parse_hhmm(tok[1], &en))
+		return false;
+	dm = os_strtoul(tok[2], NULL, 10);
+	nm = os_strtoul(tok[3], NULL, 10);
+	if (dm < 1 || dm > POWER_SNAP_MAX_MIN || nm < 1 || nm > POWER_SNAP_MAX_MIN)
+		return false;
+	s_sched_on = true;
+	s_day_start = st;
+	s_day_end = en;
+	s_day_min = dm;
+	s_night_min = nm;
+	return true;
+}
+
+static void sched_str(char *buf, int cap)
+{
+	if (!s_sched_on)
+		snprintf(buf, cap, "off (fixed snap_min %u)", s_snap_min);
+	else
+		snprintf(buf, cap, "%02d:%02d-%02d:%02d day %u night %u", s_day_start / 60, s_day_start % 60,
+			 s_day_end / 60, s_day_end % 60, s_day_min, s_night_min);
 }
 
 /* ---- activity / wake bookkeeping ---- */
@@ -256,12 +391,14 @@ static void power_do_sleep(const char *why)
 {
 	const pm_power_module_name_e need_off[] = {PM_POWER_MODULE_NAME_BTSP, PM_POWER_MODULE_NAME_WIFIP_MAC,
 						     PM_POWER_MODULE_NAME_AUDP, PM_POWER_MODULE_NAME_VIDP};
-	uint32_t minutes = s_snap_min ? s_snap_min : POWER_KEEPALIVE_MIN, i, t;
+	char swhy[96];
+	uint32_t minutes = power_wake_interval(swhy, sizeof(swhy)), i, t;
+	bool wake_pir = s_wake_pir && !s_low_batt;   /* < 15 %: the PIR wake is forced off (reported in pwr status + the JSON) */
 	bk_err_t err;
 
 	s_sleeping = true;
-	os_printf("[pwr] sleeping (%s): wake on button%s%s, rtc in %u min, batt %u mV\r\n", why,
-		  s_wake_pir ? " + pir" : "", ", usb plug, uart rx", minutes, power_batt_mv());
+	os_printf("[pwr] sleeping (%s): wake on button%s%s, rtc in %u min (%s), batt %u mV\r\n", why,
+		  wake_pir ? " + pir" : "", ", usb plug, uart rx", minutes, swhy, power_batt_mv());
 
 	/* 1. peripherals off: amp, microSD (sd_prepare_sleep), LEDs, camera, sensor rails (app side), then Wi-Fi */
 	app_power_prepare_sleep();
@@ -270,7 +407,20 @@ static void power_do_sleep(const char *why)
 
 	/* 2. pins held through the sleep: amp enable low (floating leaks audio + current), PIR enabled */
 	keep_pin_in_sleep(PIN_PWR_AMP, false);
-	if (s_wake_pir) {
+	/* USB present (GPIO 19) is a floating input while awake; pull it DOWN through the sleep so a
+	 * charger's rising edge is a clean wake (0.25.0; UNVERIFIED until a charger is at hand: the
+	 * pin's polarity itself is still unconfirmed, see docs/notes/power.md). power_init() restores
+	 * pull-disable after the wake reset. */
+	{
+		gpio_config_t usb_cfg = {
+			.io_mode = GPIO_INPUT_ENABLE,
+			.pull_mode = GPIO_PULL_DOWN_EN,
+			.func_mode = GPIO_SECOND_FUNC_DISABLE,
+		};
+		db_pin_cfg(PIN_USB_PRESENT, GPIO_INPUT_ENABLE, GPIO_PULL_DOWN_EN);
+		bk_gpio_register_lowpower_keep_status(PIN_USB_PRESENT, &usb_cfg);
+	}
+	if (wake_pir) {
 		uint32_t sens = app_power_pir_sens();
 		keep_pin_in_sleep(PIN_PIR_ENABLE, true);
 		keep_pin_in_sleep(PIN_PIR_SENS0, (sens & 1) != 0);   /* the stock keeps the sensitivity bits driven; floating = undefined sensitivity */
@@ -280,7 +430,7 @@ static void power_do_sleep(const char *why)
 	/* 3. wake sources: GPIO (button falling, USB plug rising, PIR rising if enabled) + RTC */
 	bk_gpio_register_wakeup_source(PIN_PWR_BUTTON, GPIO_INT_TYPE_FALLING_EDGE);
 	bk_gpio_register_wakeup_source(PIN_USB_PRESENT, GPIO_INT_TYPE_RISING_EDGE);
-	if (s_wake_pir)
+	if (wake_pir)
 		bk_gpio_register_wakeup_source(PIN_PWR_PIR, GPIO_INT_TYPE_RISING_EDGE);
 	else
 		bk_gpio_unregister_wakeup_source(PIN_PWR_PIR);
@@ -321,7 +471,9 @@ static void power_do_sleep(const char *why)
 	bk_pm_sleep_mode_set(PM_MODE_DEFAULT);
 	bk_alarm_unregister(AON_RTC_ID_1, (uint8_t *)"pwrwake");
 	bk_gpio_unregister_wakeup_source(PIN_USB_PRESENT);
-	if (s_wake_pir)
+	bk_gpio_unregister_lowpower_keep_status(PIN_USB_PRESENT);
+	db_pin_cfg(PIN_USB_PRESENT, GPIO_INPUT_ENABLE, GPIO_PULL_DISABLE);
+	if (wake_pir)
 		bk_gpio_unregister_wakeup_source(PIN_PWR_PIR);
 	s_fail_until_ms = rtos_get_time() + POWER_FAIL_BACKOFF_MS;
 	s_sleep_at_ms = 0;
@@ -374,6 +526,11 @@ void power_init(void)
 		s_bchan = v;
 	if (kv_get_u32(KV_PWR_BRATIO, &v) && v >= 100 && v <= 400)
 		s_bratio = v;
+	{
+		char sv[40];
+		if (db_kv_get(KV_PWR_SCHED, sv, sizeof(sv)) && !sched_parse(sv))
+			os_printf("[pwr] bad %s '%s': using the default schedule\r\n", KV_PWR_SCHED, sv);
+	}
 
 	/* status inputs as the stock configures them (GPIO 50 = PIR enable is owned by pir.c) */
 	db_pin_cfg(PIN_USB_PRESENT, GPIO_INPUT_ENABLE, GPIO_PULL_DISABLE);
@@ -404,10 +561,14 @@ void power_init(void)
 		s_inhibit_why = "crash boot";
 	}
 	power_activity();
-	os_printf("[pwr] boot: %s%s%s | batt %u mV usb %d chg %d | sleep %s idle %u s wake_pir %s snap_min %u force %s%s\r\n",
-		  reset_reason_str(s_boot_reason), s_wake_pending ? " wake=" : "", s_wake_pending ? s_wake_reason : "",
-		  power_batt_mv(), usb_present(), charging(), s_sleep_en ? "on" : "off", s_idle_s, s_wake_pir ? "on" : "off",
-		  s_snap_min, s_force ? "on" : "off", s_inhibit ? " (auto sleep inhibited: crash boot)" : "");
+	{
+		char sv[48];
+		sched_str(sv, sizeof(sv));
+		os_printf("[pwr] boot: %s%s%s | batt %u mV usb %d chg %d | sleep %s idle %u s wake_pir %s snap_min %u force %s sched %s%s\r\n",
+			  reset_reason_str(s_boot_reason), s_wake_pending ? " wake=" : "", s_wake_pending ? s_wake_reason : "",
+			  power_batt_mv(), usb_present(), charging(), s_sleep_en ? "on" : "off", s_idle_s, s_wake_pir ? "on" : "off",
+			  s_snap_min, s_force ? "on" : "off", sv, s_inhibit ? " (auto sleep inhibited: crash boot)" : "");
+	}
 	if (rtos_create_thread(&t, BEKEN_APPLICATION_PRIORITY, "power", power_task, 4096, NULL) != BK_OK)
 		os_printf("[pwr] task failed\r\n");
 }
@@ -425,11 +586,15 @@ static void pwr_status(void)
 	uint32_t now = rtos_get_time(), adc = batt_adc_mv(), mv = adc * s_bratio / 100;
 	bool chg = charging();
 	uint32_t hold = now < POWER_BOOT_HOLD_MS ? (POWER_BOOT_HOLD_MS - now) / 1000 : 0;
+	char sv[48], why[96];
+	uint32_t next = power_wake_interval(why, sizeof(why));
 
-	db_reply("[pwr] batt %u mV %u%% (adc%u %u mV x%u.%02u)%s usb %d chg %d | sleep %s force %s idle %u s wake_pir %s snap_min %u"
-		 " | up %u s hold %u s idle %u s busy %d%s%s%s | boot %s%s%s\r\n",
+	sched_str(sv, sizeof(sv));
+	db_reply("[pwr] batt %u mV %u%% (adc%u %u mV x%u.%02u)%s usb %d chg %d | sleep %s force %s idle %u s wake_pir %s%s snap_min %u"
+		 " | sched %s -> next %u min (%s) | up %u s hold %u s idle %u s busy %d%s%s%s | boot %s%s%s\r\n",
 		 mv, batt_pct(mv, chg), s_bchan, adc, s_bratio / 100, s_bratio % 100, s_batt_cached ? " (cached: sd power)" : "", usb_present(), chg,
-		 s_sleep_en ? "on" : "off", s_force ? "on" : "off", s_idle_s, s_wake_pir ? "on" : "off", s_snap_min,
+		 s_sleep_en ? "on" : "off", s_force ? "on" : "off", s_idle_s, s_wake_pir ? "on" : "off",
+		 s_wake_pir && s_low_batt ? " (FORCED OFF: battery)" : "", s_snap_min, sv, next, why,
 		 now / 1000, hold, (now - s_last_activity_ms) / 1000, app_power_busy(),
 		 s_inhibit ? " INHIBITED " : "", s_inhibit ? s_inhibit_why : "",
 		 s_sleep_at_ms ? " sleepnow pending" : (s_fail_until_ms && (int32_t)(now - s_fail_until_ms) < 0 ? " backoff" : ""),
@@ -473,7 +638,8 @@ void cli_pwr_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 			v = POWER_SNAP_MAX_MIN;
 		s_snap_min = v;
 		kv_set_u32(KV_PWR_SNAP, v);
-		db_reply("[pwr] rtc wake every %u min%s\r\n", v ? v : POWER_KEEPALIVE_MIN, v ? "" : " (keepalive only)");
+		db_reply("[pwr] rtc wake every %u min%s%s\r\n", v ? v : POWER_KEEPALIVE_MIN, v ? "" : " (keepalive only)",
+			 s_sched_on ? " (used only with `pwr sched off`; the schedule is on)" : "");
 	} else if (os_strcmp(argv[1], "sleepnow") == 0) {
 		if (s_sleeping) {
 			db_reply("[pwr] sleep sequence already running\r\n");
@@ -483,7 +649,7 @@ void cli_pwr_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 		if (!s_sleep_at_ms)
 			s_sleep_at_ms = 1;
 		db_reply("[pwr] sleeping in %u s: wake on button%s, usb plug, uart rx, rtc in %u min (cancel: pwr sleep off)\r\n",
-			 POWER_SLEEPNOW_GRACE_MS / 1000, s_wake_pir ? ", pir" : "", s_snap_min ? s_snap_min : POWER_KEEPALIVE_MIN);
+			 POWER_SLEEPNOW_GRACE_MS / 1000, s_wake_pir && !s_low_batt ? ", pir" : "", power_wake_interval(NULL, 0));
 	} else if (os_strcmp(argv[1], "chan") == 0 && argc >= 3) {
 		v = os_strtoul(argv[2], NULL, 10);
 		if (v < 16) {
@@ -498,8 +664,32 @@ void cli_pwr_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 			kv_set_u32(KV_PWR_BRATIO, v);
 		}
 		db_reply("[pwr] divider ratio x%u.%02u -> %u mV\r\n", s_bratio / 100, s_bratio % 100, power_batt_mv());
+	} else if (os_strcmp(argv[1], "sched") == 0) {
+		char sv[48], why[96], joined[40];
+		if (argc == 3 && (os_strcmp(argv[2], "off") == 0 || os_strcmp(argv[2], "on") == 0)) {
+			s_sched_on = os_strcmp(argv[2], "on") == 0;
+			if (s_sched_on)
+				snprintf(joined, sizeof(joined), "%02d:%02d %02d:%02d %u %u", s_day_start / 60, s_day_start % 60,
+					 s_day_end / 60, s_day_end % 60, s_day_min, s_night_min);
+			db_kv_set(KV_PWR_SCHED, s_sched_on ? joined : "off");
+		} else if (argc >= 6) {
+			snprintf(joined, sizeof(joined), "%s %s %s %s", argv[2], argv[3], argv[4], argv[5]);
+			if (!sched_parse(joined)) {
+				db_reply("pwr sched DAY_START DAY_END DAY_MIN NIGHT_MIN (HH:MM HH:MM 1-1440 1-1440, e.g. 07:00 22:00 15 60) | sched off | sched on\r\n");
+				return;
+			}
+			db_kv_set(KV_PWR_SCHED, joined);
+		} else if (argc != 2) {
+			db_reply("pwr sched DAY_START DAY_END DAY_MIN NIGHT_MIN | sched off | sched on | sched\r\n");
+			return;
+		}
+		sched_str(sv, sizeof(sv));
+		v = power_wake_interval(why, sizeof(why));
+		db_reply("[pwr] sched %s -> next rtc wake in %u min (%s)\r\n", sv, v, why);
+	} else if (os_strcmp(argv[1], "policy") == 0) {
+		policy_cli(argc, argv);
 	} else {
-		db_reply("pwr status | sleep on|off | sleep force on|off | idle S | wake_pir on|off | snap_min M | sleepnow | chan ADC | ratio PCT\r\n");
+		db_reply("pwr status | sleep on|off | sleep force on|off | idle S | wake_pir on|off | snap_min M | sched START END DAY NIGHT|off | policy [URL|auto|off|pull] | sleepnow | chan ADC | ratio PCT\r\n");
 	}
 }
 

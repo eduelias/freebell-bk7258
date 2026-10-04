@@ -58,6 +58,36 @@ except Exception:  # pragma: no cover - depends on the host
 
 log = logging.getLogger("vdb")
 
+
+class RamLog(logging.Handler):
+    """The firmware's 8 KB RAM log ring (policy.c): every line this "firmware" prints."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.buf = bytearray()
+        self.total = 0
+        self.lock_ = threading.Lock()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        data = (record.getMessage() + "\r\n").encode(errors="replace")
+        with self.lock_:
+            self.buf += data
+            self.total += len(data)
+            if len(self.buf) > APPLOG_SIZE:
+                del self.buf[:len(self.buf) - APPLOG_SIZE]
+
+    def tail(self, n: int) -> bytes:
+        with self.lock_:
+            return bytes(self.buf[-n:]) if n > 0 else b""
+
+    def all(self) -> bytes:
+        with self.lock_:
+            return bytes(self.buf)
+
+
+ramlog = RamLog()
+log.addHandler(ramlog)
+
 # ---------------------------------------------------------------- constants mirrored from the firmware
 FW_NAME = "doorbell-bk7258-fw"
 TCP_CMD_PORT = 2323
@@ -96,7 +126,13 @@ TALK_MIC_MAX_S = 600
 TALK_MIC_RATE = 16000            # the ADC runs at 2x the configured 8 kHz
 VOC_RATE = 8000                  # voc engine (aud_intf voice mode): 8 kHz G.711 A-law, RTP PT 8
 SPK_RATE = 8000
-SPK_GAIN_DEFAULT = 0x1C
+SPK_GAIN_DEFAULT = 0x1C          # VOL_GAIN_MAX: `vol 100`
+VOL_GAIN_MAX = 0x1C
+POLICY_PATH = "/local/doorbell/policy.json"
+POLICY_TIMEOUT_S = 3
+APPLOG_SIZE = 8192
+LOG_REPLY_MAX = 600
+POWER_LOW_BATT_PCT, POWER_LOW_BATT_MIN, POWER_DERATE_PCT = 15, 180, 30
 BELL_MS = (66450 - 16) * 1000 // (SPK_RATE * 2)   # the stock bell chime, s16le 8 kHz
 
 # simulator timing (simulated seconds, scaled by `sim time`)
@@ -461,7 +497,10 @@ class Device:
         self.talk = TalkState()
         self.sd = SdState()
         self.rtsp = RtspStandIn(self)
-        self.spk_gain = SPK_GAIN_DEFAULT
+        self.spk_gain_raw = -1               # `spk cfg gain N` raw override; -1 = follow `vol`
+        self.policy_result, self.policy_rev, self.policy_detail, self.policy_at_ms = "none", "", "not fetched", 0
+        self.policy_fetched = False
+        self.low_batt = False
         self.spk_busy = False
         self.mic_busy = False
         self.pa_pin = 46
@@ -492,6 +531,10 @@ class Device:
         self.pwr_snap_min = int(kv("db_pwr_snap", "0"))
         self.pwr_bchan = int(kv("db_pwr_bchan", "15"))
         self.pwr_bratio = int(kv("db_pwr_bratio", "200"))
+        self.sched_on, self.day_start, self.day_end, self.day_min, self.night_min = True, 7 * 60, 22 * 60, 15, 60
+        self.sched_parse(kv("db_pwr_sched", "07:00 22:00 15 60") or "07:00 22:00 15 60")
+        self.policy_cfg = kv("db_pwr_policy", "auto") or "auto"
+        self.vol = min(100, int(kv("db_vol", "100")))
         mode = kv("db_cam_mode", "auto")
         self.cam.pref = {"jpeg": 1, "h264": 2}.get(mode or "auto", 0)
         q = (kv("db_h264_q", "120 24") or "120 24").split()
@@ -507,6 +550,7 @@ class Device:
         self.voc_manual = False
         self.voc_starts = 0
         self.sd_auto = kv("db_sd_auto", "1") != "0"
+        self.sd_keep_s = max(5, int(kv("db_sd_keep", "30")))
         self.hook = kv("db_hook", self.hook) or HOOK_DEFAULT
         stored_token = kv("db_token")
         if stored_token is not None and not self.args.token_from_cli:
@@ -540,8 +584,172 @@ class Device:
         self.talk = TalkState()
         self.spk_busy = self.mic_busy = False
         self.ota_running = False
+        self.policy_fetched = False
+        self.policy_result, self.policy_rev, self.policy_detail, self.policy_at_ms = "none", "", "not fetched", 0
 
     # ------------------------------------------------------------ helpers
+    def spk_gain(self) -> int:
+        """spk_gain_now(): the raw override or the volume mapping (policy.c vol_gain)."""
+        return self.spk_gain_raw if self.spk_gain_raw >= 0 else (self.vol * VOL_GAIN_MAX + 50) // 100
+
+    # ---- smart RTC schedule (power.c, fw 0.25)
+    @staticmethod
+    def _hhmm(s: str) -> Optional[int]:
+        m = re.fullmatch(r"(\d{1,2}):(\d{2})", s)
+        if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+            return None
+        return int(m.group(1)) * 60 + int(m.group(2))
+
+    def sched_parse(self, text: str) -> bool:
+        if text == "off":
+            self.sched_on = False
+            return True
+        tok = text.split()
+        if len(tok) != 4:
+            return False
+        st, en = self._hhmm(tok[0]), self._hhmm(tok[1])
+        if st is None or en is None or not tok[2].isdigit() or not tok[3].isdigit():
+            return False
+        dm, nm = int(tok[2]), int(tok[3])
+        if not (1 <= dm <= POWER_SNAP_MAX_MIN and 1 <= nm <= POWER_SNAP_MAX_MIN):
+            return False
+        self.sched_on, self.day_start, self.day_end, self.day_min, self.night_min = True, st, en, dm, nm
+        return True
+
+    def sched_str(self) -> str:
+        if not self.sched_on:
+            return "off (fixed snap_min %u)" % self.pwr_snap_min
+        return "%02d:%02d-%02d:%02d day %u night %u" % (self.day_start // 60, self.day_start % 60, self.day_end // 60,
+                                                        self.day_end % 60, self.day_min, self.night_min)
+
+    def sched_is_day(self, t: int) -> bool:
+        if self.day_start == self.day_end:
+            return True
+        if self.day_start < self.day_end:
+            return self.day_start <= t < self.day_end
+        return t >= self.day_start or t < self.day_end
+
+    def wake_interval(self) -> tuple[int, str]:
+        """power_wake_interval(): minutes until the next RTC wake and why; refreshes the low-battery flag."""
+        pct = self.batt_pct(self.power_batt_mv(), bool(self.charging))
+        if not self.sched_on:
+            mins = self.pwr_snap_min or POWER_KEEPALIVE_MIN
+            why = "fixed snap_min%s" % ("" if self.pwr_snap_min else " (keepalive)")
+        else:
+            now = _dt.datetime.now()      # the simulator's clock is always "synced"
+            day = self.sched_is_day(now.hour * 60 + now.minute)
+            mins = self.day_min if day else self.night_min
+            why = "%s by clock %02d:%02d" % ("day" if day else "night", now.hour, now.minute)
+        self.low_batt = pct < POWER_LOW_BATT_PCT
+        if self.low_batt:
+            mins = max(mins, POWER_LOW_BATT_MIN)
+            why += ", batt %u%%<%u: %u min, pir wake off" % (pct, POWER_LOW_BATT_PCT, POWER_LOW_BATT_MIN)
+        elif pct < POWER_DERATE_PCT:
+            mins *= 2
+            why += ", batt %u%%<%u: x2" % (pct, POWER_DERATE_PCT)
+        return max(1, min(POWER_SNAP_MAX_MIN, mins)), why
+
+    # ---- policy pull (policy.c)
+    def policy_url(self) -> Optional[str]:
+        if self.policy_cfg == "off":
+            return None
+        if self.policy_cfg == "auto":
+            m = re.match(r"^([^/:]+):(\d+)", self.hook or "")
+            return "http://%s:%s%s" % (m.group(1), m.group(2), POLICY_PATH) if m else None
+        return self.policy_cfg
+
+    def policy_fetch(self, nested: bool) -> None:
+        self.policy_at_ms, self.policy_rev = self.clock.now_ms(), ""
+        url = self.policy_url()
+        if not url:
+            self.policy_result, self.policy_detail = "none", "off" if self.policy_cfg == "off" else "no url (hook not set)"
+            log.info("[policy] %s", self.policy_detail)
+            return
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "doorbell-policy"}), timeout=POLICY_TIMEOUT_S) as r:
+                body = r.read(1024).decode(errors="replace")
+            doc = json.loads(body)
+            if not isinstance(doc, dict):
+                raise ValueError("not an object")
+        except urllib.error.HTTPError as e:
+            self.policy_result, self.policy_detail = "error", "HTTP %d" % e.code
+            log.info("[policy] %s: %s", url, self.policy_detail)
+            return
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            self.policy_result, self.policy_detail = "error", "connect failed (%s)" % (getattr(e, "reason", None) or e)
+            log.info("[policy] %s: %s", url, self.policy_detail)
+            return
+        self.policy_rev = str(doc.get("rev", ""))[:23]
+        changed, same, bad, what = 0, 0, 0, []
+
+        def run(cmd: str, key: str, val) -> None:
+            nonlocal changed
+            self.run_line(cmd)
+            changed += 1
+            what.append("%s=%s" % (key, val))
+
+        def uint(v, lo, hi) -> Optional[int]:
+            try:
+                n = int(float(v))
+            except (TypeError, ValueError):
+                return None
+            return n if lo <= n <= hi else None
+
+        def flag(v) -> Optional[bool]:
+            return {"1": True, "true": True, "on": True, "0": False, "false": False, "off": False}.get(str(v).lower())
+
+        for key, lo, hi, cur, fmt in (("volume", 0, 100, lambda: self.vol, "vol %u"), ("pir_sens", 0, 2, lambda: self.pir_sens, "pir sens %u"),
+                                      ("dark_mv", 100, 4000, lambda: self.dark_mv, "ring dark %u"), ("keep_s", 5, 3600, lambda: self.sd_keep_s, "sd keep %u")):
+            if key in doc:
+                n = uint(doc[key], lo, hi)
+                if n is None:
+                    bad += 1
+                elif n != cur():
+                    run(fmt % n, key, doc[key])
+                else:
+                    same += 1
+        for key, cur, fmt in (("wake_pir", lambda: self.pwr_wake_pir, "pwr wake_pir %s"), ("night_auto", lambda: self.night_auto, "night auto %s"),
+                              ("sd_auto", lambda: self.sd_auto, "sd auto %s")):
+            if key in doc:
+                b = flag(doc[key])
+                if b is None:
+                    bad += 1
+                elif b != cur():
+                    run(fmt % ("on" if b else "off"), key, doc[key])
+                else:
+                    same += 1
+        st, en, dm, nm, diff, any_ = self.day_start, self.day_end, self.day_min, self.night_min, False, False
+        for key in ("day_start", "day_end"):
+            if key in doc:
+                any_ = True
+                t = self._hhmm(str(doc[key]))
+                if t is None:
+                    bad += 1
+                elif key == "day_start" and t != st:
+                    st, diff = t, True
+                elif key == "day_end" and t != en:
+                    en, diff = t, True
+        for key in ("day_min", "night_min"):
+            if key in doc:
+                any_ = True
+                n = uint(doc[key], 1, POWER_SNAP_MAX_MIN)
+                if n is None:
+                    bad += 1
+                elif key == "day_min" and n != dm:
+                    dm, diff = n, True
+                elif key == "night_min" and n != nm:
+                    nm, diff = n, True
+        if any_ and not self.sched_on:
+            what.append("sched=skipped(off)")
+        elif diff:
+            run("pwr sched %02d:%02d %02d:%02d %u %u" % (st // 60, st % 60, en // 60, en % 60, dm, nm), "sched",
+                "%02d:%02d-%02d:%02d/%u/%u" % (st // 60, st % 60, en // 60, en % 60, dm, nm))
+        elif any_:
+            same += 1
+        self.policy_result = "applied"
+        self.policy_detail = "%d changed %d same%s" % (changed, same, " BAD values" if bad else "")
+        log.info("[policy] rev %s: %s%s", self.policy_rev or "-", self.policy_detail, (" | " + " ".join(what)) if what else "")
+
     def uptime_ms(self) -> int:
         return self.clock.now_ms() - self.boot_ms
 
@@ -594,11 +802,15 @@ class Device:
     def report_json(self, event: str, extra: str = "") -> str:
         chg = bool(self.charging)
         bmv = self.power_batt_mv()
+        sleep_min, _ = self.wake_interval()
+        if event == "boot":   # report_ex("boot", policy_json()): the policy pull result rides on the boot report
+            extra = ',"policy":"%s","policy_rev":"%s"' % (self.policy_result, self.policy_rev) + extra
         return ('{"event":"%s","fw":"%s","ip":"%s","mv":%u,"light_mv":%u,"uptime_s":%u,"motion_count":%u,'
-                '"ring_count":%u,"pir_on":%u,"pir_sens":%u,"batt_mv":%u,"batt_pct":%u,"usb":%u,"charging":%u%s}'
+                '"ring_count":%u,"pir_on":%u,"pir_sens":%u,"batt_mv":%u,"batt_pct":%u,"usb":%u,"charging":%u,"sleep_min":%u,"wake_pir":%u%s}'
                 % (event, self.fw, self.ip, self.adc_mv(9), self.light_read_mv(), self.uptime_ms() // 1000,
                    self.motion_count, self.ring_count, 1 if self.pir_on else 0, self.pir_sens,
-                   bmv, self.batt_pct(bmv, chg), self.usb, 1 if chg else 0, extra))
+                   bmv, self.batt_pct(bmv, chg), self.usb, 1 if chg else 0, sleep_min,
+                   1 if self.pwr_wake_pir and not self.low_batt else 0, extra))
 
     def report(self, event: str, extra: str = "") -> int:
         body = self.report_json(event, extra)
@@ -759,7 +971,7 @@ class Device:
     # ------------------------------------------------------------ speaker (spk / talk)
     def spk_play(self, ms: int, what: str, hz: int = 0) -> None:
         self.spk_busy = True
-        log.info("[spk] %s %u ms (PA GPIO %d on, gain 0x%x)", what, ms, self.pa_pin, self.spk_gain)
+        log.info("[spk] %s %u ms (PA GPIO %d on, gain 0x%x)", what, ms, self.pa_pin, self.spk_gain())
         if self.args.audio and hz:
             play_tone_on_host(hz, ms)
 
@@ -863,9 +1075,9 @@ class Device:
             return
         self.sleeping = True
         self.state = "asleep"
-        rtc_min = self.pwr_snap_min or POWER_KEEPALIVE_MIN
-        log.info("[pwr] deep sleep (%s): amp off, LEDs off, camera closed, rails low, wifi stop; rtc wake in %u min, "
-                 "wake on button%s, usb plug, uart rx", why, rtc_min, ", pir" if self.pwr_wake_pir else "")
+        rtc_min, swhy = self.wake_interval()
+        log.info("[pwr] deep sleep (%s): amp off, LEDs off, camera closed, rails low, wifi stop; rtc wake in %u min (%s), "
+                 "wake on button%s, usb plug, uart rx", why, rtc_min, swhy, ", pir" if self.pwr_wake_pir and not self.low_batt else "")
         self.cam_close()
         self.white_manual, self.white_mask = -1, 0
         self._white_apply()
@@ -931,8 +1143,11 @@ class Device:
             if self.clock.sleep(BOOT_IP_S, self.stop_all) and self.state == "booting":
                 self.got_ip = True
                 self.state = "awake"
-                self.pend_boot = True
                 log.info("[wifi] got ip %s", self.ip)
+                if not self.policy_fetched:      # policy_boot_fetch(): once per boot, before the boot report
+                    self.policy_fetched = True
+                    self.policy_fetch(False)
+                self.pend_boot = True
 
         threading.Thread(target=got_ip, name="wifi", daemon=True).start()
 
@@ -1240,11 +1455,13 @@ class Device:
             adc = self.adc_mv(self.pwr_bchan)
             mv = adc * self.pwr_bratio // 100
             hold = (POWER_BOOT_HOLD_MS - self.uptime_ms()) // 1000 if self.uptime_ms() < POWER_BOOT_HOLD_MS else 0
-            r.add("[pwr] batt %u mV %u%% (adc%u %u mV x%u.%02u) usb %d chg %d | sleep %s force %s idle %u s wake_pir %s snap_min %u"
-                  " | up %u s hold %u s idle %u s busy %d%s | boot %s%s%s\r\n" % (
+            nxt, why = self.wake_interval()
+            r.add("[pwr] batt %u mV %u%% (adc%u %u mV x%u.%02u) usb %d chg %d | sleep %s force %s idle %u s wake_pir %s%s snap_min %u"
+                  " | sched %s -> next %u min (%s) | up %u s hold %u s idle %u s busy %d%s | boot %s%s%s\r\n" % (
                       mv, self.batt_pct(mv, bool(self.charging)), self.pwr_bchan, adc, self.pwr_bratio // 100, self.pwr_bratio % 100,
                       self.usb, self.charging, "on" if self.pwr_sleep else "off", "on" if self.pwr_force else "off", self.pwr_idle_s,
-                      "on" if self.pwr_wake_pir else "off", self.pwr_snap_min, self.uptime_ms() // 1000, hold,
+                      "on" if self.pwr_wake_pir else "off", " (FORCED OFF: battery)" if self.pwr_wake_pir and self.low_batt else "",
+                      self.pwr_snap_min, self.sched_str(), nxt, why, self.uptime_ms() // 1000, hold,
                       (now - self.last_activity_ms) // 1000, int(self.busy()), " sleepnow pending" if self.sleep_at_ms else "",
                       self.boot_reason, " wake=" if self.wake_reason else "", self.wake_reason))
             return
@@ -1273,14 +1490,15 @@ class Device:
             v = min(POWER_SNAP_MAX_MIN, int(argv[2]) if argv[2].isdigit() else 0)
             self.pwr_snap_min = v
             self.store.kv_set("db_pwr_snap", str(v))
-            r.add("[pwr] rtc wake every %u min%s\r\n" % (v or POWER_KEEPALIVE_MIN, "" if v else " (keepalive only)"))
+            r.add("[pwr] rtc wake every %u min%s%s\r\n" % (v or POWER_KEEPALIVE_MIN, "" if v else " (keepalive only)",
+                                                           " (used only with `pwr sched off`; the schedule is on)" if self.sched_on else ""))
         elif sub == "sleepnow":
             if self.sleeping:
                 r.add("[pwr] sleep sequence already running\r\n")
                 return
             self.sleep_at_ms = now + POWER_SLEEPNOW_GRACE_MS or 1
             r.add("[pwr] sleeping in %u s: wake on button%s, usb plug, uart rx, rtc in %u min (cancel: pwr sleep off)\r\n" % (
-                POWER_SLEEPNOW_GRACE_MS // 1000, ", pir" if self.pwr_wake_pir else "", self.pwr_snap_min or POWER_KEEPALIVE_MIN))
+                POWER_SLEEPNOW_GRACE_MS // 1000, ", pir" if self.pwr_wake_pir and not self.low_batt else "", self.wake_interval()[0]))
         elif sub == "chan" and len(argv) >= 3:
             v = int(argv[2]) if argv[2].isdigit() else 99
             if v < 16:
@@ -1294,8 +1512,64 @@ class Device:
                 self.pwr_bratio = v
                 self.store.kv_set("db_pwr_bratio", str(v))
             r.add("[pwr] divider ratio x%u.%02u -> %u mV\r\n" % (self.pwr_bratio // 100, self.pwr_bratio % 100, self.power_batt_mv()))
+        elif sub == "sched":
+            if len(argv) == 3 and argv[2] in ("on", "off"):
+                self.sched_on = argv[2] == "on"
+                joined = "%02d:%02d %02d:%02d %u %u" % (self.day_start // 60, self.day_start % 60, self.day_end // 60, self.day_end % 60,
+                                                        self.day_min, self.night_min)
+                self.store.kv_set("db_pwr_sched", joined if self.sched_on else "off")
+            elif len(argv) >= 6:
+                joined = " ".join(argv[2:6])
+                if not self.sched_parse(joined):
+                    r.add("pwr sched DAY_START DAY_END DAY_MIN NIGHT_MIN (HH:MM HH:MM 1-1440 1-1440, e.g. 07:00 22:00 15 60) | sched off | sched on\r\n")
+                    return
+                self.store.kv_set("db_pwr_sched", joined)
+            elif len(argv) != 2:
+                r.add("pwr sched DAY_START DAY_END DAY_MIN NIGHT_MIN | sched off | sched on | sched\r\n")
+                return
+            nxt, why = self.wake_interval()
+            r.add("[pwr] sched %s -> next rtc wake in %u min (%s)\r\n" % (self.sched_str(), nxt, why))
+        elif sub == "policy":
+            if len(argv) >= 3:
+                if argv[2] == "pull":
+                    self.policy_fetch(True)
+                elif argv[2] in ("auto", "off") or argv[2].startswith("http://"):
+                    self.policy_cfg = argv[2][:95]
+                    self.store.kv_set("db_pwr_policy", self.policy_cfg)
+                else:
+                    r.add("pwr policy [auto | off | http://IP[:port]/path | pull]   (auto = http://<hook host>:<hook port>%s)\r\n" % POLICY_PATH)
+                    return
+            url = self.policy_url()
+            src = "off" if self.policy_cfg == "off" else (url + " (auto)" if url and self.policy_cfg == "auto" else url or "none (auto: hook not set)")
+            r.add("[policy] %s | last: %s%s%s (%s)%s%u s ago\r\n" % (
+                src, self.policy_result, " rev " if self.policy_rev else "", self.policy_rev, self.policy_detail,
+                " " if self.policy_at_ms else " never, ", max(0, self.clock.now_ms() - self.policy_at_ms) // 1000 if self.policy_at_ms else 0))
         else:
-            r.add("pwr status | sleep on|off | sleep force on|off | idle S | wake_pir on|off | snap_min M | sleepnow | chan ADC | ratio PCT\r\n")
+            r.add("pwr status | sleep on|off | sleep force on|off | idle S | wake_pir on|off | snap_min M | sched START END DAY NIGHT|off"
+                  " | policy [URL|auto|off|pull] | sleepnow | chan ADC | ratio PCT\r\n")
+
+    # ---- vol / log (policy.c)
+    def cmd_vol(self, argv: list[str], r: Reply) -> None:
+        if len(argv) >= 2:
+            if not argv[1].isdigit() or int(argv[1]) > 100:
+                r.add("vol [0-100]   (speaker volume: chime and talk `gain auto`; now %u%% = dac gain 0x%x)\r\n" % (
+                    self.vol, (self.vol * VOL_GAIN_MAX + 50) // 100))
+                return
+            self.vol = int(argv[1])
+            self.store.kv_set("db_vol", str(self.vol))
+        r.add("[vol] %u%% -> dac gain 0x%x (chime + talk auto; `spk cfg gain N` overrides raw)\r\n" % (self.vol, (self.vol * VOL_GAIN_MAX + 50) // 100))
+
+    def cmd_log(self, argv: list[str], r: Reply) -> None:
+        n = 300
+        if len(argv) >= 2:
+            if argv[1] == "stat":
+                r.add("[log] %u bytes written, %u in the %u-byte ring (log [N<=%u] | GET /log?t=TOKEN)\r\n" % (
+                    ramlog.total, min(ramlog.total, APPLOG_SIZE), APPLOG_SIZE, LOG_REPLY_MAX))
+                return
+            n = int(argv[1]) if argv[1].isdigit() else 0
+            if n <= 0 or n > LOG_REPLY_MAX:
+                n = LOG_REPLY_MAX
+        r.text = (r.text + ramlog.tail(n).decode(errors="replace"))[:REPLY_MAX]   # app_reply_raw(): not logged again
 
     # ---- cam / rtsp
     def cmd_cam(self, argv: list[str], r: Reply) -> None:
@@ -1425,10 +1699,11 @@ class Device:
             for i in range(2, len(argv) - 1, 2):
                 if argv[i] == "gain":
                     try:
-                        self.spk_gain = int(argv[i + 1], 0)
+                        self.spk_gain_raw = -1 if argv[i + 1] == "auto" else int(argv[i + 1], 0)
                     except ValueError:
                         pass
-            r.add("[spk] cfg chl 0 mode 0 gain 0x%x rate %u clk xtal pa %d\r\n" % (self.spk_gain, SPK_RATE, self.pa_pin))
+            r.add("[spk] cfg chl 0 mode 0 gain 0x%x%s rate %u clk xtal pa %d\r\n" % (
+                self.spk_gain(), " (raw override)" if self.spk_gain_raw >= 0 else " (vol)", SPK_RATE, self.pa_pin))
         else:
             r.add("spk tone [HZ] [MS] | play beepa|beepb|bell|ADDR LEN | net HOST PORT | stop | pa PIN|off | cfg [chl L|R|LR] [mode diff|se]"
                   " [gain N] [rate HZ] [clk xtal|apll]  (busy %d)\r\n" % int(self.spk_busy))
@@ -1455,7 +1730,7 @@ class Device:
 
     def cmd_talk(self, argv: list[str], r: Reply) -> None:
         t = self.talk
-        gain = self.talk_gain or self.spk_gain
+        gain = self.talk_gain or self.spk_gain()
         if len(argv) >= 2 and argv[1] == "status":
             st = ("speaking" if t.speaking else "") + (("+listening" if t.speaking else "listening") if t.listening else "") \
                 + ("idle" if not t.speaking and not t.listening else "")
@@ -1503,7 +1778,7 @@ class Device:
                 return
             self.talk_gain = g
             self.store.kv_set("db_talk_gain", str(g))
-            r.add("[talk] speaker gain %s0x%x\r\n" % ("" if g else "auto = spk cfg ", g or self.spk_gain))
+            r.add("[talk] speaker gain %s0x%x\r\n" % ("" if g else "auto = spk cfg ", g or self.spk_gain()))
         elif len(argv) >= 3 and argv[1] == "micgain":
             try:
                 g = int(argv[2], 0)
@@ -1599,6 +1874,10 @@ class Device:
             self.sd_auto = argv[2] == "on"
             self.store.kv_set("db_sd_auto", "1" if self.sd_auto else "0")
             r.add("[sd] auto-save on ring/motion %s\r\n" % ("on" if self.sd_auto else "off"))
+        elif sub == "keep" and len(argv) >= 3:
+            self.sd_keep_s = max(5, int(argv[2]) if argv[2].isdigit() else 5)
+            self.store.kv_set("db_sd_keep", str(self.sd_keep_s))
+            r.add("[sd] keep %u s after the last save\r\n" % self.sd_keep_s)
         else:
             r.add("sd status | mount | umount [off] | format [TOKEN] | ls [DIR] [SKIP] | save [EVENT] | auto on|off | "
                   "pwr PIN|none | pins 1|0 | power on|off | ntp HOST | tz MIN | time EPOCH | sync\r\n")
@@ -1684,6 +1963,7 @@ class Device:
         "led": cmd_led, "night": cmd_night, "sys": cmd_sys, "ring": cmd_ring, "pwr": cmd_pwr,
         "cam": cmd_cam, "rtsp": cmd_rtsp, "spk": cmd_spk, "mic": cmd_mic,
         "talk": cmd_talk, "sd": cmd_sd,          # feat/talk, feat/sd
+        "vol": cmd_vol, "log": cmd_log,          # fw 0.25 (policy.c)
         "sim": cmd_sim,                            # simulator only
     }
 
@@ -1979,6 +2259,8 @@ class HttpHandler(BaseHTTPRequestHandler):
             return self._sim()
         if path.startswith(("/speak", "/mic.wav", "/talk")):
             return self._talk()
+        if self.command == "GET" and re.match(r"^/(cmd|log)(\?|$)", path):
+            return self._cmd()
         if self.command != "GET":
             return self._raw(400, "Bad Request", "text/plain", b"GET only\n")
         if path.startswith("/stream") or path.startswith("/snapshot"):
@@ -2024,6 +2306,25 @@ class HttpHandler(BaseHTTPRequestHandler):
         finally:
             self.close_connection = True
             log.info("[http] stream closed after %u frames", sent)
+
+    def _cmd(self) -> None:
+        """policy_http_handle(): GET /cmd?t=TOKEN&c=COMMAND -> the dispatcher's REPLY text; GET /log?t=TOKEN -> the ring."""
+        dev = self.dev
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(self.path).query, keep_blank_values=True))
+        if not dev.token or q.get("t") != dev.token:
+            log.info("[http] %s: denied", self.path[:4])
+            return self._raw(403, "Forbidden", "text/plain", b"denied\n", "Cache-Control: no-cache\r\n")
+        if self.path.startswith("/log"):
+            return self._raw(200, "OK", "text/plain", ramlog.all(), "Cache-Control: no-cache\r\n")
+        cmd = q.get("c", "").strip()
+        if not cmd:
+            return self._raw(400, "Bad Request", "text/plain", b"c=<command> missing\n", "Cache-Control: no-cache\r\n")
+        log.info("[http] cmd: %s", cmd)
+        dev.activity()
+        status, text = dev.run_line(cmd[:159])
+        if status != "ok":
+            return self._raw(404, "Not Found", "text/plain", b"unknown command\n", "Cache-Control: no-cache\r\n")
+        self._raw(200, "OK", "text/plain", text.encode(), "Cache-Control: no-cache\r\n")
 
     def _sim(self) -> None:
         rest = urllib.parse.unquote(self.path[len("/sim"):]).strip("/")
@@ -2073,7 +2374,7 @@ class HttpHandler(BaseHTTPRequestHandler):
             return False
         dev.talk.speaking, dev.talk.abort, dev.spk_busy = True, False, True
         dev.talk.speak_calls += 1
-        log.info("[talk] speak (%s): PA on, gain 0x%x", what, dev.talk_gain or dev.spk_gain)
+        log.info("[talk] speak (%s): PA on, gain 0x%x", what, dev.talk_gain or dev.spk_gain())
         return True
 
     def _speak_close(self, ms: int, in_bytes: int, in_rate: int) -> None:

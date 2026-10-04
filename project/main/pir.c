@@ -24,6 +24,7 @@
 #include <common/bk_include.h>   /* sdkconfig.h: CONFIG_SYS_CPU0 */
 #if (CONFIG_SYS_CPU0)   /* GPIO ISR + easyflash KV exist on CPU0 only; the file is compiled for all three cores */
 #include "pir.h"
+#include "applog.h"   /* last: our os_printf lines go to the RAM log ring (policy.c) */
 #include <os/os.h>
 #include <os/str.h>
 #include <os/mem.h>

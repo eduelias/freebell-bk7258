@@ -35,6 +35,44 @@ Versions are the `FW_VERSION` in `project/main/app_main.c` (also in every report
 - Home Assistant: `docs/homeassistant/` two-way audio notes (go2rtc view, the HA frontend is still
   listen-only) and an `Answer` action on the ring push.
 
+## 0.25.0
+- **Smart RTC schedule** (2026-10-04, `power.c`): `pwr sched DAY_START DAY_END DAY_MIN NIGHT_MIN`
+  (KV `db_pwr_sched`, default `07:00 22:00 15 60`, on by default) picks the RTC wake interval from
+  the local time (SNTP clock + `sd tz`, `app_time_local()` in sdcard.c) or, while the clock is
+  unsynced, from the light sensor (dark = night, the `ring dark` threshold). Battery derating:
+  < 30 % doubles the interval, < 15 % forces 180 min and the PIR wake off (`pwr status` shows
+  `(FORCED OFF: battery)`). `pwr sched off` = the fixed `snap_min` of before. `pwr status` and
+  `pwr sched` show the computed next interval and why; every report carries `sleep_min` and the
+  effective `wake_pir`.
+- **Policy pull** (`policy.c`): `pwr policy URL|auto|off|pull` (KV `db_pwr_policy`, default auto =
+  `http://<hook host>:<hook port>/local/doorbell/policy.json`). Once per boot, right after the IP and
+  before the boot report, the device GETs the file (3 s timeout, <= 1 KB) and applies the
+  whitelisted keys `day_start day_end day_min night_min wake_pir pir_sens dark_mv volume night_auto
+  keep_s sd_auto` through the same commands as the shell (persisting in KV), only where the value
+  differs. Never sleep on/off, hook or token. One summary line in the log; the boot report carries
+  `"policy":"applied|none|error"` and `"policy_rev"` (the file's `rev`). `pwr sched off` on the
+  device wins over the schedule keys.
+- `vol 0-100` (KV `db_vol`, default 100 = the clean maximum 0x1c): linear DAC gain for the chime
+  and for talk with `gain auto`; `spk cfg gain N` is a raw override, `spk cfg gain auto` releases it.
+- `GET /cmd?t=TOKEN&c=COMMAND` on :8080 runs the shared dispatcher (`app_exec()`, now also behind
+  the TCP channel, serialised by a mutex) and returns the reply as text/plain; 403 without the right
+  token or with no token set. `GET /log?t=TOKEN` streams the RAM log.
+- RAM log: the firmware's own `os_printf` lines (every project/main file, via `applog.h`) go to an
+  8 KB ring; `log [N<=600]`, `log stat`. The SDK's async log path has no output hook, so SDK-internal
+  lines are UART-only. The TCP channel logs the peer address with every command (`[tcp] 192.168.2.66:
+  sys info`): every command restarts the idle timer, so an unexpected poller keeps the device awake.
+- Battery read reused for 2 s (`batt_adc_mv()`): a second ADC burst right after the first reads the
+  cell ~160 mV low (the divider cannot recharge the sample capacitor), which made the schedule derate to
+  "2 %" in the first 0.25.0 build. `db_reply()` buffer 300 -> 640 (the longer `pwr status` was cut).
+- USB wake: GPIO 19 is configured as input with pull-down (and kept so through the sleep) before
+  deep sleep, pull-disable again at boot. Unverified until a charger is at hand.
+- Home Assistant: seven input helpers, `doorbell_policy.py` + `shell_command.doorbell_policy_write`
+  (helpers -> policy.json with `rev` = timestamp), automation `doorbell_bk7258_policy`,
+  `rest_command.doorbell_cmd` (URL with the token from `secrets.yaml`), `sensor.doorbell_bk7258_policy`,
+  policy fields in the webhook fan-out and the boot logbook line, setting tiles on the dashboard.
+- Simulator: `vol`, `log`, `pwr sched`, `pwr policy` (a real GET + apply), `/cmd`, `/log`, the new
+  report fields; tests for `/cmd` auth, the volume mapping, the schedule and a policy pull.
+
 ## 0.24.4
 - **microSD: the ring that wakes the device from deep sleep is saved** (2026-10-04). First real wake on
   0.24.3: the ring job ran at ~0.5 s uptime, before the media pipeline existed, the mount failed

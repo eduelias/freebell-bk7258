@@ -36,6 +36,11 @@ void sd_prepare_sleep(void);
 
 /* Wall-clock seconds since the Unix epoch (UTC), 0 when no time source has been seen yet. */
 uint32_t sd_time_now(void);
+/* Local time of day (SNTP/manual clock + `sd tz`); false while the clock is unsynced (power.c schedule). */
+bool app_time_local(int *hh, int *mm);
+/* Current `sd keep` / `sd auto` settings (policy.c compares before applying). */
+uint32_t sd_keep_get(void);
+bool sd_auto_get(void);
 
 /* ---- provided by app_main.c ---- */
 /* Make the camera pipeline ready for the card (JPEG camera open; 0 = open, -1 = H.264 held by an
