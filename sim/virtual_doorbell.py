@@ -1813,7 +1813,7 @@ class Device:
         self.voc_on, self.voc_manual = True, manual
         self.voc_starts += 1
         log.info("[voc] on: 8 kHz G711A, aec %s, mic gain 0x%x spk gain 0x%x, ring 10 x 320 B (prefill 4)",
-                 "on" if self.talk_aec else "off", self.voc_mic or 0x3F, self.talk_gain or self.spk_gain)
+                 "on" if self.talk_aec else "off", self.voc_mic or 0x3F, self.spk_gain())
         return 0
 
     def voc_stop(self) -> None:
@@ -1823,7 +1823,7 @@ class Device:
 
     def voc_status(self) -> str:
         return ("[voc] %s aec %s mic 0x%x spk 0x%x | mic 0 cb 0 B | spk 0 frames 0 B drop-tap 0 err 0 | tap - 0 frames 0 late | mictap - 0 ovr | starts %u\r\n"
-                % ("on" if self.voc_on else "off", "on" if self.talk_aec else "off", self.voc_mic or 0x3F, self.talk_gain or self.spk_gain, self.voc_starts))
+                % ("on" if self.voc_on else "off", "on" if self.talk_aec else "off", self.voc_mic or 0x3F, self.spk_gain(), self.voc_starts))
 
     # ---- sd
     def cmd_sd(self, argv: list[str], r: Reply) -> None:

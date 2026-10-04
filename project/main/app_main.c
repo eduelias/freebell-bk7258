@@ -1108,10 +1108,10 @@ static void cli_spk_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 				s_dac_chl = !os_strcmp(argv[i + 1], "R") ? AUD_DAC_CHL_R : !os_strcmp(argv[i + 1], "LR") ? AUD_DAC_CHL_LR : AUD_DAC_CHL_L;
 			else if (!os_strcmp(argv[i], "mode"))
 				s_dac_mode = !os_strcmp(argv[i + 1], "se") ? AUD_DAC_WORK_MODE_SIGNAL_END : AUD_DAC_WORK_MODE_DIFFEN;
-			else if (!os_strcmp(argv[i], "gain"))
+			else if (!os_strcmp(argv[i], "gain")) {
 				s_dac_gain_raw = !os_strcmp(argv[i + 1], "auto") ? -1 : (int)os_strtoul(argv[i + 1], NULL, 0);   /* raw override; `auto` = back to `vol` */
 				voc_set_spk_gain(spk_gain_now());   /* a live voc session follows it */
-			else if (!os_strcmp(argv[i], "rate"))
+			} else if (!os_strcmp(argv[i], "rate"))
 				s_dac_rate = os_strtoul(argv[i + 1], NULL, 10);
 			else if (!os_strcmp(argv[i], "clk"))
 				s_dac_clk = !os_strcmp(argv[i + 1], "apll") ? AUD_CLK_APLL : AUD_CLK_XTAL;
