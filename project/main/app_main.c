@@ -71,7 +71,7 @@ void db_reply(const char *fmt, ...)
 	REPLY("%s", buf);
 }
 
-#define FW_VERSION "0.26.0"
+#define FW_VERSION "0.26.2"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -340,7 +340,9 @@ static void cli_adc_read_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc,
 
 /* ---- doorbell prototype: Wi-Fi + Home Assistant webhook ---- */
 /* PIR (GPIO 24 output, 50 enable, 25/26 sensitivity) lives in pir.c since v0.19.0 */
-#define PIN_BUTTON 53   /* externally pulled high, expected to drop on press */
+#define PIN_BUTTON 53   /* externally pulled high, drops on press. The same line keys the on-board 433 MHz chime TX:
+                         * driving it low (as the SDK's boot pin map did until patch 0010) rings every paired chime */
+#define PIN_KEY2   51   /* second key in the stock firmware (long press); not wired on this board, parked as input + pull-up */
 #define HEARTBEAT_MS (5 * 60 * 1000)
 #define KV_SSID "db_ssid"
 #define KV_PASS "db_pass"
@@ -633,8 +635,12 @@ static void inputs_init(void)
 {
 	pir_init(motion_cb);   /* GPIO 24 ISR + GPIO 50/25/26 from KV (pir.c) */
 
+	/* 53: the SDK's boot pin map (patched, patch 0010) already leaves it input + pull-up; this keeps
+	 * exactly that (pin_configure() unmaps any peripheral function and keeps the pull-up) */
 	pin_configure(PIN_BUTTON, GPIO_INPUT_ENABLE, GPIO_PULL_UP_EN);
 	bk_gpio_disable_output(PIN_BUTTON);
+	pin_configure(PIN_KEY2, GPIO_INPUT_ENABLE, GPIO_PULL_UP_EN);   /* stock parks its second key the same way (0.26.2) */
+	bk_gpio_disable_output(PIN_KEY2);
 	bk_gpio_register_isr(PIN_BUTTON, button_isr);
 	bk_gpio_set_interrupt_type(PIN_BUTTON, GPIO_INT_TYPE_FALLING_EDGE);
 	bk_gpio_enable_interrupt(PIN_BUTTON);
@@ -2694,6 +2700,8 @@ void app_power_prepare_sleep(void)
 	}
 #endif
 	for (i = 0; i < sizeof(rails); i++) {
+		if (rails[i] == 9 && power_hold9())   /* `pwr hold9 on` (default off): leave the sensor rail up through the sleep */
+			continue;
 		pin_configure(rails[i], GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
 		bk_gpio_set_output_low(rails[i]);
 	}

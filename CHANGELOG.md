@@ -4,6 +4,28 @@ Versions are the `FW_VERSION` in `project/main/app_main.c` (also in every report
 `sys info`). Dates are 2026 unless stated; most of this was written between 2026-10-01 and
 2026-10-03.
 
+## 0.26.2
+- **Radio chimes no longer ring at every boot/wake** (2026-10-04, SDK patch
+  `0010-gpio-default-map-doorbell.patch`). The SDK's boot-time pin map (`GPIO_DEFAULT_DEV_CONFIG`,
+  written by `bk_gpio_driver_init()` at every reset, before our code) had GPIO 53 = the doorbell
+  button = the 433 MHz chime transmitter's key line as an LCD_B2 peripheral output; the idle
+  peripheral held it low until `inputs_init()` reclaimed it, which is a button press to the
+  transmitter. The patched table follows the stock firmware's (disassembled): 53 input + pull-up,
+  6/7 hi-Z, 27-39 peripheral functions off until the camera driver maps them, 25/26/50 keep their
+  level through low power. CPU1/CPU2 apply no table (SDK defconfig), like the stock. Story in
+  `docs/notes/pin-mapping.md`, row-by-row in `docs/notes/sdk-patches.md`.
+- `pwr hold9` default **off** (0.26.1 shipped it on): the rail theory it tested is superseded; a
+  stored `db_pwr_hold9=1` still applies until `pwr hold9 off`.
+- GPIO 51 (the stock firmware's second key, not wired here) parked as input + pull-up at boot.
+- Simulator: `pwr hold9 on|off`.
+
+## 0.26.1
+- `pwr hold9 on|off` (KV `db_pwr_hold9`, default on in this version): keep the GPIO 9 sensor rail
+  high through deep sleep (`bk_gpio_register_lowpower_keep_status`) instead of dropping it in
+  `app_power_prepare_sleep()`. First attempt at the chimes ringing at every wake, on the theory that
+  the rail's power cycle keyed the 433 MHz transmitter; it did not stop them (the cause was the boot
+  pin map, see 0.26.2).
+
 ## 0.26.0
 - **Full-duplex two-way audio over RTSP with echo cancellation** (2026-10-04, feature "duplex"). New
   `project/main/audio_voc.c`: the SDK's `aud_intf` voice mode (ADC/DAC, AEC, noise suppression and

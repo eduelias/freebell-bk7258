@@ -26,6 +26,7 @@ int  power_json(char *buf, int cap);    /* appends ',"batt_mv":N,"batt_pct":N,"u
 bool power_take_wake_event(char *reason, int cap);   /* true once after a deep-sleep wake: reason = button|pir|usb|uart|rtc|gpioNN */
 bool power_wake_pending(void);          /* a "wake" report is still waiting for Wi-Fi */
 uint32_t power_batt_mv(void);           /* battery voltage (median of 3 ADC readings x divider ratio) */
+bool power_hold9(void);                 /* keep the GPIO 9 sensor rail high through deep sleep (`pwr hold9`, fw 0.26.1; default off since 0.26.2) */
 void cli_pwr_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv);
 /* The next RTC wake interval in minutes and why (day/night by clock or light sensor, fixed
  * snap_min, battery derating). Reads the battery and, without a synced clock, the light sensor

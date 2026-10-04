@@ -24,6 +24,7 @@ Deep sleep uses the SDK's pm v2 (SoC reset on wake) and is **off by default**.
 | `pwr policy URL\|auto\|off\|pull` | boot-time settings pull from HA (0.25, below; `policy.c`) | `db_pwr_policy`, auto |
 | `pwr sleepnow` | sleep in 10 s regardless of USB/idle/boot hold (test) | |
 | `pwr chan N` / `pwr ratio PCT` | battery ADC channel / divider x0.01 | `db_pwr_bchan` 15, `db_pwr_bratio` 200 |
+| `pwr hold9 on\|off` | keep the GPIO 9 sensor rail high through deep sleep instead of dropping it with the other rails (0.26.1 experiment, see below) | `db_pwr_hold9`, **off** (0.26.2) |
 
 Report JSON carries `batt_mv`, `batt_pct`, `usb`, `charging`, `sleep_min` (the interval the next
 sleep will arm) and `wake_pir` (effective); the event `wake` with `reason`
@@ -114,3 +115,10 @@ was tested with `force on`. Log: [`../testplans/TESTPLAN-power.md`](../testplans
 4. **PIR wake unproven**: see [pir.md](pir.md). GPIO 50 is owned by `pir.c` (`pir off` keeps it
    low); `power.c` only holds it high through the sleep when `wake_pir` is on.
 5. **Button and USB wake** not yet exercised end to end (the RTC path is).
+6. **`pwr hold9`** (0.26.1) came from the first theory about the radio chimes ringing at every wake
+   ("the GPIO 9 rail power-cycles the 433 MHz transmitter"); 0.26.1 shipped it default **on**. The
+   real cause turned out to be the SDK's boot pin map driving GPIO 53 (SDK patch 0010,
+   [pin-mapping.md](pin-mapping.md)), and the stock firmware never drives GPIO 9 in sleep, so since
+   0.26.2 the default is **off** (KV absent = off; a stored `1` from 0.26.1 still applies until
+   `pwr hold9 off`). Holding the rail costs the light sensor's and the TX module's quiescent current
+   for the whole sleep; only turn it on to test the rail theory again.

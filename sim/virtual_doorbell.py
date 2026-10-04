@@ -528,6 +528,7 @@ class Device:
         self.pwr_force = kv("db_pwr_force", "0") == "1"
         self.pwr_idle_s = max(POWER_IDLE_MIN_S, int(kv("db_pwr_idle", "60")))
         self.pwr_wake_pir = kv("db_pwr_wpir", "0") == "1"
+        self.pwr_hold9 = kv("db_pwr_hold9", "0") == "1"   # fw 0.26.1 `pwr hold9`, default off since 0.26.2
         self.pwr_snap_min = int(kv("db_pwr_snap", "0"))
         self.pwr_bchan = int(kv("db_pwr_bchan", "15"))
         self.pwr_bratio = int(kv("db_pwr_bratio", "200"))
@@ -1482,6 +1483,10 @@ class Device:
             self.pwr_idle_s = v
             self.store.kv_set("db_pwr_idle", str(v))
             r.add("[pwr] idle %u s\r\n" % v)
+        elif sub == "hold9" and len(argv) >= 3 and onoff(argv[2]) is not None:
+            self.pwr_hold9 = bool(onoff(argv[2]))
+            self.store.kv_set("db_pwr_hold9", "1" if self.pwr_hold9 else "0")
+            r.add("[pwr] GPIO 9 rail %s through deep sleep\r\n" % ("held high" if self.pwr_hold9 else "dropped"))
         elif sub == "wake_pir" and len(argv) >= 3 and onoff(argv[2]) is not None:
             self.pwr_wake_pir = bool(onoff(argv[2]))
             self.store.kv_set("db_pwr_wpir", "1" if self.pwr_wake_pir else "0")
@@ -1546,7 +1551,7 @@ class Device:
                 " " if self.policy_at_ms else " never, ", max(0, self.clock.now_ms() - self.policy_at_ms) // 1000 if self.policy_at_ms else 0))
         else:
             r.add("pwr status | sleep on|off | sleep force on|off | idle S | wake_pir on|off | snap_min M | sched START END DAY NIGHT|off"
-                  " | policy [URL|auto|off|pull] | sleepnow | chan ADC | ratio PCT\r\n")
+                  " | policy [URL|auto|off|pull] | hold9 on|off | sleepnow | chan ADC | ratio PCT\r\n")
 
     # ---- vol / log (policy.c)
     def cmd_vol(self, argv: list[str], r: Reply) -> None:

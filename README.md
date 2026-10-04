@@ -244,7 +244,8 @@ Step-by-step instructions, the sanitized YAML and the helper script:
 | 46 | speaker amplifier enable | active high |
 | 50 | PIR enable | active high |
 | 52 | camera PWDN/RESET | pulsed low-high-low before open |
-| 53 | doorbell button | active low, pull-up |
+| 51 | second key (stock firmware) | not wired on this board; parked input + pull-up |
+| 53 | doorbell button | active low, pull-up; the same line keys the on-board 433 MHz chime transmitter, so it must never be driven (SDK patch 0010 fixes the boot pin map that did) |
 | 54, 55 | IR-cut filter coil | day / night pulse; unused by this firmware |
 
 Unmapped: the IR illuminator above the lens. Method and raw observations:

@@ -49,7 +49,8 @@ command).
 | 9 | active-high enable: high = light sensor alive (303 mV), low/hi-Z = dead (24 mV) | sensor / LED rail enable (held low through deep sleep) |
 | 5 | boots as plain GPIO like 9, no effect on the sensor rail; cut with the camera rails on close | camera-related rail, exact function unverified |
 | 24 | idle low; 8 isolated high pulses of 2-4 s in 8 min with nobody at the device, then confirmed by waving | PIR output, active high, 2-4 s hold |
-| 53 | active-low, about 0.3 s presses; 46 edges / 13 `ring` posts in a 45 s press test | doorbell button (confirmed) |
+| 53 | active-low, about 0.3 s presses; 46 edges / 13 `ring` posts in a 45 s press test. The same line keys the on-board 433 MHz chime transmitter (the chimes pair to the button, no firmware involved); the stock firmware's boot pin map has it as plain input + pull-up, the SDK's as an LCD_B2 output, see below | doorbell button (confirmed) + chime TX key line |
+| 51 | stock firmware: a second key (long-press handler), configured input + pull-up like 53; nothing on this board reacts to it | second key per stock, unmapped here; parked input + pull-up since 0.26.2 |
 | 44 | high = white LED on (big flare on a camera), low/hi-Z = off; pure white, no IR | white fill LED, active high |
 | 45 (ADC11) | high = the four blue LEDs around the button light up. Not infrared: the IR LED sits above the camera lens and is still unmapped; an earlier "kills the white LED" reading was a coincidence | blue button ring, active high |
 | 46 | GPIO sweep with a microphone listening: 1 kHz tone scored 108 with 46 high vs < 1 for the other pins; floating it leaks a faint output | speaker amplifier enable, active high |
@@ -67,3 +68,29 @@ command).
 
 Still unmapped: the IR illuminator above the lens, the charger IC's other status lines, and
 whether there is a power-hold line at all (the board stays up on battery without one being driven).
+
+## The boot-time pin map and the ringing chimes (fw 0.26.2, SDK patch 0010)
+
+Symptom (2026-10-04, device on the wall): all three 433 MHz chimes paired to the doorbell rang once
+at every reset of the SoC, i.e. every deep-sleep wake (RTC, button, PIR) and every warm `reboot`.
+Toggling GPIO 9/28/5/50/46/44/45 from the running firmware never rang them, so it was not a rail.
+
+Cause: the SDK's `GPIO_DEFAULT_DEV_CONFIG` (`middleware/soc/bk7258/soc/gpio_map.h`) is written to
+the AON GPIO registers by `bk_gpio_driver_init()` on CPU0 at every reset, before `user_app_main()`.
+It is the map of Beken's LCD dev kit and makes **GPIO 53 = LCD_B2**, a peripheral output: with the
+LCD block idle the pin sits low, which is a button press on the TX encoder's key input, until
+`inputs_init()` reclaims the pin as input + pull-up a few hundred ms later. The stock firmware's own
+table (disassembled the same day) has 53 as `FUNC_DISABLE / INVALID / INPUT_ENABLE / PULL_UP_EN /
+LOW_POWER_KEEP_INPUT_STATUS / CAPACITY_3`; its other differences from the SDK are 6/7 (hi-Z, not
+I2S1), 27-39 (JPEG/I2S functions off until the camera driver maps them, 38 INVALID) and 25/26/50
+(low-power keep). Rows 0-5, 8-24, 40-49, 51, 52, 54, 55 are identical. The stock cp1/cp2 apply no
+table and the stock bootloader only touches the UART pins, which matches our build (only CPU0 has
+`CONFIG_GPIO_DEFAULT_SET_SUPPORT=y`). Patch 0010 makes the SDK table the stock one at those rows
+(details: [sdk-patches.md](sdk-patches.md)); `pin cfg 53` after a boot must now show input +
+pull-up with no function, and `pin cfg 27`/`28` no function until the camera opens.
+
+If the chimes still ring after 0.26.2, the remaining suspects in order: the bootloader's UART pin
+writes (the only pins it touches), GPIO 6/7/28 behaving differently as hi-Z than as idle peripheral
+outputs (a pull on 28 would show in `pin cfg 28` at boot), and the `pwr hold9` experiment
+(`docs/notes/power.md`), which keeps the sensor rail up through the sleep.
+

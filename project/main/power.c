@@ -52,6 +52,7 @@
 #define KV_PWR_SNAP   "db_pwr_snap"     /* RTC wake every N minutes for a snapshot (default 0 = keepalive only) */
 #define KV_PWR_BCHAN  "db_pwr_bchan"    /* battery ADC channel (default 15) */
 #define KV_PWR_BRATIO "db_pwr_bratio"   /* divider ratio in percent (default 200 = x2.00) */
+#define KV_PWR_HOLD9  "db_pwr_hold9"    /* fw 0.26.1: keep the GPIO 9 sensor rail up through deep sleep. Default OFF since 0.26.2: the chimes were keyed by the boot pin map on GPIO 53 (SDK patch 0010), not by this rail, and the stock never drives 9 in sleep */
 #define KV_PWR_SCHED  "db_pwr_sched"    /* fw 0.25: "HH:MM HH:MM DAY_MIN NIGHT_MIN" or "off" (default 07:00 22:00 15 60) */
 
 #define POWER_KEEPALIVE_MIN   360       /* RTC wake when snap_min is 0, so a sleeping device still reports twice a day */
@@ -61,6 +62,8 @@
 #define POWER_TASK_PERIOD_MS  1000
 
 static bool s_sleep_en, s_force, s_wake_pir, s_inhibit;
+static bool s_hold9;   /* default off (0.26.2); `pwr hold9 on` keeps GPIO 9 high through the sleep */
+bool power_hold9(void) { return s_hold9; }
 static uint32_t s_idle_s = 60, s_snap_min, s_bchan = 15, s_bratio = 200;
 /* smart schedule (fw 0.25): day/night RTC intervals, local time from the SNTP clock + `sd tz`,
  * light sensor when unsynced; `pwr sched off` = the fixed snap_min */
@@ -407,6 +410,8 @@ static void power_do_sleep(const char *why)
 
 	/* 2. pins held through the sleep: amp enable low (floating leaks audio + current), PIR enabled */
 	keep_pin_in_sleep(PIN_PWR_AMP, false);
+	if (s_hold9)
+		keep_pin_in_sleep(9, true);   /* optional (off by default): sensor rail stays up through the sleep; a 0.26.1 experiment, see docs/notes/power.md */
 	/* USB present (GPIO 19) is a floating input while awake; pull it DOWN through the sleep so a
 	 * charger's rising edge is a clean wake (0.25.0; UNVERIFIED until a charger is at hand: the
 	 * pin's polarity itself is still unconfirmed, see docs/notes/power.md). power_init() restores
@@ -518,6 +523,7 @@ void power_init(void)
 	s_sleep_en = kv_get_bool(KV_PWR_SLEEP, false);
 	s_force = kv_get_bool(KV_PWR_FORCE, false);
 	s_wake_pir = kv_get_bool(KV_PWR_WPIR, false);
+	s_hold9 = kv_get_bool(KV_PWR_HOLD9, false);
 	if (kv_get_u32(KV_PWR_IDLE, &v) && v >= POWER_IDLE_MIN_S)
 		s_idle_s = v;
 	if (kv_get_u32(KV_PWR_SNAP, &v) && v <= POWER_SNAP_MAX_MIN)
@@ -628,6 +634,10 @@ void cli_pwr_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 		s_idle_s = v;
 		kv_set_u32(KV_PWR_IDLE, v);
 		db_reply("[pwr] idle %u s\r\n", v);
+	} else if (os_strcmp(argv[1], "hold9") == 0 && argc >= 3 && parse_onoff(argv[2], &b)) {
+		s_hold9 = b;
+		db_kv_set(KV_PWR_HOLD9, b ? "1" : "0");
+		db_reply("[pwr] GPIO 9 rail %s through deep sleep\r\n", b ? "held high" : "dropped");
 	} else if (os_strcmp(argv[1], "wake_pir") == 0 && argc >= 3 && parse_onoff(argv[2], &b)) {
 		s_wake_pir = b;
 		db_kv_set(KV_PWR_WPIR, b ? "1" : "0");
@@ -689,7 +699,7 @@ void cli_pwr_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 	} else if (os_strcmp(argv[1], "policy") == 0) {
 		policy_cli(argc, argv);
 	} else {
-		db_reply("pwr status | sleep on|off | sleep force on|off | idle S | wake_pir on|off | snap_min M | sched START END DAY NIGHT|off | policy [URL|auto|off|pull] | sleepnow | chan ADC | ratio PCT\r\n");
+		db_reply("pwr status | sleep on|off | sleep force on|off | idle S | wake_pir on|off | snap_min M | sched START END DAY NIGHT|off | policy [URL|auto|off|pull] | hold9 on|off | sleepnow | chan ADC | ratio PCT\r\n");
 	}
 }
 

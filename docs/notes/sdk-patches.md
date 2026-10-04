@@ -41,6 +41,47 @@ them are derivative works of Beken's Apache-2.0 code (see `NOTICE`).
   84 ms, stale response words). The patch raises the wait to 30 ms (one define). Normal commands are
   unaffected (the message is already queued when the wait starts); only failing commands take 30 ms
   instead of 4 ms per retry. Story in [sdcard.md](sdcard.md).
+- `0010-gpio-default-map-doorbell.patch`: `GPIO_DEFAULT_DEV_CONFIG` in
+  `middleware/soc/bk7258/soc/gpio_map.h` is the pin map `bk_gpio_driver_init()` ->
+  `gpio_hal_default_map_init()` writes on CPU0 at every reset (cold boot, warm reboot and every
+  deep-sleep wake, which is a SoC reset on the BK7258), before any application code. The SDK default
+  is the Beken LCD/camera dev-kit map and left GPIO 53 as an **LCD_B2 peripheral output**. On the
+  doorbell GPIO 53 is the button line, which also keys the on-board 433 MHz chime transmitter: the
+  peripheral drove it low for the few hundred ms until `inputs_init()` reclaimed it, so all paired
+  radio chimes rang once at every boot and every wake (found 2026-10-04 by disassembling the stock
+  firmware's own table; medium-high confidence until the owner confirms silence). The patch makes
+  the table the stock one where it differs, row by row:
+  - GPIO 53: `SECOND_FUNC_DISABLE, GPIO_DEV_INVALID, INPUT_ENABLE, PULL_UP_EN, INT_DISABLE,
+    INT_TYPE_LOW_LEVEL, LOW_POWER_KEEP_INPUT_STATUS, DRIVER_CAPACITY_3` (was `FUNC_ENABLE, LCD_B2,
+    IO_DISABLE, PULL_DISABLE, ..., DISCARD, CAPACITY_1`).
+  - GPIO 6, 7: `FUNC_DISABLE, GPIO_DEV_INVALID, IO_DISABLE, PULL_DISABLE` (were I2S1 CLK/SYNC
+    outputs; 6 is the SD card detect, 7 the ADC9 rail sense).
+  - GPIO 27-39: `SECOND_FUNC_DISABLE` (dev names kept for documentation; 38 -> `GPIO_DEV_INVALID`
+    as in the stock). Safe for the camera: `bk_dvp_camera_open()` calls
+    `bk_video_gpio_init(DVP_GPIO_ALL)` (`middleware/driver/camera/dvp_camera.c`), which
+    `gpio_dev_unmap()`s + `gpio_dev_map()`s 27 and 29-39 from `camera_gpio_map_table` in
+    `video_common_driver.c` on every open; 28 (I2S1_MCLK in the SDK table) is the camera/SD/light
+    sensor power enable here and is unmapped and driven by `cam_rails()` on CPU0 and by
+    `CONFIG_CAMERA_CTRL_POWER_GPIO_ID=28` on CPU1.
+  - GPIO 25, 26, 50 (PIR sensitivity/enable): `low_power_io_ctrl` `DISCARD` ->
+    `GPIO_LOW_POWER_KEEP_OUTPUT_STATUS` (= 3, the stock value). `gpio_hal_map_init()` still applies
+    the row's `IO_DISABLE` afterwards, so the boot state is unchanged; the effect is that
+    `gpio_lowpower_keep_status_init()` marks the three pins as "keep" so a deep sleep holds whatever
+    `pir.c` drove instead of floating them. `power.c` already registers the same dynamically when
+    `wake_pir` is on; this covers the `wake_pir off` case too (belt and braces).
+  - Every other row is the SDK's (the stock's rows 0-5, 8-24, 40-49, 51, 52, 54, 55 are identical
+    to the SDK's).
+
+  Core scope: `CONFIG_GPIO_DEFAULT_SET_SUPPORT` is `y` only in `bk7258.defconfig` (CPU0) and `n` in
+  `bk7258_cp1.defconfig` / `bk7258_cp2.defconfig`; `project-avdk/config/bk7258_cp{1,2}/config` do
+  not override it, so CPU1/CPU2 apply no table at all, exactly like the stock cp1/cp2. With the
+  default map off, the I2C driver maps its own pins (`i2c_init_gpio()` -> `I2C_SET_PIN`, so the
+  sensor's I2C1 on CPU1 works today without any table) and the SDIO driver likewise. No change to
+  the cp1/cp2 configs was needed, and the `gpio_hal_default_map_init()` interrupt-clear loop runs
+  only on CPU0 inside `bk_init()`, long before `inputs_init()` registers the button and PIR ISRs,
+  so it cannot undo them. Hardware note: `gpio_hal_map_init()` only *unmaps* a pin's function when
+  the row has `SECOND_FUNC_ENABLE`; a `FUNC_DISABLE` row leaves the function-select bit as it was
+  (0 after a cold boot; whatever `gpio_dev_unmap()` left after a warm reboot or a sleep).
 
 `0005-dvp-camera-mclk-settle.patch` was only captured on 2026-10-03 (it had lived as an uncommitted change in the author's SDK tree): a 600 ms settle after MCLK starts in `bk_dvp_camera_enumerate()`, which the OV9650 needs before it answers on SCCB.
 
