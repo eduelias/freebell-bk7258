@@ -90,6 +90,15 @@ mkdir -p ~/.config/doorbell-bk7258 && cp scripts/env.example ~/.config/doorbell-
 scripts/build-avdk.sh                                   # camera-capable build (~11 min emulated); scripts/build.sh = bare SDK flavour
 ```
 
+**Remote builder (optional).** The image is x86-64 only; on Apple Silicon it runs emulated. If an
+x86-64 Linux box (or a WSL2 distro) with docker/podman, rsync and the two SDK clones is on your
+LAN, set `REMOTE_BUILD_HOST=user@host` (and `REMOTE_BUILD_PORT`, `REMOTE_*` paths if they differ
+from the defaults) and run `scripts/build-remote.sh`: it mirrors the working tree there, runs the
+same `scripts/build-avdk.sh` natively and copies the images back into `FW_DIR`. `--bare` builds the
+other flavour, `--shell` opens a shell there; `BUILD=build-remote.sh` makes `release.sh` use it.
+Author's numbers on an 8-core i7 desktop: 41 s full, 15 s incremental, versus ~11 min / ~100 s
+emulated. Setup walk-through: [docs/notes/remote-build.md](docs/notes/remote-build.md).
+
 **First flash over UART** (once; afterwards everything is OTA):
 
 1. Unplug battery and USB. Wire the header (3.3 V adapter, no 5 V). Run `scripts/flash.sh --write`.
@@ -132,7 +141,9 @@ key is also honoured as a real environment variable, and CLI flags override both
 | `HA_TOKEN_FILE` | long-lived HA token file (default `~/.ha_token`) |
 | `OTA_URL_BASE` | HTTP base URL the *device* can fetch images from, e.g. `http://<ha-ip>:8123/local/doorbell` |
 | `OTA_PUBLISH` | shell command that copies the image where `OTA_URL_BASE` serves it; `{rbl}` and `{name}` are substituted, e.g. `scp {rbl} user@ha:/config/www/doorbell/` |
-| `BUILD` | which build script `release.sh` runs: `build-avdk.sh` (default) or `build.sh` |
+| `BUILD` | which build script `release.sh` runs: `build-avdk.sh` (default), `build.sh` or `build-remote.sh` |
+| `CONTAINER_RUNTIME` | `podman` or `docker` for the build scripts (default: podman if installed, else docker) |
+| `REMOTE_BUILD_HOST`, `REMOTE_BUILD_PORT`, `REMOTE_REPO_DIR`, `REMOTE_SDK`, `REMOTE_AVDK`, `REMOTE_OUT`, `REMOTE_FW_DIR`, `REMOTE_WAKE` | remote builder for `scripts/build-remote.sh` ([docs/notes/remote-build.md](docs/notes/remote-build.md)) |
 
 Tools: `tools/dbcmd.py [--host H] [--port P] [--token T] CMD...` (TCP), `tools/shell.py` /
 `tools/serial_capture.py` / `tools/bkreboot.py` / `tools/bkwrite.py` (serial, accept `--port`),
@@ -271,7 +282,7 @@ PIR cooldown, night-light arbiter, sleep/wake cycle, OTA version bump and KV per
 | `tools/` | host-side Python: ROM flasher (`bkwrite.py`, `bkread.py`, `bkdump.py`, `bkreboot.py`, `linkcheck.py`), serial (`shell.py`, `serial_capture.py`), LAN (`dbcmd.py`), HA (`ha_generic_camera.py`), RTSP two-way audio test client (`rtsp_backchannel.py`), audio and pin-mapping helpers |
 | `sim/` | virtual doorbell + tests |
 | `docs/homeassistant/` | HA automation, package, TTS helper, policy file writer, setup guide |
-| `docs/notes/` | technical notes: [flashing](docs/notes/flashing.md), [camera](docs/notes/camera.md), [gpio-irq](docs/notes/gpio-irq.md), [pir](docs/notes/pir.md), [audio](docs/notes/audio.md), [night-light](docs/notes/night-light.md), [power](docs/notes/power.md), [sdcard](docs/notes/sdcard.md), [pin-mapping](docs/notes/pin-mapping.md), [sdk-patches](docs/notes/sdk-patches.md), [bench-setup](docs/notes/bench-setup.md) |
+| `docs/notes/` | technical notes: [flashing](docs/notes/flashing.md), [camera](docs/notes/camera.md), [gpio-irq](docs/notes/gpio-irq.md), [pir](docs/notes/pir.md), [audio](docs/notes/audio.md), [night-light](docs/notes/night-light.md), [power](docs/notes/power.md), [sdcard](docs/notes/sdcard.md), [pin-mapping](docs/notes/pin-mapping.md), [sdk-patches](docs/notes/sdk-patches.md), [bench-setup](docs/notes/bench-setup.md), [remote-build](docs/notes/remote-build.md) |
 | `docs/testplans/` | per-feature test plans with measured results ([index](docs/testplans/README.md)) |
 | `CHANGELOG.md` | per-version summary |
 
