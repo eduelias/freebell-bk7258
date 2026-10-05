@@ -439,6 +439,15 @@ class CamState:
     last_ms: int = 0
     opened_ms: int = 0
     jpeg: bytes = b""
+    scene: str = "stock"               # fw 0.27: scene hint given to the sensor at the open
+    open_mv: int = 0
+    exp_class: int = 0
+    open_frames: int = 0
+    settled: bool = True
+    settle_how: str = "-"
+    settled_ms: int = 0
+    wait_ms: int = 0
+    waits: int = 0
 
 
 @dataclass
@@ -516,6 +525,11 @@ class Device:
     def _load_settings(self) -> None:
         kv = self.store.kv_get
         self.dark_mv = int(kv("db_dark_mv", "1400"))
+        st = kv("db_cam_settle", "16 4500 4").split()
+        self.cam_settle = (int(st[0]), int(st[1]), int(st[2])) if len(st) == 3 else (16, 4500, 4)
+        self.cam_scene_pref = kv("db_cam_scene", "auto")
+        self.ircut = kv("db_ircut", "")
+        self.cam_exp_fixed = int(kv("db_cam_exp", "0"))
         self.fx_enabled = kv("db_fx", "1") != "0"
         self.light_chan = int(kv("db_light_chan", "14"))
         self.pir_on = kv("db_pir_on", "1") != "0"
@@ -996,6 +1010,15 @@ class Device:
             self.cam.frames = self.cam.h264_frames = 0
             self.cam.opened_ms = now
             self.night_last_sample_ms = now
+            scene = self.cam_scene_pref if self.cam_scene_pref != "auto" else ("night" if self.is_dark(self.light_mv) else "day")
+            c = self.cam
+            c.scene, c.open_mv, c.open_frames, c.settle_how, c.settled_ms = scene, self.light_mv, 0, "-", 0
+            c.exp_class = self.cam_exp_class(self.light_mv) if scene == "day" else 0
+            c.settled = h264                 # the settle gate is for JPEG consumers only
+            if scene in ("day", "night") and scene != self.ircut:
+                self.ircut = scene
+                self.store.kv_set("db_ircut", scene)
+                log.info("[cam] ir-cut -> %s (GPIO %d pulse)", scene, 54 if scene == "day" else 55)
             log.info("[cam] open %ux%u %s: rails 9/28/5/6 high, PWDN pulse, sensor ov9650 (first frame in ~1 s)", w, h,
                      "h264" if h264 else "jpeg")
             self.activity()
@@ -1021,6 +1044,27 @@ class Device:
                 self.cam_close()
             return self.cam_open(1280, 720, False)
 
+    def cam_exp_class(self, mv: int) -> int:
+        """Day start-exposure class (x16 lines) from the light reading, as cam_exp_class() in app_main.c."""
+        if self.cam_exp_fixed:
+            return self.cam_exp_fixed
+        return 16 if mv < 700 else 18 if mv < 850 else 20 if mv < 1000 else 22 if mv < 1200 else 24
+
+    def cam_settle_wait(self) -> int:
+        """Exposure settle gate (fw 0.27): block a JPEG consumer until the AEC settled, capped at settle MS after the open."""
+        c = self.cam
+        if not c.open or c.h264 or c.settled:
+            return 0
+        t0 = self.clock.now_ms()
+        while not c.settled and c.open and not c.h264:
+            if self.clock.now_ms() - c.opened_ms >= self.cam_settle[1]:
+                c.settled_ms, c.settle_how, c.settled = self.clock.now_ms() - c.opened_ms, "t", True
+                break
+            time.sleep(0.02)
+        c.wait_ms = self.clock.now_ms() - t0
+        c.waits += 1
+        return c.wait_ms
+
     def cam_frame_tick(self) -> None:
         """One tick of the frame producer (runs at --fps real frames per second)."""
         if not self.cam.open or (self.clock.now_ms() - self.cam.opened_ms) < CAM_FIRST_FRAME_S * 1000:
@@ -1038,6 +1082,11 @@ class Device:
             self.cam.frames = n
             self.cam.seq += 1
             self.cam.last_ms = self.clock.now_ms()
+            self.cam.open_frames += 1
+            if not self.cam.settled and self.cam.open_frames >= min(3, self.cam_settle[0]):
+                self.cam.settle_how = "n" if self.cam.open_frames >= self.cam_settle[0] else "s"
+                self.cam.settled_ms = self.cam.last_ms - self.cam.opened_ms
+                self.cam.settled = True
 
     # ------------------------------------------------------------ SD card stand-in
     def sd_save(self, event: str) -> str:
@@ -1591,9 +1640,47 @@ class Device:
             r.add("[cam] closed\r\n")
         elif len(argv) >= 2 and argv[1] == "stat":
             c = self.cam
-            r.add("[cam] open %d %s (mode %s) frames %u h264 %u dropped %u last jpeg %u bytes %ux%u seq %u age %u ms\r\n" % (
+            r.add("[cam] open %d %s (mode %s) frames %u h264 %u dropped %u last jpeg %u bytes %ux%u seq %u age %u ms"
+                  " | scene %s (%s, %u mV, exp %u) open_frames %u settled %s@%u ms wait %u ms x%u settle %u/%u ms/%u%% ircut %s\r\n" % (
                 int(c.open), ("h264" if c.h264 else "jpeg") if c.open else "-", ("auto", "jpeg", "h264")[c.pref], c.frames,
-                c.h264_frames, c.drop, len(c.jpeg), c.w, c.h, c.seq, self.clock.now_ms() - c.last_ms if c.last_ms else 0))
+                c.h264_frames, c.drop, len(c.jpeg), c.w, c.h, c.seq, self.clock.now_ms() - c.last_ms if c.last_ms else 0,
+                c.scene, self.cam_scene_pref, c.open_mv, c.exp_class, c.open_frames, c.settle_how, c.settled_ms, c.wait_ms, c.waits,
+                self.cam_settle[0], self.cam_settle[1], self.cam_settle[2], self.ircut or "unknown"))
+        elif len(argv) >= 2 and argv[1] == "settle":
+            if len(argv) >= 3:
+                vals = [int(x) if x.isdigit() else -1 for x in argv[2:5]] + list(self.cam_settle[len(argv) - 2:])
+                n, ms, pct = vals[0], vals[1], vals[2]
+                if not (1 <= n <= 60 and 100 <= ms <= 8000 and 1 <= pct <= 50):
+                    r.add("cam settle N(1-60) [MS(100-8000) [PCT(1-50)]]\r\n")
+                    return
+                self.cam_settle = (n, ms, pct)
+                self.store.kv_set("db_cam_settle", "%u %u %u" % self.cam_settle)
+            r.add("[cam] settle %u frames, cap %u ms, stable < %u %% (applies at the next open)\r\n" % self.cam_settle)
+        elif len(argv) >= 2 and argv[1] == "scene":
+            if len(argv) >= 3:
+                if argv[2] not in ("auto", "day", "night", "stock"):
+                    r.add("cam scene auto|day|night|stock\r\n")
+                    return
+                self.cam_scene_pref = argv[2]
+                self.store.kv_set("db_cam_scene", argv[2])
+            r.add("[cam] scene %s (applies at the next open; light now %u mV, dark > %u; open camera: %s)\r\n" % (
+                self.cam_scene_pref, self.light_read_mv(), self.dark_mv, self.cam.scene if self.cam.open else "-"))
+        elif len(argv) >= 2 and argv[1] == "exp":
+            if len(argv) >= 3:
+                n = int(argv[2]) if argv[2].isdigit() else 99
+                if n > 26 or 11 < n < 16:
+                    r.add("cam exp 0-11 (0 = from the light sensor, else 1 << (N-1) rows; 16-26 = manual 1 << (N-16) rows for 1 s, then AEC)\r\n")
+                    return
+                self.cam_exp_fixed = n
+                self.store.kv_set("db_cam_exp", str(n))
+            mv = self.light_read_mv()
+            c = self.cam_exp_class(mv)
+            r.add("[cam] exp class %u (%s; light now %u mV -> class %u = %u rows; applies at the next day open)\r\n" % (
+                self.cam_exp_fixed, "fixed" if self.cam_exp_fixed else "auto", mv, c, (1 << min(c - 16, 10)) if c >= 16 else (1 << (min(c, 11) - 1)) if c else 4))
+        elif len(argv) >= 3 and argv[1] == "ircut" and argv[2] in ("day", "night"):
+            self.ircut = argv[2]
+            self.store.kv_set("db_ircut", argv[2])
+            r.add("[cam] ir-cut pulsed to %s (remembered)\r\n" % argv[2])
         elif len(argv) >= 3 and argv[1] == "mode":
             if argv[2] not in ("auto", "jpeg", "h264"):
                 r.add("cam mode auto|jpeg|h264\r\n")
@@ -1608,7 +1695,8 @@ class Device:
             r.add("[cam] sending %u bytes to %s:%s\r\n" % (len(self.cam.jpeg), argv[2], argv[3]))
             threading.Thread(target=self._tcp_push, args=(argv[2], argv[3], self.cam.jpeg), daemon=True).start()
         else:
-            r.add("cam open [W H] [h264] | close | stat | mode auto|jpeg|h264 | snap HOST PORT | http://IP:8080/snapshot.jpg /stream"
+            r.add("cam open [W H] [h264] | close | stat | mode auto|jpeg|h264 | settle [N [MS [PCT]]] | scene auto|day|night|stock"
+                  " | exp [0-11] | ircut day|night | snap HOST PORT | http://IP:8080/snapshot.jpg /stream"
                   " | probe [PWR_PIN ...] | probe scan | probe rails on|off | probe bb SCL SDA\r\n")
 
     @staticmethod
@@ -2268,31 +2356,33 @@ class HttpHandler(BaseHTTPRequestHandler):
             return self._cmd()
         if self.command != "GET":
             return self._raw(400, "Bad Request", "text/plain", b"GET only\n")
+        settle = 0
         if path.startswith("/stream") or path.startswith("/snapshot"):
             if dev.cam_want_jpeg() == 0:
                 deadline = time.monotonic() + 3.0 / dev.clock.speed + 0.5   # the firmware waits up to 3 s for the first frame
                 while not dev.cam.jpeg and time.monotonic() < deadline:
                     time.sleep(0.01)
+                settle = dev.cam_settle_wait()
             elif path.startswith("/stream") or not dev.cam.jpeg:
                 return self._raw(503, "Service Unavailable", None, b"camera busy (H.264/RTSP)")
         if not dev.cam.ever_opened:
             return self._raw(503, "Service Unavailable", None, b"camera not open")
         if path.startswith("/stream"):
-            return self._stream()
+            return self._stream(settle)
         if path.startswith("/snapshot"):
             jpeg = dev.cam.jpeg
             if jpeg:
-                return self._raw(200, "OK", "image/jpeg", jpeg, "Cache-Control: no-cache\r\n")
+                return self._raw(200, "OK", "image/jpeg", jpeg, "Cache-Control: no-cache\r\nX-Settle-Ms: %u\r\n" % settle)
             return self._raw(503, "Service Unavailable", None, b"no frame yet")
         c = dev.cam
         body = ("<html><body>doorbell %s cam open=%d frames=%u %ux%u<br>"
                 "<a href=/snapshot.jpg>snapshot.jpg</a> <a href=/stream>stream</a></body></html>" % (dev.fw, int(c.open), c.frames, c.w, c.h))
         self._raw(200, "OK", "text/html", body.encode())
 
-    def _stream(self) -> None:
+    def _stream(self, settle: int = 0) -> None:
         dev = self.dev
         self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n"
-                         b"Cache-Control: no-cache\r\nConnection: close\r\n\r\n")
+                         b"Cache-Control: no-cache\r\nX-Settle-Ms: %u\r\nConnection: close\r\n\r\n" % settle)
         log.info("[http] GET %s -> 200 mjpeg", self.path)
         last, gen, sent = 0, dev.net.generation, 0
         try:

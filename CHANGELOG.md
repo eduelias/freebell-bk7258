@@ -4,7 +4,34 @@ Versions are the `FW_VERSION` in `project/main/app_main.c` (also in every report
 `sys info`). Dates are 2026 unless stated; most of this was written between 2026-10-01 and
 2026-10-03.
 
-## Unreleased
+## 0.27.0
+- **Daylight snapshots after a cold open are no longer white** (2026-10-05). Every camera open
+  now reads the light sensor and passes a scene hint (`day`/`night`) to the CPU1 sensor driver in
+  the spare high bits of `media_camera_device_t.info.fps` (a bit-mask enum; CPU1 copies the struct
+  through the mailbox unchanged and calls `set_fps()` with it right after the init table, no SDK
+  patch; the enum is one byte, so bit 7 = night, bit 6 = day, five bits = a start-exposure
+  class). Day: AEC/AGC off, COM11 night mode off, AGC ceiling 2x, AE target 0x78/0x68, a start
+  exposure from the light reading (1 row on a sunny day; `cam exp N` to fix one, KV `db_cam_exp`)
+  and unity gain, and the AEC/AGC take over **one second later** from a CPU1 thread: enabled on a
+  correctly exposed stream the engine stays put, while any AEC-on start overshoots to ~130 rows on
+  the dark start-up frames and needs ~4 s to come back (writing the registers with AEC enabled did
+  nothing at all, measured); night: the shipped table plus the stock firmware's
+  black-and-white registers (`0x3a=0x11`, `0x67/0x68=0x80`). `cam scene auto|day|night|stock`
+  (KV `db_cam_scene`) overrides the reading; `stock` restores the 0.26 behaviour. CPU1 leaves a
+  register read-back and a 15 s AEC trace in two globals readable with `mem` (addresses in
+  `docs/notes/camera.md`).
+- Fixed on the way: the wake report's `light_read_mv()` could drop GPIO 28 under an open in
+  progress (a cold wake read 31 mV and would have picked `day` at night); `/snapshot.jpg` clients
+  allocate the current frame size instead of 150 KB each, and answer `503 busy (mem)` instead of
+  closing the socket when PSRAM is short (HA's wake photo + preview + a third client). The IR-cut coil is pulsed (GPIO 54 day / 55 night, 300 ms, overlapping the open's own
+  delays) when the scene differs from the last pulse (KV `db_ircut`); `cam ircut day|night` by hand.
+- **Exposure settle gate**: `/snapshot.jpg`, the first MJPEG frame and the SD save wait after an
+  open until `cam settle N` frames arrived (default 16) or, after N/2 frames, three consecutive
+  JPEGs are within `PCT` % in size (4), capped at `MS` after the open (4500; KV `db_cam_settle`
+  "N MS PCT"). The
+  wait is reported in the `X-Settle-Ms` response header and in `cam stat` (`scene`, `open_frames`,
+  `settled <how>@<ms>`, `wait`, `settle`, `ircut` fields). Measurements before/after in
+  `docs/notes/camera.md`.
 - tools: **remote builder** (2026-10-04). `scripts/build-remote.sh` mirrors the working tree to an
   x86-64 host over ssh/rsync, runs `scripts/build-avdk.sh` (or `build.sh` with `--bare`) there and
   copies the images back into `FW_DIR`; flags `--no-sync-back`, `--shell`; keys `REMOTE_BUILD_HOST`,

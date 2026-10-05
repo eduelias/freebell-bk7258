@@ -171,7 +171,7 @@ flash and survive OTA.
 | `pwr` | `status` \| `sleep on\|off` \| `sleep force on\|off` \| `idle S` \| `wake_pir on\|off` \| `snap_min M` \| `sched DAY_START DAY_END DAY_MIN NIGHT_MIN` \| `sched off\|on` \| `policy URL\|auto\|off\|pull` \| `sleepnow` \| `chan ADC` \| `ratio PCT` | `db_pwr_sleep` (off), `db_pwr_force` (off), `db_pwr_idle` (60), `db_pwr_wpir` (off), `db_pwr_snap` (0, used with `sched off`), `db_pwr_sched` (07:00 22:00 15 60), `db_pwr_policy` (auto), `db_pwr_bchan` (15), `db_pwr_bratio` (200) |
 | `vol` | `vol [0-100]` (speaker volume: chime and talk `gain auto`, linear onto DAC gain 0..0x1c; `spk cfg gain N` stays a raw override, `spk cfg gain auto` releases it) | `db_vol` (100) |
 | `log` | `log [N]` (last N bytes of the 8 KB RAM log, N <= 600) \| `stat` | |
-| `cam` | `open [W H] [h264]` \| `close` \| `stat` \| `mode auto\|jpeg\|h264` \| `snap HOST PORT` \| `probe [PWR_PIN ...]` \| `probe scan` \| `probe rails on\|off` \| `probe bb SCL SDA` | mode (auto) |
+| `cam` | `open [W H] [h264]` \| `close` \| `stat` \| `mode auto\|jpeg\|h264` \| `settle [N [MS [PCT]]]` (exposure settle gate: frames / cap / stable-size %) \| `scene auto\|day\|night\|stock` (sensor scene hint at open) \| `exp [0-11\|16-26]` (day start exposure 1 << (N-1) rows, 0 = from the light sensor; 16-26 = manual 1 << (N-16) rows for 1 s, then AEC) \| `ircut day\|night` (pulse the IR-cut coil) \| `snap HOST PORT` \| `probe [PWR_PIN ...]` \| `probe scan` \| `probe rails on\|off` \| `probe bb SCL SDA` | `db_cam_mode` (auto), `db_cam_settle` (16 4500 4), `db_cam_scene` (auto), `db_cam_exp` (0), `db_ircut` (last pulse) |
 | `rtsp` | `on\|off` \| `status` \| `port N` \| `q IMB PMB` \| `idr` | on/off (off), port (554), q (120/24) |
 | `spk` | `tone [HZ] [MS]` \| `play beepa\|beepb\|bell\|ADDR LEN` \| `net HOST PORT` \| `stop` \| `pa PIN\|off` \| `cfg [chl L\|R\|LR] [mode diff\|se] [gain N] [rate HZ] [clk xtal\|apll]` | gain 0x1c, PA 46 |
 | `mic` | `level [MS] [HZ]` \| `rec MS HOST PORT` \| `cfg [mic 1\|2\|both] [mode diff\|se] [gain N] [chl L\|R\|LR] [rate HZ] [clk xtal\|apll]` | |
@@ -288,9 +288,11 @@ PIR cooldown, night-light arbiter, sleep/wake cycle, OTA version bump and KV per
 
 ## Known issues
 
-- **Frame rate follows the sensor**: about 9 fps in daylight, about 3 fps in the dark (the OV9650
-  night mode in the shipped configuration halves the rate as exposure grows). RTSP probes take
-  5-11 s and HA's still-from-stream is marginal, which is why the camera entity keeps the still URL.
+- **Frame rate follows the sensor**: about 9 fps in daylight (0.27: the day scene turns the
+  OV9650 night mode off, so the rate no longer sags in dim daylight), about 3 fps in the dark
+  (night scene = the shipped configuration, whose night mode halves the rate as exposure grows).
+  RTSP probes take 5-11 s and HA's still-from-stream is marginal, which is why the camera entity
+  keeps the still URL.
 - **White LED flash at reset**: the white LED (GPIO 44) lights briefly on every reset, before the
   firmware runs and configures the pin; cosmetic, cause not investigated.
 - **Camera close + quick reopen wedge**: fixed in v0.22.1-0.22.3 by power-cycling the camera rails

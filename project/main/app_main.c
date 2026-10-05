@@ -71,7 +71,7 @@ void db_reply(const char *fmt, ...)
 	REPLY("%s", buf);
 }
 
-#define FW_VERSION "0.26.2"
+#define FW_VERSION "0.27.0"
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
 #define PIN_IS_CONSOLE(p) ((p) == 10 || (p) == 11)
@@ -1687,6 +1687,49 @@ static bool s_rtsp_on;                       /* KV db_rtsp, default off */
 #define KV_RTSP "db_rtsp"
 #define KV_RTSP_PORT "db_rtsp_port"
 
+/* ---- scene hint + exposure settle gate (v0.27.0) ----
+ * A cold OV9650 open in daylight used to deliver white frames for ~10 s (stock table: night mode
+ * on, long initial exposure, bright AE target; see dvp_ov9650.c). Now every open tells CPU1 the
+ * scene: the light sensor is read once the camera rail is up and `day` or `night` is ORed into
+ * media_camera_device_t.info.fps (bits 6/7 of a bit-mask enum whose highest real value is FPS30 =
+ * bit 5); dvp_camera.c copies the struct through the mailbox unchanged and calls the sensor's
+ * set_fps() with it right after the init table, where the overlay driver programs the per-scene
+ * registers. `cam scene auto|day|night|stock` (KV db_cam_scene) overrides the reading; `stock`
+ * sends no hint = the pre-0.27 table only. The IR-cut coil (GPIO 54 = day, 55 = night, 300 ms
+ * pulse, as the stock firmware does) is pulsed when the scene differs from the last one applied
+ * (KV db_ircut), overlapping the rail/reset delays so the open is not slower.
+ * The gate: JPEG consumers (HTTP snapshot, first MJPEG frame, SD save) wait after an open until the
+ * AEC has settled: `settle N` frames since the open (default 8), or earlier once three consecutive
+ * JPEGs differ by less than `settle PCT` (4 %) in size (a cheap exposure-change proxy), capped at
+ * `settle MS` (2500) after the open so HA's 10 s snapshot timeout is never near. */
+enum { CAM_SCENE_AUTO = 0, CAM_SCENE_DAY = 1, CAM_SCENE_NIGHT = 2, CAM_SCENE_STOCK = 3 };
+#define OV9650_SCENE_DAY   (1u << 6)   /* same encoding as avdk-overlay/.../dvp_ov9650.c: byte-sized enum, */
+#define OV9650_SCENE_NIGHT (1u << 7)   /* bit 2 = FPS15, bits 0-1/3-5 = 5-bit start-exposure class */
+#define OV9650_EXP_ENCODE(c) (((((c) >> 2) & 7u) << 3) | ((c) & 3u))
+#define KV_CAM_EXP "db_cam_exp"        /* 0 = class from the light reading, 1-11 = fixed start exposure 1 << (N-1) rows */
+#define CAM_EXP_ROWS(c) ((c) >= 16 ? (1u << ((c) - 16 > 10 ? 10 : (c) - 16)) : (c) ? (1u << (((c) > 11 ? 11 : (c)) - 1)) : 4u)
+#define KV_CAM_SCENE "db_cam_scene"
+#define KV_CAM_SETTLE "db_cam_settle"   /* "N MS PCT" */
+#define KV_IRCUT "db_ircut"             /* "day" | "night": the last IR-cut pulse applied */
+#define PIN_IRCUT_DAY 54
+#define PIN_IRCUT_NIGHT 55
+#define IRCUT_PULSE_MS 300
+static int s_cam_scene_pref = CAM_SCENE_AUTO;
+static uint32_t s_cam_exp_fixed, s_cam_exp_class;   /* `cam exp N` override, and the class sent at the last open */
+static int s_cam_scene;                 /* scene of the open camera: 0 stock/none, 1 day, 2 night */
+static uint32_t s_cam_open_mv;          /* light sensor at the open */
+static uint32_t s_cam_settle_n = 16, s_cam_settle_ms = 4500, s_cam_settle_pct = 4;   /* 2026-10-05: a manual-first day open is good from the first frame (the gate opens on size stability at N/2), an AEC-on start at ~4.3 s / ~18 frames */
+static volatile uint32_t s_cam_open_frames, s_cam_prev_len, s_cam_stable, s_cam_settled_ms;
+static volatile bool s_cam_settled = true;
+static volatile char s_cam_settle_how = '-';   /* n = frame count, s = stable size, t = timeout */
+static uint32_t s_cam_settle_wait_ms, s_cam_settle_waits;   /* the last wait a consumer spent in the gate, and how many waited */
+static int s_ircut_state = -1;          /* -1 unknown, CAM_SCENE_DAY, CAM_SCENE_NIGHT */
+static uint32_t s_ircut_t0;             /* pulse start (ms), 0 = no pulse in progress */
+static int s_ircut_pin;
+static uint32_t s_cam_off_ms, s_cam_open_ms;   /* last power-off and last open (ms) */
+static volatile bool s_cam_opening;      /* cam_open_locked() in progress: light_read_mv() must leave GPIO 28 alone */
+static volatile uint32_t s_light_last_mv;  /* last plausible light reading (>= 100 mV), fallback for the scene decision */
+
 static void cam_frame_cb(frame_buffer_t *frame)
 {
 	if (!frame || !frame->frame || frame->length == 0)
@@ -1712,6 +1755,21 @@ static void cam_frame_cb(frame_buffer_t *frame)
 	s_cam_frames++;
 	s_cam_last_ms = rtos_get_time();
 	rtos_unlock_mutex(&s_cam_mutex);
+	s_cam_open_frames++;
+	if (!s_cam_settled) {   /* settle gate: N frames, or three JPEGs in a row within PCT % of each other */
+		uint32_t prev = s_cam_prev_len, len = frame->length, d = prev > len ? prev - len : len - prev;
+
+		s_cam_stable = (prev && d * 100 < s_cam_settle_pct * len) ? s_cam_stable + 1 : 0;
+		s_cam_prev_len = len;
+		if (s_cam_open_frames >= s_cam_settle_n)
+			s_cam_settle_how = 'n';
+		else if (s_cam_open_frames >= s_cam_settle_n / 2 && s_cam_open_frames >= 3 && s_cam_stable >= 2)
+			s_cam_settle_how = 's';
+		else
+			return;
+		s_cam_settled_ms = s_cam_last_ms - s_cam_open_ms;
+		s_cam_settled = true;
+	}
 }
 
 static void camsnap_task(beken_thread_arg_t arg)
@@ -1953,8 +2011,7 @@ static void cam_rails(int on)
  * a close followed by a reopen within a few seconds otherwise leaves the sensor silent (no
  * frames, "camera wedge", 2026-10-03) and only a rail cycle or a reboot brings it back. GPIO 9
  * (light sensor / LED rail) is left alone. */
-static uint32_t s_cam_off_ms, s_cam_open_ms;
-static void cam_power(int on)
+static void cam_power(int on)   /* s_cam_off_ms / s_cam_open_ms live with the settle state above */
 {
 	static const int pins[] = {28, 5};
 	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
@@ -1997,12 +2054,75 @@ static void cli_cam_probe(int argc, char **argv)
 }
 #endif /* CONFIG_DVP_CAMERA */
 
+#if CONFIG_DVP_CAMERA
+/* IR-cut filter coil: GPIO 54 pulsed high moves it to the day position, GPIO 55 to night (stock
+ * firmware: 300 ms). Only pulsed when the scene differs from the last pulse (KV db_ircut), and
+ * the pulse overlaps the open's own delays: ircut_begin() raises the pin, ircut_end() waits out
+ * whatever is left of the 300 ms and drops it. `cam ircut day|night` forces one. */
+static void ircut_begin(int scene)
+{
+	const char *name = scene == CAM_SCENE_DAY ? "day" : "night";
+
+	s_ircut_pin = scene == CAM_SCENE_DAY ? PIN_IRCUT_DAY : PIN_IRCUT_NIGHT;
+	pin_configure(PIN_IRCUT_DAY, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+	pin_configure(PIN_IRCUT_NIGHT, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+	bk_gpio_set_output_low(PIN_IRCUT_DAY);
+	bk_gpio_set_output_low(PIN_IRCUT_NIGHT);
+	bk_gpio_set_output_high(s_ircut_pin);
+	s_ircut_t0 = rtos_get_time() | 1;
+	s_ircut_state = scene;
+	kv_set_str(KV_IRCUT, name);
+	os_printf("[cam] ir-cut -> %s (GPIO %d pulse)\r\n", name, s_ircut_pin);
+}
+
+static void ircut_end(void)
+{
+	uint32_t el;
+
+	if (!s_ircut_t0)
+		return;
+	el = rtos_get_time() - s_ircut_t0;
+	if (el < IRCUT_PULSE_MS)
+		rtos_delay_milliseconds(IRCUT_PULSE_MS - el);
+	bk_gpio_set_output_low(s_ircut_pin);
+	s_ircut_t0 = 0;
+}
+#endif /* CONFIG_DVP_CAMERA */
+
+/* Start-exposure class for a day open from the light sensor: class 1..11 = 1 << (class - 1) rows
+ * (one row ~127 us) with the AEC on at once, class 16..26 = the same rows manual-first. The LDR is
+ * a weak illuminance meter (663 mV on a sunny morning reads like a lit room, yet the AEC settled at
+ * 1 row, gain 1x) and the loop moves about a stop per 0.5 s either way, so err short: a dark first
+ * frame keeps its detail, a white one does not. `cam exp N` fixes a class; the CPU1 trace
+ * (camera.md, "Checking CPU1 from CPU0") shows where the AEC ends up for a given reading. */
+static uint32_t cam_exp_class(uint32_t mv)
+{
+	if (s_cam_exp_fixed)
+		return s_cam_exp_fixed;
+	/* Default = manual-first (class 16+): AEC/AGC stay off for the first second at this exposure,
+	 * then take over. Measured 2026-10-05 (sunny, 515-663 mV): the AEC settles at 1 row, gain 1x;
+	 * started there the first frame is right and the AEC stays put, whereas any AEC-on start
+	 * overshoots to ~130 rows on the dark start-up frames and needs ~4 s to come back. */
+	if (mv < 700) return 16;    /* 1 row */
+	if (mv < 850) return 18;    /* 4 */
+	if (mv < 1000) return 20;   /* 16 */
+	if (mv < 1200) return 22;   /* 64 */
+	return 24;                  /* 256 */
+}
+
+static const char *cam_scene_name(int scene)
+{
+	static const char *const names[] = {"auto", "day", "night", "stock"};
+	return scene >= 0 && scene <= 3 ? names[scene] : "?";
+}
+
 /* Open the sensor in JPEG or H.264 mode (1280x720 only for H.264: the encoder needs height % 16
  * == 0 and the OV9650 table has 720p). Caller holds s_cam_ctl. */
 static int cam_open_locked(uint32_t w, uint32_t h, bool h264)
 {
 	media_camera_device_t dev = {0};
-	int ret;
+	int ret, scene = s_cam_scene_pref;
+	uint32_t mv = 0;
 
 	if (s_cam_open)
 		return s_cam_h264 == h264 ? BK_OK : BK_ERR_STATE;
@@ -2012,6 +2132,7 @@ static int cam_open_locked(uint32_t w, uint32_t h, bool h264)
 		return BK_ERR_NO_MEM;
 	if (!s_cam_mutex)
 		rtos_init_mutex(&s_cam_mutex);
+	s_cam_opening = true;
 #if CONFIG_DVP_CAMERA
 	if (s_cam_off_ms) {   /* a real power-off: 250 ms left 3/8 cold opens silent or undetected */
 		uint32_t off = rtos_get_time() - s_cam_off_ms;
@@ -2020,6 +2141,26 @@ static int cam_open_locked(uint32_t w, uint32_t h, bool h264)
 	}
 	cam_rails(1);   /* GPIO 9, 28 (camera power, active high per the stock firmware), 5 */
 	rtos_delay_milliseconds(150);
+	/* GPIO 28 is up, so the LDR divider is live and this is a plain ADC read. < 100 mV is the
+	 * unpowered-divider signature (seen once at a cold wake, 2026-10-05: the wake report's
+	 * light_read_mv() in the reporter thread dropped GPIO 28 under us, hence s_cam_opening);
+	 * re-read a few times, then fall back to the last plausible reading. */
+	for (int t = 0; t < 4; t++) {
+		mv = adc_read_mv(LIGHT_ADC_CHAN);
+		if (mv >= 100)
+			break;
+		rtos_delay_milliseconds(30);
+	}
+	if (mv < 100 && s_light_last_mv) {
+		os_printf("[cam] light read %u mV (divider off?), using last %u mV\r\n", (unsigned)mv, (unsigned)s_light_last_mv);
+		mv = s_light_last_mv;
+	} else if (mv >= 100) {
+		s_light_last_mv = mv;
+	}
+	if (scene == CAM_SCENE_AUTO)
+		scene = mv > s_dark_mv ? CAM_SCENE_NIGHT : CAM_SCENE_DAY;
+	if ((scene == CAM_SCENE_DAY || scene == CAM_SCENE_NIGHT) && scene != s_ircut_state)
+		ircut_begin(scene);   /* overlaps the 250 ms reset pulse below; ircut_end() pads to 300 ms */
 	/* stock bk_dvp_camera_enumerate: GPIO 52 low 100 ms, high 100 ms, low (sensor PWDN/RESET pulse) */
 	pin_configure(52, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
 	bk_gpio_set_output_low(52);
@@ -2028,19 +2169,35 @@ static int cam_open_locked(uint32_t w, uint32_t h, bool h264)
 	rtos_delay_milliseconds(100);
 	bk_gpio_set_output_low(52);
 	rtos_delay_milliseconds(50);
+	ircut_end();
+#else
+	if (scene == CAM_SCENE_AUTO)
+		scene = CAM_SCENE_DAY;
 #endif
 	dev.type = DVP_CAMERA;
 	dev.mode = h264 ? H264_MODE : JPEG_MODE;
 	dev.fmt = h264 ? PIXEL_FMT_H264 : PIXEL_FMT_JPEG;
 	dev.info.resolution.width = w;
 	dev.info.resolution.height = h;
-	dev.info.fps = FPS15;
+	/* scene hint for the CPU1 sensor driver, see the block comment above cam_frame_cb() */
+	s_cam_exp_class = scene == CAM_SCENE_DAY ? cam_exp_class(mv) : 0;
+	dev.info.fps = (frame_fps_t)(FPS15 | (scene == CAM_SCENE_DAY ? (OV9650_SCENE_DAY | OV9650_EXP_ENCODE(s_cam_exp_class)) :
+					     scene == CAM_SCENE_NIGHT ? OV9650_SCENE_NIGHT : 0));
+	s_cam_scene = scene == CAM_SCENE_STOCK ? 0 : scene;
+	s_cam_open_mv = mv;
 	s_cam_h264_frames = 0;
+	s_cam_open_frames = 0;
+	s_cam_prev_len = 0;
+	s_cam_stable = 0;
+	s_cam_settled_ms = 0;
+	s_cam_settle_how = '-';
+	s_cam_settled = h264;   /* the gate is for JPEG consumers only */
 	ret = media_app_camera_open(&dev);
 	if (ret != BK_OK) {
 #if CONFIG_DVP_CAMERA
 		cam_power(0);   /* undetected cold sensor: make the retry a real power cycle */
 #endif
+		s_cam_opening = false;
 		return ret;
 	}
 	/* one registration at a time: the format selects which CPU1 frame queue is forwarded */
@@ -2050,8 +2207,32 @@ static int cam_open_locked(uint32_t w, uint32_t h, bool h264)
 	s_h264_q_pending = s_cam_h264;
 	s_cam_open_ms = rtos_get_time();
 	s_cam_last_ms = s_cam_open_ms;
-	os_printf("[cam] open %ux%u %s -> %d\r\n", w, h, h264 ? "h264" : "jpeg", ret);
+	s_cam_opening = false;
+	os_printf("[cam] open %ux%u %s scene %s (%u mV, exp class %u) -> %d\r\n", w, h, h264 ? "h264" : "jpeg", cam_scene_name(s_cam_scene), (unsigned)mv, (unsigned)s_cam_exp_class, ret);
 	return ret;
+}
+
+/* Exposure settle gate (see the block above cam_frame_cb): block a JPEG consumer until the AEC
+ * has settled after the open, at most `settle MS` after the open. Returns the ms spent here. */
+static uint32_t cam_settle_wait(void)
+{
+	uint32_t t0 = rtos_get_time(), waited;
+
+	if (!s_cam_open || s_cam_h264 || s_cam_settled)
+		return 0;
+	while (!s_cam_settled && s_cam_open && !s_cam_h264) {
+		if (rtos_get_time() - s_cam_open_ms >= s_cam_settle_ms) {
+			s_cam_settled_ms = rtos_get_time() - s_cam_open_ms;
+			s_cam_settle_how = 't';
+			s_cam_settled = true;
+			break;
+		}
+		rtos_delay_milliseconds(20);
+	}
+	waited = rtos_get_time() - t0;
+	s_cam_settle_wait_ms = waited;
+	s_cam_settle_waits++;
+	return waited;
 }
 
 /* Caller holds s_cam_ctl. The last JPEG stays in s_cam_buf (stale snapshot while in H.264). */
@@ -2236,6 +2417,7 @@ int app_cam_grab(uint8_t *dst, uint32_t cap, uint32_t wait_ms)
 		return -1;
 	if (!s_cam_mutex || !s_cam_buf)
 		return -2;
+	cam_settle_wait();   /* a cold open: let the exposure converge before the card gets the frame */
 	while ((n = cam_copy_latest(dst, cap, &seq)) <= 0 && rtos_get_time() - t0 < wait_ms)
 		rtos_delay_milliseconds(50);
 	return n;
@@ -2254,7 +2436,7 @@ static void cam_http_client_task(beken_thread_arg_t arg)
 	int sock = (int)(intptr_t)arg, n;
 	char req[384], hdr[192];   /* 384: GET /cmd?t=<token>&c=<url-encoded command> must fit in the first read */
 	uint8_t *buf = NULL;
-	uint32_t seq = 0, last = 0;
+	uint32_t seq = 0, last = 0, settle = 0, s_buf_cap = 0;
 	struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
 
 	setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -2271,6 +2453,7 @@ static void cam_http_client_task(beken_thread_arg_t arg)
 		if (cam_want_jpeg() == 0) {   /* open on demand (or switch back from H.264); the first frame takes ~1 s */
 			for (int w = 0; w < 300 && s_cam_len == 0; w++)
 				rtos_delay_milliseconds(10);
+			settle = cam_settle_wait();   /* cold open: wait for the exposure to settle (X-Settle-Ms) */
 		} else if (os_strncmp(req, "GET /stream", 11) == 0 || !s_cam_len) {
 			n = snprintf(hdr, sizeof(hdr), "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 24\r\nConnection: close\r\n\r\ncamera busy (H.264/RTSP)");
 			send_all(sock, hdr, n);
@@ -2283,12 +2466,25 @@ static void cam_http_client_task(beken_thread_arg_t arg)
 		send_all(sock, hdr, n);
 		goto out;
 	}
-	buf = psram_malloc(CAM_BUF_MAX);
-	if (!buf)
-		goto out;
+	/* Client buffer: the MJPEG stream needs the full size; a snapshot gets the current frame plus
+	 * a margin (retried at full size if the frame grew), so three concurrent snapshots (HA's wake
+	 * photo, its preview and a tool) fit the 512 KB PSRAM heap next to the 150 KB frame buffer
+	 * and the 128 KB RTSP ring. 150 KB each left room for one: the others got a closed socket. */
+	{
+		uint32_t cap = os_strncmp(req, "GET /stream", 11) == 0 || !s_cam_len ? CAM_BUF_MAX : s_cam_len + 16 * 1024;
+		if (cap > CAM_BUF_MAX)
+			cap = CAM_BUF_MAX;
+		buf = psram_malloc(cap);
+		if (!buf) {
+			n = snprintf(hdr, sizeof(hdr), "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 11\r\nConnection: close\r\n\r\nbusy (mem)\n");
+			send_all(sock, hdr, n);
+			goto out;
+		}
+		s_buf_cap = cap;
+	}
 	if (os_strncmp(req, "GET /stream", 11) == 0) {
 		n = snprintf(hdr, sizeof(hdr), "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n"
-			     "Cache-Control: no-cache\r\nConnection: close\r\n\r\n");
+			     "Cache-Control: no-cache\r\nX-Settle-Ms: %u\r\nConnection: close\r\n\r\n", (unsigned)settle);
 		if (send_all(sock, hdr, n))
 			goto out;
 		for (;;) {
@@ -2305,10 +2501,16 @@ static void cam_http_client_task(beken_thread_arg_t arg)
 				break;
 		}
 	} else if (os_strncmp(req, "GET /snapshot", 13) == 0) {
-		n = cam_copy_latest(buf, CAM_BUF_MAX, &seq);
+		n = cam_copy_latest(buf, s_buf_cap, &seq);
+		if (n <= 0 && s_cam_len > s_buf_cap) {   /* the frame grew past the margin: once more at full size */
+			os_free(buf);
+			buf = psram_malloc(CAM_BUF_MAX);
+			if (buf)
+				n = cam_copy_latest(buf, CAM_BUF_MAX, &seq);
+		}
 		if (n > 0) {
 			int hl = snprintf(hdr, sizeof(hdr), "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n"
-					  "Cache-Control: no-cache\r\nConnection: close\r\n\r\n", n);
+					  "Cache-Control: no-cache\r\nX-Settle-Ms: %u\r\nConnection: close\r\n\r\n", n, (unsigned)settle);
 			if (!send_all(sock, hdr, hl))
 				send_all(sock, buf, n);
 		} else {
@@ -2395,9 +2597,67 @@ static void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 		REPLY("[cam] closed\r\n");
 	} else if (argc >= 2 && os_strcmp(argv[1], "stat") == 0) {
 		static const char *const pref[] = {"auto", "jpeg", "h264"};
-		REPLY("[cam] open %d %s (mode %s) frames %u h264 %u dropped %u last jpeg %u bytes %ux%u seq %u age %u ms\r\n", s_cam_open,
+		REPLY("[cam] open %d %s (mode %s) frames %u h264 %u dropped %u last jpeg %u bytes %ux%u seq %u age %u ms"
+		      " | scene %s (%s, %u mV, exp %u) open_frames %u settled %c@%u ms wait %u ms x%u settle %u/%u ms/%u%% ircut %s\r\n", s_cam_open,
 		      s_cam_open ? (s_cam_h264 ? "h264" : "jpeg") : "-", pref[s_cam_pref], s_cam_frames, s_cam_h264_frames,
-		      s_cam_drop, s_cam_len, s_cam_w, s_cam_h, s_cam_seq, s_cam_last_ms ? rtos_get_time() - s_cam_last_ms : 0);
+		      s_cam_drop, s_cam_len, s_cam_w, s_cam_h, s_cam_seq, s_cam_last_ms ? rtos_get_time() - s_cam_last_ms : 0,
+		      s_cam_scene ? cam_scene_name(s_cam_scene) : "stock", cam_scene_name(s_cam_scene_pref), s_cam_open_mv, s_cam_exp_class, s_cam_open_frames,
+		      s_cam_settle_how, s_cam_settled_ms, s_cam_settle_wait_ms, s_cam_settle_waits, s_cam_settle_n, s_cam_settle_ms, s_cam_settle_pct,
+		      s_ircut_state < 0 ? "unknown" : cam_scene_name(s_ircut_state));
+	} else if (argc >= 2 && os_strcmp(argv[1], "settle") == 0) {   /* cam settle [N [MS [PCT]]] */
+		char buf[32];
+		if (argc >= 3) {
+			uint32_t n = os_strtoul(argv[2], NULL, 10), ms = argc >= 4 ? os_strtoul(argv[3], NULL, 10) : s_cam_settle_ms;
+			uint32_t pct = argc >= 5 ? os_strtoul(argv[4], NULL, 10) : s_cam_settle_pct;
+			if (n < 1 || n > 60 || ms < 100 || ms > 8000 || pct < 1 || pct > 50) {   /* cap: HA's snapshot timeout is 10 s incl. ~1 s open */
+				REPLY("cam settle N(1-60) [MS(100-8000) [PCT(1-50)]]\r\n");
+				return;
+			}
+			s_cam_settle_n = n;
+			s_cam_settle_ms = ms;
+			s_cam_settle_pct = pct;
+			snprintf(buf, sizeof(buf), "%u %u %u", n, ms, pct);
+			kv_set_str(KV_CAM_SETTLE, buf);
+		}
+		REPLY("[cam] settle %u frames, cap %u ms, stable < %u %% (applies at the next open)\r\n", s_cam_settle_n, s_cam_settle_ms, s_cam_settle_pct);
+	} else if (argc >= 2 && os_strcmp(argv[1], "scene") == 0) {   /* cam scene auto|day|night|stock */
+		if (argc >= 3) {
+			int sc = os_strcmp(argv[2], "auto") == 0 ? CAM_SCENE_AUTO : os_strcmp(argv[2], "day") == 0 ? CAM_SCENE_DAY :
+				 os_strcmp(argv[2], "night") == 0 ? CAM_SCENE_NIGHT : os_strcmp(argv[2], "stock") == 0 ? CAM_SCENE_STOCK : -1;
+			if (sc < 0) {
+				REPLY("cam scene auto|day|night|stock\r\n");
+				return;
+			}
+			s_cam_scene_pref = sc;
+			kv_set_str(KV_CAM_SCENE, argv[2]);
+		}
+		REPLY("[cam] scene %s (applies at the next open; light now %u mV, dark > %u; open camera: %s)\r\n", cam_scene_name(s_cam_scene_pref),
+		      light_read_mv(), s_dark_mv, s_cam_open ? (s_cam_scene ? cam_scene_name(s_cam_scene) : "stock") : "-");
+	} else if (argc >= 2 && os_strcmp(argv[1], "exp") == 0) {   /* cam exp [N]: day start exposure class, 0 = from the light */
+		char buf[8];
+		if (argc >= 3) {
+			uint32_t n = os_strtoul(argv[2], NULL, 10);
+			if (n > 26 || (n > 11 && n < 16)) {
+				REPLY("cam exp 0-11 (0 = from the light sensor, else 1 << (N-1) rows; 16-26 = manual 1 << (N-16) rows for 1 s, then AEC)\r\n");
+				return;
+			}
+			s_cam_exp_fixed = n;
+			snprintf(buf, sizeof(buf), "%u", n);
+			kv_set_str(KV_CAM_EXP, buf);
+		}
+		{
+			uint32_t now_mv = light_read_mv(), c = cam_exp_class(now_mv);
+			REPLY("[cam] exp class %u (%s; light now %u mV -> class %u = %u rows; applies at the next day open)\r\n", s_cam_exp_fixed,
+			      s_cam_exp_fixed ? "fixed" : "auto", now_mv, c, CAM_EXP_ROWS(c));
+		}
+	} else if (argc >= 3 && os_strcmp(argv[1], "ircut") == 0 && (os_strcmp(argv[2], "day") == 0 || os_strcmp(argv[2], "night") == 0)) {
+#if CONFIG_DVP_CAMERA
+		ircut_begin(os_strcmp(argv[2], "day") == 0 ? CAM_SCENE_DAY : CAM_SCENE_NIGHT);
+		ircut_end();
+		REPLY("[cam] ir-cut pulsed to %s (remembered)\r\n", argv[2]);
+#else
+		REPLY("[cam] ir-cut: no DVP camera in this build\r\n");
+#endif
 	} else if (argc >= 3 && os_strcmp(argv[1], "mode") == 0) {
 		if (os_strcmp(argv[2], "auto") == 0)
 			s_cam_pref = CAM_PREF_AUTO;
@@ -2420,7 +2680,7 @@ static void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char
 		if (rtos_create_thread(&t, BEKEN_APPLICATION_PRIORITY, "camsnap", camsnap_task, 4096, NULL) != BK_OK)
 			REPLY("[cam] thread failed\r\n");
 	} else {
-		REPLY("cam open [W H] [h264] | close | stat | mode auto|jpeg|h264 | snap HOST PORT | http://IP:8080/snapshot.jpg /stream | probe [PWR_PIN ...] | probe scan | probe rails on|off | probe bb SCL SDA\r\n");
+		REPLY("cam open [W H] [h264] | close | stat | mode auto|jpeg|h264 | settle [N [MS [PCT]]] | scene auto|day|night|stock | exp [0-11] | ircut day|night | snap HOST PORT | http://IP:8080/snapshot.jpg /stream | probe [PWR_PIN ...] | probe scan | probe rails on|off | probe bb SCL SDA\r\n");
 	}
 }
 
@@ -2553,7 +2813,7 @@ static uint32_t light_read_mv(void)
 {
 	uint32_t mv;
 #if defined(DOORBELL_AVDK) && (CONFIG_SYS_CPU0)
-	bool cam = s_cam_open;   /* camera open = GPIO 28 already high and must stay high */
+	bool cam = s_cam_open || s_cam_opening;   /* camera open(ing) = GPIO 28 already high and must stay high */
 #else
 	bool cam = false;
 #endif
@@ -2566,6 +2826,10 @@ static uint32_t light_read_mv(void)
 	mv = adc_read_mv(LIGHT_ADC_CHAN);
 	if (!cam)
 		bk_gpio_set_output_low(28);
+#if defined(DOORBELL_AVDK) && (CONFIG_SYS_CPU0)
+	if (mv >= 100)
+		s_light_last_mv = mv;
+#endif
 	return mv;
 }
 
@@ -2759,7 +3023,7 @@ static const struct cli_command s_doorbell_commands[] = {
 	{"log", "log [N<=600] | stat (last N bytes of the RAM log; GET /log?t=TOKEN for all 8 KB)", cli_log_cmd},
 #endif
 #if defined(DOORBELL_AVDK) && (CONFIG_SYS_CPU0)
-	{"cam", "cam open [W H] [h264] | close | stat | mode auto|jpeg|h264 | snap HOST PORT (AVDK build)", cli_cam_cmd},
+	{"cam", "cam open [W H] [h264] | close | stat | mode auto|jpeg|h264 | settle [N [MS [PCT]]] | scene auto|day|night|stock | exp [0-11] | ircut day|night | snap HOST PORT (AVDK build)", cli_cam_cmd},
 	{"rtsp", "rtsp on|off | status | port N | q IMB PMB | idr (H.264 live stream rtsp://IP:554/live)", cli_rtsp_cmd},
 #endif
 	{"spk", "spk tone [HZ] [MS] | play beepa|beepb|bell|ADDR LEN | net HOST PORT | stop", cli_spk_cmd},
@@ -2817,6 +3081,21 @@ void user_app_main(void)
 			s_rtsp_port = (uint16_t)os_strtoul(v, NULL, 10);
 		if (kv_get_str(KV_RTSP, v, sizeof(v)))
 			s_rtsp_on = v[0] == '1';
+		if (kv_get_str(KV_CAM_SETTLE, v, sizeof(v))) {   /* "N MS PCT" */
+			uint32_t n = os_strtoul(v, &e, 10), ms = os_strtoul(e, &e, 10), pct = os_strtoul(e, NULL, 10);
+			if (n >= 1 && n <= 60 && ms >= 100 && ms <= 8000 && pct >= 1 && pct <= 50) {
+				s_cam_settle_n = n;
+				s_cam_settle_ms = ms;
+				s_cam_settle_pct = pct;
+			}
+		}
+		if (kv_get_str(KV_CAM_SCENE, v, sizeof(v)))
+			s_cam_scene_pref = os_strcmp(v, "day") == 0 ? CAM_SCENE_DAY : os_strcmp(v, "night") == 0 ? CAM_SCENE_NIGHT :
+					   os_strcmp(v, "stock") == 0 ? CAM_SCENE_STOCK : CAM_SCENE_AUTO;
+		if (kv_get_str(KV_CAM_EXP, v, sizeof(v)) && os_strtoul(v, NULL, 10) <= 26)
+			s_cam_exp_fixed = os_strtoul(v, NULL, 10);
+		if (kv_get_str(KV_IRCUT, v, sizeof(v)))
+			s_ircut_state = os_strcmp(v, "day") == 0 ? CAM_SCENE_DAY : os_strcmp(v, "night") == 0 ? CAM_SCENE_NIGHT : -1;
 		rtos_create_thread(&http, BEKEN_APPLICATION_PRIORITY, "camhttp", cam_http_task, 4096, NULL);
 		if (s_rtsp_on)   /* default off: nothing changes for the camera until `rtsp on` */
 			rtsp_start(s_rtsp_port);

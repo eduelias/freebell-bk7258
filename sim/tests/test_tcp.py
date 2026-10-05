@@ -48,8 +48,17 @@ def test_reply_formats(sim):
     assert re.match(r"ok\n\[night\] auto 1 ring 1 hyst 400 \| light \d+ mV \(last \d+, dark > 1400\) cam [01] cam_dark 0 samples \d+ "
                     r"motion_left \d+ s \| white src 0x[0-9a-f]+ manual -1 out [01] \| ring manual -1 out 0 wifi 1 fx [01]$",
                     sim.cmd("night status"))
-    assert re.match(r"ok\n\[cam\] open [01] \S+ \(mode auto\) frames \d+ h264 \d+ dropped \d+ last jpeg \d+ bytes \d+x\d+ seq \d+ age \d+ ms$",
+    assert re.match(r"ok\n\[cam\] open [01] \S+ \(mode auto\) frames \d+ h264 \d+ dropped \d+ last jpeg \d+ bytes \d+x\d+ seq \d+ age \d+ ms"
+                    r" \| scene \S+ \(auto, \d+ mV, exp \d+\) open_frames \d+ settled [-nst]@\d+ ms wait \d+ ms x\d+ settle 16/4500 ms/4% ircut \S+$",
                     sim.cmd("cam stat"))
+    assert sim.cmd("cam settle 6 2000") == "ok\n[cam] settle 6 frames, cap 2000 ms, stable < 4 % (applies at the next open)"
+    assert sim.cmd("cam settle 0") == "ok\ncam settle N(1-60) [MS(100-8000) [PCT(1-50)]]"
+    assert sim.cmd("cam scene day").startswith("ok\n[cam] scene day (applies at the next open; light now ")
+    assert sim.cmd("cam scene dusk") == "ok\ncam scene auto|day|night|stock"
+    assert sim.cmd("cam ircut day") == "ok\n[cam] ir-cut pulsed to day (remembered)"
+    assert re.match(r"ok\n\[cam\] exp class 3 \(fixed; light now \d+ mV -> class 3 = 4 rows; applies at the next day open\)$", sim.cmd("cam exp 3"))
+    assert sim.cmd("cam exp 40") == "ok\ncam exp 0-11 (0 = from the light sensor, else 1 << (N-1) rows; 16-26 = manual 1 << (N-16) rows for 1 s, then AEC)" and sim.cmd("cam exp 0").startswith("ok\n[cam] exp class 0 (auto")
+    assert sim.cmd("cam settle 16 4500 4").startswith("ok\n[cam] settle 16 frames") and sim.cmd("cam scene auto").startswith("ok\n[cam] scene auto")
     assert re.match(r"ok\n\[rtsp\] stopped port \d+ clients 0/3 \(0 playing\) in 0\.0 fps 0 kbps frames 0 key 0 drop busy 0 big 0 "
                     r"sps 0 pps 0 age 0 ms\r\n\[rtsp\] audio: voc off aec on \| clients 0 \| mic in 0 frames 0 B \| back in 0 pkts 0 B \| voc fails 0$",
                     sim.cmd("rtsp status"))

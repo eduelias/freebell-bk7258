@@ -113,10 +113,148 @@ int ov9650_set_ppi(media_ppi_t ppi)
 	return (ppi == PPI_1280X720 || ppi == PPI_800X480) ? 0 : -1;
 }
 
+/* Scene hint from CPU0 (fw 0.27): the application packs it into media_camera_device_t.info.fps,
+ * which dvp_camera.c (bk_idk) copies verbatim through the mailbox and hands to set_fps() right
+ * after init() programmed the table. frame_fps_t is a byte-sized bit-mask enum (FPS15 = bit 2 is
+ * the only real rate of this sensor), so the other 7 bits are free: bit 7 = night, bit 6 = day,
+ * bits 0-1 and 3-5 = a 5-bit start-exposure class (0 = driver default). Same encoding in
+ * project/main/app_main.c. */
+#define OV9650_SCENE_DAY   (1u << 6)
+#define OV9650_SCENE_NIGHT (1u << 7)
+#define OV9650_FPS_MASK    0x04u
+#define OV9650_EXP_CLASS(v) (((((v) >> 3) & 7u) << 2) | ((v) & 3u))
+/* class 1..11 = start exposure 1..1024 rows with AEC on at once; 0 = 4 rows; class 16..27 = the
+ * same rows but AEC/AGC stay OFF for the first second (the trace thread enables them), an
+ * experiment lever: the engine restarts from ~130 rows whenever AEC is enabled (measured). */
+#define OV9650_EXP_MANUAL(c) ((c) >= 16u)
+#define OV9650_EXP_LINES(c) (OV9650_EXP_MANUAL(c) ? (1u << (((c) - 16u) > 10u ? 10u : ((c) - 16u))) : (c) ? (1u << (((c) > 11u ? 11u : (c)) - 1u)) : 4u)
+
+/* Debug words readable from CPU0 with `mem <addr> N` (addresses: grep ov9650_dbg / ov9650_trace
+ * in the bk7258_cp1 app.map; flash XIP is mapped identically for both cores, SRAM too):
+ *   ov9650_dbg[0] = 0x965000xx with xx = the fps word received, [1] = COM8<<24|COM11<<16|COM9<<8|AECH
+ *   read back after the sequence, [2] = AECHM<<24|COM1<<16|GAIN<<8|AEW, [3] = start exposure lines.
+ *   ov9650_trace[i] = AEC lines | GAIN<<16 | COM8<<24, sampled every 500 ms for 15 s after a day
+ *   open (a short-lived CPU1 thread), so the converged exposure for a light level can be read. */
+volatile uint32_t ov9650_dbg[4];
+volatile uint32_t ov9650_trace[32];
+
+static uint32_t ov9650_read_exposure(uint8_t *gain, uint8_t *com8)
+{
+	uint8_t h = 0, l = 0, m = 0, g = 0, c = 0;
+
+	SENSOR_I2C_READ(0x10, &h);
+	SENSOR_I2C_READ(0x04, &l);
+	SENSOR_I2C_READ(0xa1, &m);
+	SENSOR_I2C_READ(0x00, &g);
+	SENSOR_I2C_READ(0x13, &c);
+	if (gain)
+		*gain = g;
+	if (com8)
+		*com8 = c;
+	return ((uint32_t)(m & 0x3f) << 10) | ((uint32_t)h << 2) | (l & 3);
+}
+
+static bool ov9650_manual_first;
+static volatile uint32_t ov9650_gen;   /* bumped per open: a trace thread of a previous open stops and never touches the new one */
+
+static void ov9650_trace_task(beken_thread_arg_t arg)
+{
+	uint32_t gen = (uint32_t)arg;
+
+	for (uint32_t i = 0; i < 30 && gen == ov9650_gen; i++) {
+		uint8_t g, c;
+		uint32_t e = ov9650_read_exposure(&g, &c);
+		ov9650_trace[i] = (e & 0xffff) | ((uint32_t)g << 16) | ((uint32_t)c << 24);
+		if (i == 1 && ov9650_manual_first && gen == ov9650_gen) {   /* manual-first class: AEC/AGC on after ~1 s */
+			SENSOR_I2C_WRITE(0x13, 0xe7);
+			ov9650_manual_first = false;
+		}
+		rtos_delay_milliseconds(500);
+	}
+	ov9650_trace[30] = 0xd0ded0de;
+	rtos_delete_thread(NULL);
+}
+
+/* Day: the stock table starts the sensor in night mode (COM11 0x3b bit 7) with the AEC engine at a
+ * long exposure (AECHM 0xa1 = 0x41 -> AEC[10]) and gain 0x80, and in daylight the loop needs ~10 s
+ * of frames to come down (2026-10-05: 93 % of pixels clipped at +2 s, 1 % at +13 s). Writing the
+ * exposure registers while AEC is enabled does nothing (the engine owns them; measured: no change
+ * at all with v1 of this code), so: AEC/AGC off (AWB stays on), night mode off, lower AGC ceiling
+ * and AE target, a start exposure chosen by CPU0 from the light sensor, gain 1x, then AEC/AGC on
+ * again so the loop starts from there instead of from white. The loop moves about one stop per
+ * 0.5 s either way (trace 2026-10-05 11:25: 64 -> 130 -> 65 -> 17 -> 9 -> 5 -> 2 -> 1 row at
+ * 663 mV, then gain 0x0f -> 0 over 5 s), so the start is biased short: a sunny scene is right
+ * at once and an overcast one is a stop or three up, which keeps the detail a white frame loses. */
+static void ov9650_day(uint32_t lines, bool manual_first)
+{
+	static const uint8_t pre[][2] = {
+		{0x13, 0xe2},   /* COM8: fast algorithm + unlimited step + banding + AWB, AEC/AGC OFF */
+		{0x3b, 0x29},   /* COM11: night mode off, banding filter as in the table */
+		{0x14, 0x0a},   /* COM9: AGC ceiling 2x (table: 4x) */
+		{0x24, 0x78},   /* AEW: AE upper target (table 0x98) */
+		{0x25, 0x68},   /* AEB: AE lower target (table 0x88) */
+		{0xa1, 0x00},   /* AECHM: exposure[15:10] = 0 (table 0x41) */
+	};
+	uint8_t v10 = (lines >> 2) & 0xff, v04 = lines & 3, g, c;
+
+	for (uint32_t i = 0; i < sizeof(pre) / sizeof(pre[0]); i++) {
+		SENSOR_I2C_WRITE(pre[i][0], pre[i][1]);
+		rtos_delay_milliseconds(1);
+	}
+	SENSOR_I2C_WRITE(0x10, v10);   /* AECH: exposure[9:2] */
+	rtos_delay_milliseconds(1);
+	SENSOR_I2C_WRITE(0x04, v04);   /* COM1: exposure[1:0] */
+	rtos_delay_milliseconds(1);
+	SENSOR_I2C_WRITE(0x00, 0x00);  /* GAIN: 1x (table 0x80) */
+	rtos_delay_milliseconds(1);
+	ov9650_manual_first = manual_first;
+	if (!manual_first)
+		SENSOR_I2C_WRITE(0x13, 0xe7);  /* COM8: AEC/AGC/AWB on (manual-first: the trace thread does this after ~1 s) */
+	rtos_delay_milliseconds(1);
+	{
+		uint8_t r13 = 0, r3b = 0, r14 = 0, r10 = 0, ra1 = 0, r04 = 0, r00 = 0, r24 = 0;
+		SENSOR_I2C_READ(0x13, &r13); SENSOR_I2C_READ(0x3b, &r3b); SENSOR_I2C_READ(0x14, &r14); SENSOR_I2C_READ(0x10, &r10);
+		SENSOR_I2C_READ(0xa1, &ra1); SENSOR_I2C_READ(0x04, &r04); SENSOR_I2C_READ(0x00, &r00); SENSOR_I2C_READ(0x24, &r24);
+		ov9650_dbg[1] = ((uint32_t)r13 << 24) | ((uint32_t)r3b << 16) | ((uint32_t)r14 << 8) | r10;
+		ov9650_dbg[2] = ((uint32_t)ra1 << 24) | ((uint32_t)r04 << 16) | ((uint32_t)r00 << 8) | r24;
+	}
+	ov9650_dbg[3] = lines;
+	(void)ov9650_read_exposure(&g, &c);
+	{
+		beken_thread_t t;
+		for (uint32_t i = 0; i < 32; i++)
+			ov9650_trace[i] = 0;
+		rtos_create_thread(&t, BEKEN_APPLICATION_PRIORITY, "ov9650tr", ov9650_trace_task, 1024, (beken_thread_arg_t)ov9650_gen);
+	}
+}
+
+/* Night: the table as shipped (night mode on, AGC 4x, bright target) plus the registers the stock
+ * day/night switch wrote when it moved the IR-cut filter to night: fixed U/V = black and white
+ * (TSLB 0x3a bit 4 + MANU/MANV 0x67/0x68 = 0x80). */
+static const uint8_t ov9650_night_regs[][2] = {
+	{0x3a, 0x11}, {0x67, 0x80}, {0x68, 0x80},
+};
+
 int ov9650_set_fps(frame_fps_t fps)
 {
-	LOGI("%s %d (fixed at 15)\n", __func__, fps);
-	return fps == FPS15 ? 0 : -1;
+	uint32_t v = (uint32_t)fps & 0xff;
+
+	ov9650_gen++;   /* retire the trace thread of the previous open before anything is programmed */
+	ov9650_manual_first = false;
+	ov9650_dbg[0] = 0x96500000u | v;
+	ov9650_dbg[1] = ov9650_dbg[2] = ov9650_dbg[3] = 0;
+	if (v & OV9650_SCENE_DAY) {
+		ov9650_day(OV9650_EXP_LINES(OV9650_EXP_CLASS(v)), OV9650_EXP_MANUAL(OV9650_EXP_CLASS(v)));
+	} else if (v & OV9650_SCENE_NIGHT) {
+		for (uint32_t i = 0; i < sizeof(ov9650_night_regs) / sizeof(ov9650_night_regs[0]); i++) {
+			SENSOR_I2C_WRITE(ov9650_night_regs[i][0], ov9650_night_regs[i][1]);
+			rtos_delay_milliseconds(1);
+		}
+	}
+	BK_LOGW(TAG, "%s 0x%02x: scene %s, start %u lines (class %u), sensor fixed at 15\n", __func__, v,
+		(v & OV9650_SCENE_DAY) ? "day" : (v & OV9650_SCENE_NIGHT) ? "night" : "stock",
+		(v & OV9650_SCENE_DAY) ? OV9650_EXP_LINES(OV9650_EXP_CLASS(v)) : 0, OV9650_EXP_CLASS(v));
+	return (v & OV9650_FPS_MASK) ? 0 : -1;
 }
 
 int ov9650_dump(media_ppi_t ppi)
