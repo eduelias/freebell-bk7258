@@ -227,7 +227,8 @@ with the start rows from the light reading (< 700 mV -> 1 row, measured at 515-6
 |---|---|---|---|---|
 | 12:07 open after the OTA reboot (632 mV, exp class 16 = 1 row) | +3.4 s **161 / 1.9 %** (`X-Settle-Ms` 1264, gate `s@1950 ms` = size-stable at the N/2 floor) | 161 / 1.9 % flat to +8.5 s | `scene day (auto, 632 mV, exp 16) ... ircut day` | 87.7 KB |
 | 12:07 `cam close` + reopen (647 mV) | +3.9 s 161 / 2.4 % (settle 1960) | flat | same | 87.1 KB |
-COLD_WAKE_ROWS
+| 12:42:32 **RTC deep-sleep wake** (`reset deepsleep-rtc`, 642 mV, overcast by now) | +3.4 s **132 / 0.9 %** (settle 1266, `s@1950 ms`) | flat; HA's own `wake_latest.jpg` written 4 s after the wake: 132 / 0.9 % (this morning: 250 / 91 %) | `scene day (auto, 642 mV, exp 16) ... ircut day`, trace 1 row then gain 1 -> 3 | 87.4 KB |
+| 12:59:33 RTC deep-sleep wake (633 mV) | +3.4 s **159 / 0.1 %** (settle 1254; HA's request took the gate first, `wait 460 ms x2`) | flat; HA `wake_latest.jpg` 159 / 0.1 % | same, trace 1 row / gain 0 | 87.3 KB |
 
 CPU1 trace for both: 1 row with AEC off, AEC on after 1 s, 1 row / gain 0 from then on - the
 engine does not restart when enabled on a correctly exposed stream. The first frame itself
