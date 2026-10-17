@@ -1,4 +1,6 @@
-# doorbell-bk7258-fw
+# freebell-bk7258
+
+*Formerly `doorbell-bk7258-fw`. The firmware still announces itself under that name until 0.28.*
 
 Open firmware for the Tuya "Smart Visual Doorbell" built on the Beken **BK7258** (board
 `IP108_MAIN_V05`, Tuya product IP10B), plus the Home Assistant glue that turns it into a fully

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build doorbell-bk7258-fw with Beken's armino-idk container (podman or docker; x86-64, emulated
+# Build freebell-bk7258 with Beken's armino-idk container (podman or docker; x86-64, emulated
 # through Rosetta on Apple Silicon, native on an x86-64 Linux host, see scripts/build-remote.sh).
 # Our project is mounted over the SDK's projects/app slot so the stock build flow applies.
 # Settings (SDK, OUT, FW_DIR) come from the environment or ~/.config/doorbell-bk7258/env
