@@ -4,6 +4,34 @@ Versions are the `FW_VERSION` in `src/version.h` (`project/main/app_main.c` befo
 report JSON and in `sys info`). Dates are 2026 unless stated; most of this was written between 2026-10-01 and
 2026-10-03.
 
+## 0.28.1
+- **Rescue mode: boot-loop protection for OTA updates** (`src/rescue.c`). The bootloader installs an
+  update over the running image and has no rollback, so an image that crashes at every boot needed
+  the UART header. Now every crash or watchdog reset (SDK reset reasons watchdog, NMI watchdog,
+  faults and asserts; `CONFIG_ASSERT_REBOOT` is on) increments a KV counter, a boot that runs 90 s or
+  reaches a normal deep sleep clears it, and after 3 crash resets in a row the firmware starts in
+  rescue mode: Wi-Fi, the TCP channel and the OTA client only, one `{"event":"rescue","crashes":N,
+  "reset_reason":R,"forced":0|1}` webhook report, and only `rescue ota reboot wifi hook tok`. The camera,
+  audio, microSD, PIR, night light, RTSP, policy pull and deep sleep stay off. `ota` clears the count;
+  `rescue on|off|crash|status`. Not covered: a crash before the application starts, in the Wi-Fi/OTA
+  path, or on CPU1/CPU2 only. The SDK also has an A/B partition scheme with confirm and rollback
+  (`CONFIG_HTTP_AB_PARTITION`); switching to it needs a new bootloader and partition table, so one
+  UART session, and is left for a day the doorbell is off the wall anyway.
+- **microSD: survive a card that loses contact** (the author's is taped in). SDK patch 0011: a failed
+  or short block read returned `BK_OK` (the host function computed the error and returned OK, the SD
+  layer ignored the result), so FatFs could trust a stale buffer and write it back as FAT or directory
+  data; the error now reaches FatFs, which retries and then fails, and the card is dropped. Card detect
+  is debounced before a mount (3 reads, 15 ms apart), and the worker unmounts a card that leaves the
+  slot while mounted within ~2 s instead of at the next failing write (`removed` in `sd status`).
+- **`"sd"` in every webhook report**: `ok`, `nocard` (detect switch open), `fail` (the last mount or
+  save failed, none succeeded since) or `off` (automatic saves off); also `health` in `sd status`.
+- Board profile: `BOARD_ADC_SUPPLY` (ADC 9, the supply sense reported as `mv`) replaces two literal 9s.
+- Simulator: `sd` field, `sim card in|out`, the `rescue` command and rescue mode (`test_rescue.py`).
+- Correction to 0.28.0's note on GPIO 6 in deep sleep: driving the card-detect line low is the
+  low-power choice. The stock firmware's internal pull-up suggests no external one, so with the card
+  out nothing flows, and with the card in the switch grounds the pin anyway (an input with the
+  internal pull-up would draw through it all night).
+
 ## 0.28.0
 Restructuring release (2026-10-17): no feature changes; the project is now **freebell-bk7258**
 (boot banner, heartbeat and `FW_NAME`).
@@ -35,7 +63,7 @@ Restructuring release (2026-10-17): no feature changes; the project is now **fre
   after a simulated reboot or sleep on Linux (`server_bind()` override skipped `SO_REUSEADDR`,
   listeners closed without `shutdown()`); fixed.
 - Known, not changed here: before deep sleep the firmware drives GPIO 6 (microSD card detect, an
-  input) low with the camera rails. Harmless with a card in (the socket grounds it); to be revisited.
+  input) low with the camera rails (see 0.28.1: this is the low-power choice).
 
 ## 0.27.0
 - **Daylight snapshots after a cold open are no longer white** (2026-10-05). Every camera open

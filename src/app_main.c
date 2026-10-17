@@ -29,6 +29,7 @@ void app_power_prepare_sleep(void)
 #if defined(DOORBELL_AVDK)
 	camera_close_for_sleep();
 #endif
+	rescue_mark_healthy();   /* reaching a normal deep sleep proves this boot healthy */
 	for (i = 0; i < sizeof(rails); i++) {
 		if (rails[i] == BOARD_PIN_SENSOR_RAIL && power_hold9())   /* `pwr hold9 on` (default off): leave the sensor rail up through the sleep */
 			continue;
@@ -57,6 +58,9 @@ static void heartbeat_task(beken_thread_arg_t arg)
 
 	while (1) {
 		os_printf("[" FW_NAME "] alive %u, uptime %u ms\r\n", n++, rtos_get_time());
+#if (CONFIG_SYS_CPU0)
+		rescue_tick();   /* 90 s up: clear the crash count */
+#endif
 		rtos_delay_milliseconds(30000);
 	}
 }
@@ -72,6 +76,10 @@ void user_app_main(void)
 			   heartbeat_task, 2048, NULL);
 
 #if (CONFIG_SYS_CPU0)
+	if (rescue_boot_check()) {   /* 3 crash resets in a row (or `rescue on`): Wi-Fi, TCP channel and OTA only */
+		rescue_start();
+		return;
+	}
 	pa_set(0);   /* amplifier enable floats at boot and half-turns the speaker on: park it low */
 	voc_init();  /* KV: db_talk_aec / db_voc_mic; the engine itself starts with the first RTSP audio track */
 	pin_configure(BOARD_PIN_SENSOR_RAIL, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);   /* sensor rail: light sensor reads ~25 mV dead without it */
@@ -104,7 +112,7 @@ void user_app_main(void)
 		};
 		night_init(&env);
 	}
-	net_start_events();  /* netif/Wi-Fi event callbacks, then the button and PIR inputs */
+	net_start_events(true);   /* netif/Wi-Fi event callbacks, then the button and PIR inputs */
 	power_init();        /* before the reporter: a button wake from deep sleep must chime at once, before Wi-Fi */
 	sd_init();           /* microSD worker: card mounted on demand (ring/motion/`sd save`, opens the camera), unmounted when idle */
 	net_start_reporter();

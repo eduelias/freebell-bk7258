@@ -115,7 +115,8 @@ void cli_cam_probe(int argc, char **argv);
 extern char s_ip[16];
 extern volatile bool s_got_ip;
 void net_load_settings(void);
-void net_start_events(void);
+void net_start_events(bool inputs);
+int net_post(const char *json);
 void net_start_reporter(void);
 void net_connect(void);
 bool net_ota_busy(void);
@@ -124,6 +125,17 @@ void net_wake_input(uint32_t pin);
 void cli_wifi_cmd(CLI_ARGS);
 void cli_ota_cmd(CLI_ARGS);
 void cli_hook_cmd(CLI_ARGS);
+
+/* rescue.c: boot-loop protection */
+bool rescue_boot_check(void);
+bool rescue_active(void);
+uint32_t rescue_crashes(void);
+void rescue_mark_healthy(void);
+void rescue_tick(void);
+void rescue_clear(void);
+bool rescue_allows(const char *cmd);
+void rescue_start(void);
+void cli_rescue_cmd(CLI_ARGS);
 
 /* audio_engine.c */
 extern volatile bool s_spk_busy;

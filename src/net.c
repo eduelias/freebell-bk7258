@@ -287,6 +287,7 @@ void cli_ota_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 		return;
 	}
 	os_strlcpy(s_ota_url, argv[1], sizeof(s_ota_url));
+	rescue_clear();   /* the new image starts with a clean crash count (the SDK reboots on success, we do not return) */
 	os_printf("[ota] downloading %s\r\n", s_ota_url);
 	/* run in its own thread so the shell / TCP channel reply at once; the device reboots on success */
 	ret = rtos_create_thread(&ota_thread, BEKEN_APPLICATION_PRIORITY, "ota", ota_task, 8192, NULL);
@@ -351,11 +352,22 @@ void net_load_settings(void)
 		os_strlcpy(s_hook, HOOK_DEFAULT, sizeof(s_hook));
 }
 
-void net_start_events(void)
+void net_start_events(bool inputs)   /* inputs: the button + PIR (not in rescue mode) */
 {
 	bk_event_register_cb(EVENT_MOD_NETIF, EVENT_ID_ALL, netif_event_cb, NULL);
 	bk_event_register_cb(EVENT_MOD_WIFI, EVENT_ID_ALL, wifi_event_cb, NULL);
-	inputs_init();
+	if (inputs)
+		inputs_init();
+}
+
+/* POST a ready-made JSON body to the webhook (rescue.c); the HTTP status or -errno */
+int net_post(const char *json)
+{
+	if (!s_got_ip)
+		return -ENOTCONN;
+	if (!s_hook[0])
+		return -ENOENT;
+	return http_post_json(s_hook, json);
 }
 
 void net_start_reporter(void)

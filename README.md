@@ -21,7 +21,12 @@ the two sections below before you flash anything.
   forever** (the Tuya licence lives in the flash region this firmware does not use, but there is no
   supported way back except your own full dump).
 - Brick risk is low: the BK7258's download mode lives in mask ROM and is always reachable over the
-  UART header, whatever is in flash ([docs/notes/flashing.md](docs/notes/flashing.md)).
+  UART header, whatever is in flash ([docs/notes/flashing.md](docs/notes/flashing.md)). OTA has no
+  rollback (the bootloader installs over the running image), so since 0.28.1 the firmware protects
+  itself against a bad update: after **three crash or watchdog resets in a row** it starts in
+  **rescue mode** (Wi-Fi, the TCP channel and OTA only, a `rescue` webhook report) so a fixed image
+  can still go in over the air. It cannot help with a crash before the application starts or in the
+  Wi-Fi/OTA path itself; then the UART is the way back.
 - The board carries a **3.7 V Li-ion pack**: do not short it, do not run it with a swollen cell,
   unplug battery *and* USB before touching the header, and keep the device mains-free as designed.
 - Your stock dump contains **device-specific data** (Tuya licence, RF calibration, Wi-Fi
@@ -162,7 +167,8 @@ flash and survive OTA.
 | `wifi` | `set SSID PASS` \| `status` \| `connect` \| `clear` | ssid/pass |
 | `hook` | `show` \| `set HOST:PORT/PATH` \| `test` \| `ring` \| `motion` | `db_hook` (unset) |
 | `tok` | `set SECRET` \| `clear` (disables TCP 2323) | token |
-| `ota` | `ota URL` (fetch `app_pack.rbl` over HTTP, install, reboot) | |
+| `ota` | `ota URL` (fetch `app_pack.rbl` over HTTP, install, reboot; clears the crash count) | |
+| `rescue` | `status` \| `on` (next boot in rescue mode) \| `off` (clear the crash count / leave rescue) \| `crash` (deliberate crash, for testing the protection). In rescue mode only `rescue`, `ota`, `reboot`, `wifi`, `hook`, `tok` run | `db_crashes`, `db_rescue` |
 | `sys` | `info` (fw, uptime, ip, heap, reset reason, light/battery mV) | |
 | `reboot` | reset the SoC; the ROM download window is reachable right after | |
 | `ring` | `test` \| `dark MV` \| `chan ADC` \| `fx on\|off` (chime + LEDs on a press) | `db_dark_mv` (1000), `db_light_chan`, fx on |
