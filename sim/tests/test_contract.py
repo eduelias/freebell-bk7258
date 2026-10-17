@@ -55,5 +55,6 @@ def test_report_json_has_the_firmware_fields():
     dev.pwr_bchan, dev.pwr_bratio, dev.boot_ms, dev.motion_count, dev.ring_count, dev.pir_on, dev.pir_sens = 15, 200, 0, 0, 0, True, 1
     dev.sched_on, dev.day_start, dev.day_end, dev.day_min, dev.night_min, dev.pwr_snap_min = True, 7 * 60, 22 * 60, 15, 60, 0
     dev.pwr_wake_pir, dev.low_batt, dev.policy_result, dev.policy_rev = False, False, "none", ""
+    dev.sd_auto, dev.sd = True, vdb.SdState()
     sim_fields = set(re.findall(r'"([a-z_]+)":', dev.report_json("boot")))
     assert fw_fields - {"reason"} <= sim_fields, "report fields missing in the simulator: %s" % (fw_fields - sim_fields)

@@ -143,8 +143,13 @@ CAM_FIRST_FRAME_S = 1.0
 
 RESET_REASONS = {               # bk_idk include/components/system.h
     "power-on": 0x0, "reboot": 0x1, "watchdog": 0x2, "deepsleep-gpio": 0x3, "deepsleep-rtc": 0x4,
-    "super-deep": 0xF, "nmi-wdt": 0x10, "ota": 0x18, "unknown": 0xFF,
+    "super-deep": 0xF, "nmi-wdt": 0x10, "ota": 0x18, "unknown": 0xFF, "crash-assert": 0xE,
 }
+# rescue.c: reset reasons that count as a crash, and what rescue mode still accepts
+CRASH_REASONS = {"watchdog", "nmi-wdt", "crash-assert"}
+RESCUE_AFTER = 3
+RESCUE_HEALTHY_MS = 90_000
+RESCUE_CMDS = ("rescue", "ota", "reboot", "wifi", "hook", "tok")
 
 
 def fw_version_from_source(default: str = "0.0.0-sim") -> str:
@@ -478,6 +483,7 @@ class SdState:
     fmt_token: int = 0
     fmt_token_ms: int = 0
     result: str = "mounted"
+    fail_since: bool = False   # sdcard.c s_fail_since: the last mount/save failed, none succeeded since
 
 
 class Device:
@@ -821,9 +827,9 @@ class Device:
         if event == "boot":   # report_ex("boot", policy_json()): the policy pull result rides on the boot report
             extra = ',"policy":"%s","policy_rev":"%s"' % (self.policy_result, self.policy_rev) + extra
         return ('{"event":"%s","fw":"%s","ip":"%s","mv":%u,"light_mv":%u,"uptime_s":%u,"motion_count":%u,'
-                '"ring_count":%u,"pir_on":%u,"pir_sens":%u,"batt_mv":%u,"batt_pct":%u,"usb":%u,"charging":%u,"sleep_min":%u,"wake_pir":%u%s}'
+                '"ring_count":%u,"pir_on":%u,"pir_sens":%u,"sd":"%s","batt_mv":%u,"batt_pct":%u,"usb":%u,"charging":%u,"sleep_min":%u,"wake_pir":%u%s}'
                 % (event, self.fw, self.ip, self.adc_mv(9), self.light_read_mv(), self.uptime_ms() // 1000,
-                   self.motion_count, self.ring_count, 1 if self.pir_on else 0, self.pir_sens,
+                   self.motion_count, self.ring_count, 1 if self.pir_on else 0, self.pir_sens, self.sd_health(),
                    bmv, self.batt_pct(bmv, chg), self.usb, 1 if chg else 0, sleep_min,
                    1 if self.pwr_wake_pir and not self.low_batt else 0, extra))
 
@@ -840,6 +846,64 @@ class Device:
             self.reports.append({"t": time.time(), "status": status, "json": json.loads(body)})
             del self.reports[:-50]
         return status
+
+    # ------------------------------------------------------------ rescue mode (rescue.c)
+    def rescue_boot_check(self, reason: str) -> None:
+        self.rescue_crashes = int(self.store.kv_get("db_crashes") or 0) if self.store else 0
+        if reason in CRASH_REASONS:
+            self.rescue_crashes += 1
+            self.store.kv_set("db_crashes", str(self.rescue_crashes))
+        self.rescue_forced = (self.store.kv_get("db_rescue") if self.store else None) == "1"
+        self.rescue = self.rescue_forced or self.rescue_crashes >= RESCUE_AFTER
+        self.rescue_healthy = False
+        self.rescue_reason = RESET_REASONS.get(reason, 0xFF)
+        if self.rescue:
+            log.info("[rescue] reset 0x%x, %u crash reset(s) in a row: RESCUE MODE%s", self.rescue_reason,
+                     self.rescue_crashes, " (forced)" if self.rescue_forced else "")
+
+    def rescue_tick(self) -> None:
+        if not hasattr(self, "rescue") or self.rescue or self.rescue_healthy or self.uptime_ms() < RESCUE_HEALTHY_MS:
+            return
+        self.rescue_healthy = True
+        if self.rescue_crashes:
+            self.rescue_crashes = 0
+            self.store.kv_set("db_crashes", "0")
+
+    def rescue_clear(self) -> None:
+        self.rescue_crashes = 0
+        self.store.kv_set("db_crashes", "0")
+        if self.rescue_forced:
+            self.rescue_forced = False
+            self.store.kv_set("db_rescue", "0")
+
+    def report_rescue(self) -> int:
+        body = '{"event":"rescue","fw":"%s","ip":"%s","crashes":%u,"reset_reason":%u,"forced":%u}' % (
+            self.fw, self.ip, self.rescue_crashes, self.rescue_reason, 1 if self.rescue_forced else 0)
+        status = self.http_post_json(self.hook, body) if self.hook else -2
+        log.info("[rescue] report -> %d", status)
+        with self.lock:
+            self.reports.append({"t": time.time(), "status": status, "json": json.loads(body)})
+            del self.reports[:-50]
+        return status
+
+    def cmd_rescue(self, argv: list[str], r: Reply) -> None:
+        sub = argv[1] if len(argv) >= 2 else "status"
+        if sub == "on":
+            self.store.kv_set("db_rescue", "1")
+            r.add("[rescue] on: the next boot starts in rescue mode (`reboot` now; `rescue off` or an OTA leaves it)\r\n")
+        elif sub == "off":
+            self.rescue_clear()
+            r.add("[rescue] off: crash count cleared%s\r\n" % ("; `reboot` to start normally" if self.rescue else ""))
+        elif sub == "crash":
+            r.add("[rescue] crash test in 0.5 s (counts as crash reset %u of %u)\r\n" % (self.rescue_crashes + 1, RESCUE_AFTER))
+            self.reboot("crash-assert", REBOOT_DOWN_S)
+        elif sub == "status":
+            r.add("[rescue] %s | reset 0x%x | %u crash reset(s) in a row, rescue after %u | forced %s | fw %s up %u s ip %s"
+                  " | allowed in rescue: rescue ota reboot wifi hook tok\r\n" % (
+                      "RESCUE MODE" if self.rescue else "normal", self.rescue_reason, self.rescue_crashes, RESCUE_AFTER,
+                      "on" if self.rescue_forced else "off", self.fw, self.uptime_ms() // 1000, self.ip))
+        else:
+            r.add("rescue [status] | on | off | crash   (boot-loop protection, see src/rescue.c)\r\n")
 
     @staticmethod
     def http_post_json(hook: str, body: str) -> int:
@@ -1089,13 +1153,25 @@ class Device:
                 self.cam.settled = True
 
     # ------------------------------------------------------------ SD card stand-in
+    def sd_health(self) -> str:
+        """sd_health(): "off" (auto saves off), "nocard" (detect switch open), "fail", else "ok"."""
+        if not self.sd_auto:
+            return "off"
+        if not self.sd.present:
+            return "nocard"
+        return "fail" if self.sd.fail_since else "ok"
+
     def sd_save(self, event: str) -> str:
         if not self.sd.mounted:
             self.sd.fail += 1
+            if self.sd.present:
+                self.sd.fail_since = True
             return "not mounted"
         if not self.cam.jpeg:
             self.sd.fail += 1
+            self.sd.fail_since = True
             return "no frame"
+        self.sd.fail_since = False
         name = "1:/doorbell/%s_%s.jpg" % (_dt.datetime.now().strftime("%Y%m%d_%H%M%S"), event)
         self.sd.files.append((name, len(self.cam.jpeg)))
         self.sd.saved += 1
@@ -1172,6 +1248,7 @@ class Device:
         with self.lock:
             self._load_settings()
             self._reset_runtime(reason, wake_reason)
+            self.rescue_boot_check(reason)
             log.info("==== %s %s: hello from our own firmware ==== (reset 0x%x %s%s)", FW_NAME, self.fw,
                      RESET_REASONS.get(reason, 0xFF), reason, " wake=" + wake_reason if wake_reason else "")
             log.info("[night] boot blink (blue ring 150 ms)")
@@ -1194,6 +1271,9 @@ class Device:
                 self.got_ip = True
                 self.state = "awake"
                 log.info("[wifi] got ip %s", self.ip)
+                if self.rescue:                  # rescue.c report_task(): the only report in rescue mode
+                    self.report_rescue()
+                    return
                 if not self.policy_fetched:      # policy_boot_fetch(): once per boot, before the boot report
                     self.policy_fetched = True
                     self.policy_fetch(False)
@@ -1207,6 +1287,7 @@ class Device:
         last_frame = 0.0
         while not self.stop_all.is_set():
             try:
+                self.rescue_tick()
                 if self.state in ("awake", "booting") and not self.sleeping:
                     if self.pend_boot:
                         self.pend_boot = False
@@ -1254,6 +1335,8 @@ class Device:
         handler = self.COMMANDS.get(argv[0])
         if handler is None or (allow is not None and argv[0] not in allow):
             return "unknown", ""
+        if getattr(self, "rescue", False) and argv[0] not in RESCUE_CMDS:
+            return "ok", "[rescue] `%s` is not available in rescue mode (rescue ota reboot wifi hook tok)\r\n" % argv[0]
         r = Reply()
         try:
             handler(self, argv, r)
@@ -1337,6 +1420,7 @@ class Device:
             log.info("[ota] no network")
             return
         url = argv[1][:159]
+        self.rescue_clear()   # rescue.c: the new image starts with a clean crash count
         log.info("[ota] downloading %s", url)
         if self.ota_running:
             log.info("[ota] thread failed -1")
@@ -1987,6 +2071,12 @@ class Device:
                 before = self.ring_count
                 self.press()
                 r.add("[sim] button pressed: ring_count %u%s\r\n" % (self.ring_count, "" if self.ring_count != before else " (debounced, 0.8 s)"))
+        elif sub == "card" and arg in ("in", "out"):   # sdcard.c: detect switch; out while mounted = sd_cd_watch()
+            self.sd.present = arg == "in"
+            if not self.sd.present and self.sd.mounted:
+                self.sd.mounted = False
+                self.sd.result = "card left the slot while mounted (cd=1): unmounted"
+            r.add("[sim] card %s\r\n" % arg)
         elif sub == "motion":
             if self.sleeping:
                 if self.pwr_wake_pir:
@@ -2047,7 +2137,7 @@ class Device:
                       self.args.http_port, self.args.sim_port, self.rtsp_port, " (ffmpeg)" if self.rtsp.running() else "",
                       "Pillow" if HAVE_PIL else "mosaic"))
         else:
-            r.add("sim press | motion | light MV | batt MV | usb on|off | charging on|off | time SPEED | heartbeat | wake [REASON]"
+            r.add("sim press | motion | card in|out | light MV | batt MV | usb on|off | charging on|off | time SPEED | heartbeat | wake [REASON]"
                   " | status | help   (curl http://IP:%d/sim/press)\r\n" % self.args.http_port)
 
     COMMANDS: dict[str, Callable[["Device", list, Reply], None]] = {
@@ -2057,6 +2147,7 @@ class Device:
         "cam": cmd_cam, "rtsp": cmd_rtsp, "spk": cmd_spk, "mic": cmd_mic,
         "talk": cmd_talk, "sd": cmd_sd,          # feat/talk, feat/sd
         "vol": cmd_vol, "log": cmd_log,          # fw 0.25 (policy.c)
+        "rescue": cmd_rescue,                      # 0.28.1 (rescue.c)
         "sim": cmd_sim,                            # simulator only
     }
 

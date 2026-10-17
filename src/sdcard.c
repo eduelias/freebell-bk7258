@@ -185,6 +185,8 @@ static uint32_t s_keep_until_ms;        /* worker: power the card down once this
 static uint32_t s_sectors, s_free_mb;   /* from the last successful mount (shown while unmounted too) */
 static volatile uint32_t s_saved, s_save_fail, s_dropped, s_deferred, s_retried;
 static uint32_t s_mounts, s_mount_fail, s_last_mount_ms, s_last_cold_save_ms;
+static uint32_t s_removed;     /* cards that left the slot while mounted or powered (sd_cd_watch) */
+static bool s_fail_since;      /* the last mount or save failed and none succeeded since (sd_health) */
 static char s_last_file[48];
 static char s_result[112] = "idle";
 static char s_probe[300];               /* `sd probe` output, filled by the worker, replied by the caller */
@@ -260,6 +262,17 @@ bool app_time_local(int *hh, int *mm)
 uint32_t sd_keep_get(void)
 {
 	return s_keep_s;
+}
+
+static int sd_cd_level(void);
+
+const char *sd_health(void)
+{
+	if (!s_auto)
+		return "off";
+	if (sd_cd_level())
+		return "nocard";
+	return s_fail_since ? "fail" : "ok";
 }
 
 bool sd_auto_get(void)
@@ -467,6 +480,23 @@ static void sd_cd_init(void)
 static int sd_cd_level(void)
 {
 	return bk_gpio_get_input(SD_CD_PIN) ? 1 : 0;
+}
+
+/* A taped or loose card can bounce the detect switch: count it present only when every read of a short
+ * burst agrees, so a bounce does not start a mount that will fail half-way (0.28.1). */
+#define SD_CD_SETTLE_READS 3
+#define SD_CD_SETTLE_GAP_MS 15
+static bool sd_cd_settled_present(void)
+{
+	int i;
+
+	for (i = 0; i < SD_CD_SETTLE_READS; i++) {
+		if (i)
+			rtos_delay_milliseconds(SD_CD_SETTLE_GAP_MS);
+		if (sd_cd_level())
+			return false;
+	}
+	return true;
 }
 
 static void sd_pins(uint8_t out[3])
@@ -873,7 +903,7 @@ static int sd_do_mount(void)
 		sd_set_result("sleeping: no mount");
 		return -1;
 	}
-	if (sd_cd_level()) {   /* GPIO 6 = 1: slot empty, do not even clock the bus */
+	if (!sd_cd_settled_present()) {   /* GPIO 6 = 1 (or bouncing): slot empty, do not even clock the bus */
 		s_present = false;
 		sd_set_result("no card (cd=1)");
 		return -1;
@@ -889,6 +919,7 @@ static int sd_do_mount(void)
 			bk_pm_module_vote_cpu_freq(PM_DEV_ID_SDIO, PM_CPU_FRQ_DEFAULT);
 			s_cpu_voted = false;
 		}
+		s_fail_since = true;
 		sd_set_result("no card (init %d, %u ms)", ret, rtos_get_time() - t0);
 		return -1;
 	}
@@ -906,12 +937,14 @@ static int sd_do_mount(void)
 		s_mount_fail++;
 		rtos_unlock_mutex(&s_fs_mutex);
 		sd_power(0);
+		s_fail_since = true;
 		sd_set_result(nofs ? "card %u MB has no FAT filesystem (fr=%d): `sd format`" : "card %u MB: mount failed fr=%d",
 			      mb, fr);
 		return -2;
 	}
 	s_mounted = true;
 	s_mounts++;
+	s_fail_since = false;
 	s_last_mount_ms = rtos_get_time() - t0;
 	fr = f_mkdir(SD_DIR);
 	if (fr != FR_OK && fr != FR_EXIST)
@@ -1029,7 +1062,7 @@ static int sd_do_save_inner(const char *event, uint32_t ev_ms, bool automatic)
 	if (!s_mounted) {   /* on demand: power on, pre-condition, init, mount */
 		if (automatic && (!s_auto || s_sleep))
 			return SD_SAVE_FAIL;
-		if (sd_cd_level()) {   /* GPIO 6 = 1: slot empty, nothing to retry */
+		if (!sd_cd_settled_present()) {   /* GPIO 6 = 1 (or bouncing): slot empty, nothing to retry */
 			s_present = false;
 			sd_set_result("no card (cd=1)");
 			return SD_SAVE_NOCARD;
@@ -1106,6 +1139,11 @@ static int sd_do_save(const char *event, uint32_t ev_ms, bool automatic)
 	uint32_t t0 = rtos_get_time();
 	bool cold = !s_mounted;
 	int r = sd_do_save_inner(event, ev_ms, automatic);
+
+	if (r == SD_SAVE_OK)
+		s_fail_since = false;
+	else if (r != SD_SAVE_NOCARD)   /* an empty slot is reported as "nocard" by sd_health() itself */
+		s_fail_since = true;
 
 	if (s_jpg) {
 		psram_free(s_jpg);
@@ -1374,6 +1412,29 @@ static void sd_idle_check(uint32_t now)
 #endif
 }
 
+/* Worker idle tick (~1 s): a card that leaves the slot while mounted or powered is unmounted at once, not
+ * at the next failing write. Two ticks in a row with cd=1, so one bounce of the switch does not count. */
+static void sd_cd_watch(void)
+{
+#if SD_HAVE_HOST
+	static uint8_t gone;
+
+	if (!(s_mounted || s_present) || !sd_cd_level()) {
+		gone = 0;
+		return;
+	}
+	if (++gone < 2)
+		return;
+	gone = 0;
+	s_removed++;
+	s_busy = true;
+	sd_do_umount(true);
+	s_busy = false;
+	sd_set_result("card left the slot while mounted (cd=1): unmounted");
+	os_printf("[sd] %s\r\n", s_result);
+#endif
+}
+
 static void sd_worker(beken_thread_arg_t arg)
 {
 	uint32_t t_start = rtos_get_time(), now;
@@ -1398,6 +1459,7 @@ static void sd_worker(beken_thread_arg_t arg)
 			continue;
 		}
 		now = rtos_get_time();
+		sd_cd_watch();
 		sd_idle_check(now);
 		if (app_net_up() && now - last_ntp_try > SD_NTP_RETRY_MS
 		    && (!s_time_valid || now - s_time_sync_ms > SD_NTP_RESYNC_MS)) {
@@ -1522,9 +1584,9 @@ static void sd_cmd_status(void)
 		for (i = 0; i < SD_RETRY_SLOTS; i++)
 			pend += s_retry[i].used ? 1 : 0;
 #endif
-		app_reply("[sd] %scard %s (cd=%d) cam %d vote %d pin %s%s %s%s | mount %u MB, %u MB free, %u ms (%u ok %u fail) cold %u ms | "
+		app_reply("[sd] %scard %s (cd=%d) health %s removed %u cam %d vote %d pin %s%s %s%s | mount %u MB, %u MB free, %u ms (%u ok %u fail) cold %u ms | "
 			  "saved %u fail %u drop %u (%s) defer %u retry %u pending %d last %s\r\n",
-			  SD_HAVE_HOST ? "" : "NO-HOST-BUILD ", cd ? "out" : "in", cd, cam, s_cpu_voted ? 1 : 0,
+			  SD_HAVE_HOST ? "" : "NO-HOST-BUILD ", cd ? "out" : "in", cd, sd_health(), s_removed, cam, s_cpu_voted ? 1 : 0,
 			  s_pwr_pin < 0 ? "none" : (s_pwr_on ? "on" : "off"),
 			  (s_pwr_pin >= 0 && !s_pwr_on && sd_adc_pin_blocked(s_pwr_pin)) ? " (adc settling)" : "",
 			  s_mounted ? "mounted" : (s_present ? "present" : "unmounted"), keep,

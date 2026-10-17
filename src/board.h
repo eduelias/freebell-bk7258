@@ -21,7 +21,7 @@
     !defined(BOARD_PIN_CAM_PWR) || !defined(BOARD_PIN_CAM_LDO) || !defined(BOARD_PIN_CAM_PWDN) || \
     !defined(BOARD_PIN_IRCUT_DAY) || !defined(BOARD_PIN_IRCUT_NIGHT) || !defined(BOARD_PIN_SENSOR_RAIL) || \
     !defined(BOARD_PIN_USB_PRESENT) || !defined(BOARD_PIN_CHARGING) || !defined(BOARD_PIN_SD_DETECT) || \
-    !defined(BOARD_ADC_LIGHT) || !defined(BOARD_ADC_BATTERY) || !defined(BOARD_PIN_BATTERY) || !defined(BOARD_BATT_RATIO_PCT)
+    !defined(BOARD_ADC_LIGHT) || !defined(BOARD_ADC_SUPPLY) || !defined(BOARD_ADC_BATTERY) || !defined(BOARD_PIN_BATTERY) || !defined(BOARD_BATT_RATIO_PCT)
 #error "board profile incomplete: see board.h for the required BOARD_* names"
 #endif
 

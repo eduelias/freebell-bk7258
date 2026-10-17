@@ -45,6 +45,7 @@
 
 /* ---- analog */
 #define BOARD_ADC_LIGHT        14   /* light sensor (LDR on GPIO 12); higher mV = darker; needs BOARD_PIN_CAM_PWR */
+#define BOARD_ADC_SUPPLY        9   /* regulated ~3.07 V supply sense (GPIO 7), reported as "mv" (sys info "batt") */
 #define BOARD_ADC_BATTERY      15   /* battery node, on BOARD_PIN_BATTERY */
 #define BOARD_PIN_BATTERY      13   /* GPIO behind BOARD_ADC_BATTERY (ADC only: not the microSD power) */
 #define BOARD_BATT_RATIO_PCT  200   /* battery divider: cell mV = ADC mV x 2.00 */

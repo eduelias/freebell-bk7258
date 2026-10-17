@@ -89,6 +89,10 @@ static int run_line(char *line)
 		argv[argc++] = t;
 	if (!argc)
 		return -1;
+	if (!rescue_allows(argv[0])) {
+		REPLY("[rescue] `%s` is not available in rescue mode (rescue ota reboot wifi hook tok)\r\n", argv[0]);
+		return 0;
+	}
 	for (i = 0; i < s_doorbell_command_count; i++)
 		if (os_strcmp(argv[0], s_doorbell_commands[i].name) == 0) {
 			s_doorbell_commands[i].function(NULL, 0, argc, argv);
@@ -264,6 +268,7 @@ static const struct cli_command s_doorbell_commands[] = {
 	{"pir", "pir on|off | sens 0-3 | cooldown MS | status (PIR GPIO 24/50/25/26)", cli_pir_cmd},
 	{"motion", "motion test (simulated PIR edge through the ISR handler)", cli_motion_cmd},
 	{"ota", "ota URL (download app_pack.rbl over HTTP, then reboot)", cli_ota_cmd},
+	{"rescue", "rescue [status] | on | off | crash (boot-loop protection: minimal start after 3 crash resets)", cli_rescue_cmd},
 	{"tok", "tok set SECRET | clear (token for the TCP command channel, port 2323)", cli_tok_cmd},
 	{"led", "led white|ring on|off|auto (white fill LED GPIO 44 / blue button ring GPIO 45)", cli_led_cmd},
 	{"night", "night auto on|off | ring on|off | hyst MV | status (night light, ring indicator)", night_cli_cmd},

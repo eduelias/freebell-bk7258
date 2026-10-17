@@ -350,7 +350,7 @@ void sys_cli_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 		uint32_t rr = bk_misc_get_reset_reason();
 		uint32_t up = rtos_get_time() / 1000;
 		uint32_t light = s_env.light_read_mv ? s_env.light_read_mv() : 0;
-		uint32_t batt = s_env.adc_read_mv ? s_env.adc_read_mv(9) : 0;
+		uint32_t batt = s_env.adc_read_mv ? s_env.adc_read_mv(BOARD_ADC_SUPPLY) : 0;
 
 		db_reply("[sys] fw %s uptime %us (%uh%02um) ip %s wifi %d heap %u B reset 0x%x (%s) light %u mV batt %u mV cam %d\r\n",
 			 s_env.fw_version ? s_env.fw_version : "?", up, up / 3600, (up / 60) % 60, s_env.ip ? s_env.ip : "?",

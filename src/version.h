@@ -5,6 +5,6 @@
 #define DOORBELL_VERSION_H
 
 #define FW_NAME "freebell-bk7258"
-#define FW_VERSION "0.28.0"
+#define FW_VERSION "0.28.1"
 
 #endif

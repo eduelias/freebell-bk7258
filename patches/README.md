@@ -23,11 +23,12 @@ kept, because the build detects an applied patch by reversing it).
 | `0008-fatfs-weak-get-fattime.patch` | `components/fatfs/ff.c` | Make `get_fattime()` weak so the application can supply the SNTP time for FAT timestamps (`sdcard.c`). |
 | `0009-sdio-cmd-wait-outlasts-hw-timeout.patch` | `middleware/driver/sdio_host/sdio_host_driver.c` | `SDIO_CMD_WAIT_TIME` 4 -> 30 ms: the software wait for a command response now outlasts the hardware response timeout (25 ms at the 100 kHz init clock), so a late response can no longer be queued by the ISR after the caller gave up and desynchronise every later command. |
 | `0010-gpio-default-map-doorbell.patch` | `middleware/soc/bk7258/soc/gpio_map.h` | Boot-time pin map (`GPIO_DEFAULT_DEV_CONFIG`, applied by `bk_gpio_driver_init()` on CPU0 at every reset) aligned with the doorbell's stock firmware: GPIO 53 (button = the 433 MHz chime TX key line) input + pull-up instead of an LCD_B2 output that rang every paired chime at each boot/wake; GPIO 6/7 hi-Z; GPIO 27-39 peripheral function off until the camera driver maps them; GPIO 25/26/50 keep their driven level through low power. |
+| `0011-sdio-read-errors-reach-fatfs.patch` | `middleware/driver/sdio_host/sdio_host_driver.c`, `middleware/driver/sd_card/sd_card_driver.c` | A failed or short SD block read returned `BK_OK` (the host function computed the error and returned OK anyway, and `bk_sd_card_read_blocks()` ignored it). Now the error reaches FatFs, whose disk layer retries and then fails the call, so a card that loses contact is dropped instead of handing FatFs a stale buffer it might write back as FAT or directory data. |
 
 About the numbering: `0005` was originally an I2C1-pin remap that turned out to be wrong and was
 reverted during the camera bring-up; the number was then reused for the MCLK settle delay, which
 had lived only in the SDK working tree until it was captured here. Apply order does not matter
-(the patches touch different files).
+(the patches touch different files, or distant parts of one: 0009 and 0011).
 
 All patches are needed (0005 and 0006 are the camera ones; before 0.28 a camera-less build used the
 others alone). 0010 changes an SDK header that

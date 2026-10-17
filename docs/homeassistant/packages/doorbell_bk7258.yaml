@@ -54,6 +54,11 @@ template:
           rev: "{{ trigger.event.data.policy_rev if trigger.event.data.policy else this.attributes.get('rev') }}"
           sleep_min: "{{ trigger.event.data.sleep_min }}"
           wake_pir: "{{ trigger.event.data.wake_pir }}"
+      - name: Doorbell BK7258 SD card
+        # fw 0.28.1: "sd" in every report: ok | nocard (detect switch open) | fail (last mount/save failed) | off
+        unique_id: doorbell_bk7258_sd
+        icon: mdi:micro-sd
+        state: "{{ trigger.event.data.sd if trigger.event.data.sd else this.state }}"
     binary_sensor:
       - name: Doorbell BK7258 USB power
         unique_id: doorbell_bk7258_usb
@@ -81,6 +86,23 @@ automation:
         data:
           title: Doorbell
           message: "Doorbell battery {{ states('sensor.doorbell_bk7258_battery') }} % - charge it"
+    mode: single
+
+  # fw 0.28.1: one push when the card goes missing or stops working (entity id from the sensor's name)
+  - id: doorbell_bk7258_sd_problem
+    alias: "Doorbell BK7258: microSD problem"
+    triggers:
+      - trigger: state
+        entity_id: sensor.doorbell_bk7258_sd_card
+        to: [nocard, fail]
+    actions:
+      - action: notify.doorbell_family
+        data:
+          title: Doorbell
+          message: >-
+            {{ 'The doorbell no longer sees its microSD card.' if trigger.to_state.state == 'nocard' else
+               'The doorbell cannot write to its microSD card (loose contact or a damaged card).' }}
+            Snapshots still go to Home Assistant.
     mode: single
 
   # fw 0.25: the seven helpers -> /config/www/doorbell/policy.json (the device fetches it on every boot), then try
