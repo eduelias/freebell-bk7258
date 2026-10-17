@@ -110,7 +110,7 @@ rssh "cd $repo_s && SDK=$(spath "$REMOTE_SDK") AVDK=$(spath "$REMOTE_AVDK") OUT=
 	FW_DIR=$(spath "$REMOTE_FW_DIR") GIT_REV=$rev scripts/$script"
 
 # 4. bring the images home and point the latest symlink at them
-ver=$(sed -nE 's/^#define FW_VERSION "([^"]+)"/\1/p' "$HERE/project/main/app_main.c")
+ver=$(sed -nE 's/^#define FW_VERSION "([^"]+)"/\1/p' "$HERE/project/main/version.h")
 if [ $sync_back = 1 ]; then
 	mkdir -p "$FW_DIR"
 	files=("doorbell-fw_${ver}_app_pack.rbl")

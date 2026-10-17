@@ -1,6 +1,14 @@
 set(incs .)
 set(srcs
     app_main.c
+    cmd.c
+    board_io.c
+    bringup.c
+    net.c
+    audio_engine.c
+    camera.c
+    cam_http.c
+    ringfx.c
     night.c
     pir.c
     power.c

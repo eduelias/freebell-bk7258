@@ -49,7 +49,7 @@ start=$(date +%s)
 	-w /avdk -u "$(id -u)" \
 	"$IMAGE" make bk7258 PROJECT=doorbell
 echo "build took $(( $(date +%s) - start ))s"
-ver=$(sed -nE 's/^#define FW_VERSION "([^"]+)"/\1/p' "$HERE/project/main/app_main.c")
+ver=$(sed -nE 's/^#define FW_VERSION "([^"]+)"/\1/p' "$HERE/project/main/version.h")
 cp "$OUT/doorbell/bk7258/all-app.bin" "$FW_DIR/doorbell-fw_${ver}_avdk_all-app.bin"
 cp "$OUT/doorbell/bk7258/encrypt/app_pack.rbl" "$FW_DIR/doorbell-fw_${ver}_app_pack.rbl"
 ln -sf "doorbell-fw_${ver}_app_pack.rbl" "$FW_DIR/doorbell-fw_latest_app_pack.rbl"

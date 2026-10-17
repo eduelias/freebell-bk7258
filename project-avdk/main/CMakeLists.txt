@@ -1,5 +1,5 @@
 set(incs . ../shared)
-set(srcs ../shared/app_main.c ../shared/night.c ../shared/pir.c ../shared/power.c ../shared/rtsp.c ../shared/talk.c ../shared/audio_voc.c ../shared/sdcard.c ../shared/policy.c)
+set(srcs ../shared/app_main.c ../shared/cmd.c ../shared/board_io.c ../shared/bringup.c ../shared/net.c ../shared/audio_engine.c ../shared/camera.c ../shared/cam_http.c ../shared/ringfx.c ../shared/night.c ../shared/pir.c ../shared/power.c ../shared/rtsp.c ../shared/talk.c ../shared/audio_voc.c ../shared/sdcard.c ../shared/policy.c)
 if (CONFIG_OVERRIDE_FLASH_PARTITION)
     list(APPEND srcs ../shared/vendor_flash.c)
 endif()

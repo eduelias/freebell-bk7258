@@ -40,7 +40,7 @@ if [ $build = 1 ] && [ $dry = 0 ]; then
 	"$HERE/scripts/$BUILD"
 fi
 
-ver=$(sed -nE 's/^#define FW_VERSION "([^"]+)"/\1/p' "$HERE/project/main/app_main.c")
+ver=$(sed -nE 's/^#define FW_VERSION "([^"]+)"/\1/p' "$HERE/project/main/version.h")
 rbl="$FW_DIR/doorbell-fw_${ver}_app_pack.rbl"
 name=$(basename "$rbl")
 

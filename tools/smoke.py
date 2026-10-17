@@ -5,7 +5,7 @@
   python3 tools/smoke.py diff before.txt after.txt
 
 `run` fetches `/snapshot.jpg` first (so the camera is open for every run), then sends only read-only
-commands (status/show/stat, `pin all`), fetches the HTTP status page and `/cmd`, and does an RTSP OPTIONS/DESCRIBE handshake. Nothing rings, plays,
+commands (status/show/stat, `pin dump N` for every pin config word), fetches the HTTP status page and `/cmd`, and does an RTSP OPTIONS/DESCRIBE handshake. Nothing rings, plays,
 records, saves to the SD card or changes a setting. The camera opens for the snapshot, as it does
 for Home Assistant. Secrets are masked (webhook id, token).
 
@@ -29,14 +29,16 @@ import dbcmd  # noqa: E402
 
 COMMANDS = [
     "sys info", "wifi status", "hook show", "pwr status", "pir status", "night status", "cam stat",
-    "rtsp status", "talk status", "sd status", "vol", "log stat", "pin all",
+    "rtsp status", "talk status", "sd status", "vol", "log stat",
 ]
+EXACT = ("pin cfg",)   # blocks compared exactly by `diff` (pin direction/pull/function must not move)
+VOLATILE_PINS = {27: "camera MCLK: upper bits follow the DVP pipeline state between runs"}
 NUM = re.compile(r"[-+]?(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)?)")
 
 
 def mask(text):
     text = re.sub(r"(/api/webhook/)[\w-]+", r"\1<id>", text)
-    return re.sub(r"(t=)[^&\s]+", r"\1<token>", text)
+    return re.sub(r"(?<![\w])(t=)[^&\s]+", r"\1<token>", text)
 
 
 def http_get(host, port, path, timeout=15.0):
@@ -75,6 +77,14 @@ def run(args):
         print(f"## {cmd}")
         print(mask(reply))
         time.sleep(0.3)   # the firmware's TCP task drops commands sent back to back
+    print("## pin cfg")   # AON config word per pin, bit 0 (live input level) masked
+    for first in range(0, 56, 8):
+        reply = dbcmd.send(f"pin dump {first}", host=host, port=args.port, tok=args.token, timeout=10)
+        m = re.search(r"CFG (\d+): ((?:[0-9a-f]{8} ?){8})", reply)
+        words = " ".join("--------" if first + i in VOLATILE_PINS else "%08x" % (int(w, 16) & ~1)
+                         for i, w in enumerate(m.group(2).split())) if m else "no reply: " + reply
+        print(f"CFG {first:02d}: {words}")
+        time.sleep(0.3)
     print("## http /")
     st, ct, body = http_get(host, args.http_port, "/")
     print(st, ct, body.decode(errors="replace").strip()[:300])
@@ -117,7 +127,7 @@ def diff(args):
             y = lb[i] if i < len(lb) else "<missing>"
             if x == y:
                 continue
-            if NUM.sub("#", x) == NUM.sub("#", y):
+            if key not in EXACT and NUM.sub("#", x) == NUM.sub("#", y):
                 numeric += 1
                 if args.verbose:
                     print(f"  numbers [{key}]: {x}\n                -> {y}")
