@@ -19,7 +19,7 @@ builds from scratch in 48 s.
 The remote needs: Linux (a WSL2 distro counts), docker or podman usable by the login user, git,
 rsync, ssh key login, clones of bk_idk and bk_avdk at `release/v2.0.1`, the image pulled. Nothing
 from this repository is installed there: each run mirrors the working tree, so the remote always
-builds exactly what the laptop has, committed or not. The private firmware repo is never cloned on
+builds exactly what the laptop has, committed or not. The firmware repo itself is never cloned on
 the remote.
 
 ## Settings

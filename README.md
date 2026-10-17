@@ -10,7 +10,7 @@ night light, battery reporting and deep sleep, optional microSD recording, and o
 Why: the author's unit shipped without a Tuya licence and could never be paired, and the licence
 can only be issued by the OEM. Rather than e-waste it, the stock image was dumped, the board was
 reverse-engineered from that image and from the bench, and TuyaOS was replaced. Status: **works,
-in daily use by the author since 2026-10-03** (v0.24.0). It is a one-person hobby project; read
+in daily use by the author since 2026-10-03** (v0.24.0 then; v0.27.0 now). It is a one-person hobby project; read
 the two sections below before you flash anything.
 
 ## Legal and safety
