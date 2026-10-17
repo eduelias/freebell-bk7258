@@ -1,0 +1,27 @@
+diff --git a/middleware/driver/sd_card/sd_card_driver.c b/middleware/driver/sd_card/sd_card_driver.c
+--- a/middleware/driver/sd_card/sd_card_driver.c
++++ b/middleware/driver/sd_card/sd_card_driver.c
+@@ -1609,7 +1609,8 @@
+ 		data_config.data_len = SD_BLOCK_SIZE * block_num;
+ 
+ 	//read data from SDIO to buffer
+-	bk_sdio_host_read_blks_fifo(data, block_num);
++	/* doorbell-bk7258-fw patch 0011: the result was ignored, so a failed read returned BK_OK */
++	error_state = bk_sdio_host_read_blks_fifo(data, block_num);
+ 
+ #if CONFIG_SDCARD_OPS_TRACE_EN
+ 	s_sdcard_sw_status.read = 4;
+diff --git a/middleware/driver/sdio_host/sdio_host_driver.c b/middleware/driver/sdio_host/sdio_host_driver.c
+--- a/middleware/driver/sdio_host/sdio_host_driver.c
++++ b/middleware/driver/sdio_host/sdio_host_driver.c
+@@ -1190,7 +1190,9 @@
+ 		SDIO_HOST_LOGE("read data fail,rx real cnt=%d,request cnt=%d\r\n", index, data_size);
+ 	}
+ 
+-	return BK_OK;
++	/* doorbell-bk7258-fw patch 0011: report the short read instead of BK_OK, so a card that loses contact
++	 * mid-read is an I/O error for FatFs (which retries, then fails) rather than a stale buffer it trusts */
++	return error_state;
+ }
+ 
+ bk_err_t bk_sdio_host_read_blks_fifo(uint8_t *read_data, uint32_t blk_cnt)

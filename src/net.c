@@ -98,9 +98,9 @@ static int report_ex(const char *event, const char *extra)
 	power_json(pwr, sizeof(pwr));   /* ,"batt_mv":..,"batt_pct":..,"usb":..,"charging":.. */
 	snprintf(json, sizeof(json),
 		 "{\"event\":\"%s\",\"fw\":\"" FW_VERSION "\",\"ip\":\"%s\",\"mv\":%u,\"light_mv\":%u,"
-		 "\"uptime_s\":%u,\"motion_count\":%u,\"ring_count\":%u,\"pir_on\":%u,\"pir_sens\":%u%s%s}",
-		 event, s_ip, adc_read_mv(9), light_read_mv(), rtos_get_time() / 1000, s_motion_count, s_ring_count,
-		 pir_is_on() ? 1u : 0u, pir_sens_get(), pwr, extra ? extra : "");
+		 "\"uptime_s\":%u,\"motion_count\":%u,\"ring_count\":%u,\"pir_on\":%u,\"pir_sens\":%u,\"sd\":\"%s\"%s%s}",
+		 event, s_ip, adc_read_mv(BOARD_ADC_SUPPLY), light_read_mv(), rtos_get_time() / 1000, s_motion_count, s_ring_count,
+		 pir_is_on() ? 1u : 0u, pir_sens_get(), sd_health(), pwr, extra ? extra : "");
 	st = http_post_json(s_hook, json);
 	os_printf("[hook] %s -> %d\r\n", event, st);
 	return st;

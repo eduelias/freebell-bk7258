@@ -5,7 +5,7 @@ import time
 
 from conftest import wait_until
 
-REQUIRED = {"event", "fw", "ip", "mv", "light_mv", "uptime_s", "motion_count", "ring_count", "pir_on", "pir_sens",
+REQUIRED = {"event", "fw", "ip", "mv", "light_mv", "uptime_s", "motion_count", "ring_count", "pir_on", "pir_sens", "sd",
             "batt_mv", "batt_pct", "usb", "charging"}
 
 
@@ -78,3 +78,22 @@ def test_heartbeat_can_be_forced(sim, sink):
     mark = sink.mark()
     assert sim.cmd("sim heartbeat") == "ok\n[sim] heartbeat report queued"
     assert REQUIRED <= set(sink.wait_for("heartbeat", 5, since=mark))
+
+
+def test_sd_health_in_reports(sim, sink):
+    """0.28.1: every report says whether the card works: ok / nocard / off (fail: a mount or save failed)."""
+    assert sim.get("/snapshot.jpg")[0] == 200      # camera open: a save can succeed
+    assert "saved" in sim.cmd("sd save test")      # a good save clears any earlier failure
+    mark = sink.mark()
+    sim.cmd("hook test")
+    assert sink.wait_for("test", 5, since=mark)["sd"] == "ok"
+    assert sim.cmd("sim card out") == "ok\n[sim] card out"
+    mark = sink.mark()
+    sim.cmd("hook test")
+    assert sink.wait_for("test", 5, since=mark)["sd"] == "nocard"
+    sim.cmd("sim card in")
+    sim.cmd("sd auto off")
+    mark = sink.mark()
+    sim.cmd("hook test")
+    assert sink.wait_for("test", 5, since=mark)["sd"] == "off"
+    sim.cmd("sd auto on")

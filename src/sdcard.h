@@ -31,6 +31,9 @@ void cli_sd_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
 bool sd_adc_pin_blocked(int gpio);
 /* True while the card power pin is driven high. */
 bool sd_card_powered(void);
+/* For the report JSON ("sd"): "off" (automatic saves off), "nocard" (the detect switch says empty),
+ * "fail" (the last mount or save failed and none succeeded since), else "ok". */
+const char *sd_health(void);
 /* power.c, before deep sleep: unmount + power the card off (blocks up to 4 s); no mounts after. */
 void sd_prepare_sleep(void);
 

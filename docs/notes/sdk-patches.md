@@ -85,6 +85,16 @@ them are derivative works of Beken's Apache-2.0 code (see `NOTICE`).
 
 `0005-dvp-camera-mclk-settle.patch` was only captured on 2026-10-03 (it had lived as an uncommitted change in the author's SDK tree): a 600 ms settle after MCLK starts in `bk_dvp_camera_enumerate()`, which the OV9650 needs before it answers on SCCB.
 
+- `0011-sdio-read-errors-reach-fatfs.patch` (0.28.1): `sdio_host_cpu_read_blks_fifo()` counts the bytes it
+  received and sets `BK_ERR_SDIO_HOST_DATA_CRC_FAIL` when a block is short, then `return BK_OK;`; its caller
+  `bk_sd_card_read_blocks()` (the `CONFIG_SDIO_V2P0` variant this chip builds) did not even look at the
+  result. A card that loses contact mid-read (the owner's is taped into the slot) therefore produced a
+  "successful" read of a partly stale buffer. If that was a FAT or directory sector, FatFs could write it
+  back and corrupt the volume. With the patch the error reaches `disk_read()` in `components/fatfs/disk_io.c`,
+  which already retries with `sdcard_operation_err_reset()` and then returns `RES_ERROR`; `sdcard.c` drops
+  the card on the resulting `FR_DISK_ERR`. Healthy reads are unchanged (the error stays `BK_OK` when every
+  byte arrived). The write path of this variant already propagated its errors.
+
 ## bk_avdk (`patches-avdk/` and `avdk-overlay/`)
 
 - `patches-avdk/0001-register-ov9650.patch`: declares `dvp_sensor_ov9650` in

@@ -478,6 +478,7 @@ class SdState:
     fmt_token: int = 0
     fmt_token_ms: int = 0
     result: str = "mounted"
+    fail_since: bool = False   # sdcard.c s_fail_since: the last mount/save failed, none succeeded since
 
 
 class Device:
@@ -821,9 +822,9 @@ class Device:
         if event == "boot":   # report_ex("boot", policy_json()): the policy pull result rides on the boot report
             extra = ',"policy":"%s","policy_rev":"%s"' % (self.policy_result, self.policy_rev) + extra
         return ('{"event":"%s","fw":"%s","ip":"%s","mv":%u,"light_mv":%u,"uptime_s":%u,"motion_count":%u,'
-                '"ring_count":%u,"pir_on":%u,"pir_sens":%u,"batt_mv":%u,"batt_pct":%u,"usb":%u,"charging":%u,"sleep_min":%u,"wake_pir":%u%s}'
+                '"ring_count":%u,"pir_on":%u,"pir_sens":%u,"sd":"%s","batt_mv":%u,"batt_pct":%u,"usb":%u,"charging":%u,"sleep_min":%u,"wake_pir":%u%s}'
                 % (event, self.fw, self.ip, self.adc_mv(9), self.light_read_mv(), self.uptime_ms() // 1000,
-                   self.motion_count, self.ring_count, 1 if self.pir_on else 0, self.pir_sens,
+                   self.motion_count, self.ring_count, 1 if self.pir_on else 0, self.pir_sens, self.sd_health(),
                    bmv, self.batt_pct(bmv, chg), self.usb, 1 if chg else 0, sleep_min,
                    1 if self.pwr_wake_pir and not self.low_batt else 0, extra))
 
@@ -1089,13 +1090,25 @@ class Device:
                 self.cam.settled = True
 
     # ------------------------------------------------------------ SD card stand-in
+    def sd_health(self) -> str:
+        """sd_health(): "off" (auto saves off), "nocard" (detect switch open), "fail", else "ok"."""
+        if not self.sd_auto:
+            return "off"
+        if not self.sd.present:
+            return "nocard"
+        return "fail" if self.sd.fail_since else "ok"
+
     def sd_save(self, event: str) -> str:
         if not self.sd.mounted:
             self.sd.fail += 1
+            if self.sd.present:
+                self.sd.fail_since = True
             return "not mounted"
         if not self.cam.jpeg:
             self.sd.fail += 1
+            self.sd.fail_since = True
             return "no frame"
+        self.sd.fail_since = False
         name = "1:/doorbell/%s_%s.jpg" % (_dt.datetime.now().strftime("%Y%m%d_%H%M%S"), event)
         self.sd.files.append((name, len(self.cam.jpeg)))
         self.sd.saved += 1
@@ -1987,6 +2000,12 @@ class Device:
                 before = self.ring_count
                 self.press()
                 r.add("[sim] button pressed: ring_count %u%s\r\n" % (self.ring_count, "" if self.ring_count != before else " (debounced, 0.8 s)"))
+        elif sub == "card" and arg in ("in", "out"):   # sdcard.c: detect switch; out while mounted = sd_cd_watch()
+            self.sd.present = arg == "in"
+            if not self.sd.present and self.sd.mounted:
+                self.sd.mounted = False
+                self.sd.result = "card left the slot while mounted (cd=1): unmounted"
+            r.add("[sim] card %s\r\n" % arg)
         elif sub == "motion":
             if self.sleeping:
                 if self.pwr_wake_pir:
@@ -2047,7 +2066,7 @@ class Device:
                       self.args.http_port, self.args.sim_port, self.rtsp_port, " (ffmpeg)" if self.rtsp.running() else "",
                       "Pillow" if HAVE_PIL else "mosaic"))
         else:
-            r.add("sim press | motion | light MV | batt MV | usb on|off | charging on|off | time SPEED | heartbeat | wake [REASON]"
+            r.add("sim press | motion | card in|out | light MV | batt MV | usb on|off | charging on|off | time SPEED | heartbeat | wake [REASON]"
                   " | status | help   (curl http://IP:%d/sim/press)\r\n" % self.args.http_port)
 
     COMMANDS: dict[str, Callable[["Device", list, Reply], None]] = {
