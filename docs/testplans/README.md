@@ -9,6 +9,10 @@ Conventions in these files: `<device-ip>` / `<ha-ip>` were, on the author's benc
 LAN used for TCP peers and long soaks (see [`../notes/bench-setup.md`](../notes/bench-setup.md)).
 Device commands are `python3 tools/dbcmd.py <cmd>` unless marked UART.
 
+Paths are as they were at the time. Since 0.28 the sources live in `src/` (was `project/main/`), the
+build project in `project/` (was `project-avdk/`), the build script is `scripts/build.sh` (was
+`build-avdk.sh`), and `app_main.c` is split into modules: see `CHANGELOG.md`, 0.28.0.
+
 | File | Feature | Firmware |
 |---|---|---|
 | [TESTPLAN-polish.md](TESTPLAN-polish.md) | night light arbiter, blue ring indicator, amplifier pop, `sys info` | 0.19.x |

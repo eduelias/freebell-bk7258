@@ -32,7 +32,7 @@ host that accepts inbound connections): `python3 tools/audio_relay.py recv 5100 
 `spk net <host> 5101` (s16le mono 8 kHz). `tools/mic_raw.py cap.raw --seconds 4 --wav out.wav`
 exports a raw capture (32-bit FIFO words) as WAV. 0 overruns at 64 KB/s.
 
-## Two-way audio over HTTP (v0.23, `project/main/talk.c`)
+## Two-way audio over HTTP (v0.23, `src/talk.c`)
 
 Half-duplex intercom on the camera HTTP server (port 8080). Nothing runs until a request arrives.
 
@@ -79,7 +79,7 @@ the first time (no reload service); scripts and rest commands reload. Listening 
 `http://<device-ip>:8080/mic.wav` in VLC/ffplay, or an iframe card on `/talk` (the camera entity has
 no audio). Files: [`../homeassistant/`](../homeassistant/README.md).
 
-## Full duplex over RTSP (v0.26, `project/main/audio_voc.c`, `rtsp.c`)
+## Full duplex over RTSP (v0.26, `src/audio_voc.c`, `rtsp.c`)
 
 The raw engine above is half duplex: a listener hears silence while the speaker plays, because
 the microphone would otherwise feed the speaker back. For real two-way talk the firmware now has a

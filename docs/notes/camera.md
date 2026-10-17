@@ -125,7 +125,7 @@ memcpy's it into `camera_info.device`, `dvp_camera.c` (bk_idk) copies it again a
 toolchain (`arm-none-eabi-gcc` 10.3 defaults to `-fshort-enums`; checked), and the OV9650 runs at
 a fixed 15 fps (bit 2), so the other seven bits are a free channel into the driver, carried
 through both copies unchanged: bit 7 = night, bit 6 = day, bits 0-1 and 3-5 = a 5-bit
-**start-exposure class** (`OV9650_EXP_ENCODE()`, same macros in `project/main/app_main.c` and
+**start-exposure class** (`OV9650_EXP_ENCODE()`, same macros in `src/camera.c` and
 `avdk-overlay/.../dvp_ov9650.c`). `cam_open_locked()` reads the light sensor once the camera rail
 is up (GPIO 28 feeds the LDR divider, so this costs nothing; the reading is retried when it says
 < 100 mV = divider off, and falls back to the last plausible value - see the race below), picks

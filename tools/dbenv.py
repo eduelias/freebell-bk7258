@@ -22,7 +22,7 @@ DEFAULTS = {
     "AVDK": "~/reps/oss/bk_avdk",
     "HA_URL": "http://homeassistant.local:8123",
     "HA_TOKEN_FILE": "~/.ha_token",
-    "BUILD": "build-avdk.sh",
+    "BUILD": "build.sh",
     "DOORBELL_PORT": "2323",
 }
 

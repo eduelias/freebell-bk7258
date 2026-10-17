@@ -1,8 +1,41 @@
 # Changelog
 
-Versions are the `FW_VERSION` in `project/main/app_main.c` (also in every report JSON and in
-`sys info`). Dates are 2026 unless stated; most of this was written between 2026-10-01 and
+Versions are the `FW_VERSION` in `src/version.h` (`project/main/app_main.c` before 0.28; also in every
+report JSON and in `sys info`). Dates are 2026 unless stated; most of this was written between 2026-10-01 and
 2026-10-03.
+
+## 0.28.0
+Restructuring release (2026-10-17): no feature changes; the project is now **freebell-bk7258**
+(boot banner, heartbeat and `FW_NAME`).
+- **Board profile.** Every GPIO, ADC channel and the battery divider ratio live in
+  `src/boards/ip108_main_v05.h`, selected by `src/board.h`; modules no longer hard-code pin numbers.
+  A new board is a new profile (`-DDOORBELL_BOARD_HEADER='"boards/<board>.h"'`); `board.h` fails the
+  build when a profile misses a name. Verified as a no-op by comparing clean builds function by
+  function: the only differences were the `__LINE__` values the SDK's `os_malloc()` macro embeds.
+- **`app_main.c` (3181 lines) split into modules:** `cmd.c` (reply buffer, TCP channel, dispatcher,
+  token, reboot, command table), `net.c` (Wi-Fi, webhook reports, button/PIR events, reporter,
+  wifi/hook/ota), `camera.c` + `cam_http.c`, `audio_engine.c`, `ringfx.c` (light sensor, ring
+  effects, ring/led), `board_io.c` (GPIO/ADC/KV helpers, `pin`/`adc`), `bringup.c`; `app_main.c`
+  keeps startup (module init calls in the original order) and the power hooks, which now go
+  through small module APIs (`audio_busy()`, `net_reports_pending()`, `camera_close_for_sleep()`,
+  ...). `app_internal.h` is what the modules share. Code moved verbatim.
+- **Bring-up tools behind `DOORBELL_BRINGUP`** (`src/features.h`, default 0): `mem` and
+  `cam probe` (rails, I2C scans, power scan, bit-banged I2C) are only in bring-up builds; `pin` and
+  `adc` stay. OTA package 4.3 KB smaller.
+- **One build flavour.** The camera-less bk_idk-only build is gone; sources moved
+  `project/main/` -> `src/`, the bk_avdk project `project-avdk/` -> `project/`,
+  `scripts/build-avdk.sh` -> `scripts/build.sh` (`BUILD=build-avdk.sh` still accepted by
+  `release.sh`). `FW_VERSION` / `FW_NAME` in `src/version.h`.
+- `scripts/flash.sh` flashed the stale camera-less `doorbell-fw_latest.bin` by default; it now
+  flashes `doorbell-fw_latest_all-app.bin`, refreshed by every build.
+- `tools/smoke.py`: read-only on-device snapshot (status commands, every pin config word,
+  snapshot, `/`, `/cmd`, RTSP handshake) and a diff that separates moved numbers from real
+  changes; used to verify this release on the device.
+- Simulator: CI was red since 0.25.0 because the virtual doorbell could not re-open its ports
+  after a simulated reboot or sleep on Linux (`server_bind()` override skipped `SO_REUSEADDR`,
+  listeners closed without `shutdown()`); fixed.
+- Known, not changed here: before deep sleep the firmware drives GPIO 6 (microSD card detect, an
+  input) low with the camera rails. Harmless with a card in (the socket grounds it); to be revisited.
 
 ## 0.27.0
 - **Daylight snapshots after a cold open are no longer white** (2026-10-05). Every camera open

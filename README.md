@@ -1,6 +1,6 @@
 # freebell-bk7258
 
-*Formerly `doorbell-bk7258-fw`. The firmware still announces itself under that name until 0.28.*
+*Formerly `doorbell-bk7258-fw`.*
 
 Open firmware for the Tuya "Smart Visual Doorbell" built on the Beken **BK7258** (board
 `IP108_MAIN_V05`, Tuya product IP10B), plus the Home Assistant glue that turns it into a fully
@@ -12,7 +12,7 @@ night light, battery reporting and deep sleep, optional microSD recording, and o
 Why: the author's unit shipped without a Tuya licence and could never be paired, and the licence
 can only be issued by the OEM. Rather than e-waste it, the stock image was dumped, the board was
 reverse-engineered from that image and from the bench, and TuyaOS was replaced. Status: **works,
-in daily use by the author since 2026-10-03** (v0.24.0 then; v0.27.0 now). It is a one-person hobby project; read
+in daily use by the author since 2026-10-03** (v0.24.0 then; v0.28.0 now). It is a one-person hobby project; read
 the two sections below before you flash anything.
 
 ## Legal and safety
@@ -89,15 +89,15 @@ adapter.
 
 ```bash
 mkdir -p ~/.config/doorbell-bk7258 && cp scripts/env.example ~/.config/doorbell-bk7258/env   # then edit: SDK, AVDK, FW_DIR, DOORBELL_HOST, HA_URL, OTA_*
-scripts/build-avdk.sh                                   # camera-capable build (~11 min emulated); scripts/build.sh = bare SDK flavour
+scripts/build.sh                                        # firmware build (~11 min emulated on Apple Silicon)
 ```
 
 **Remote builder (optional).** The image is x86-64 only; on Apple Silicon it runs emulated. If an
 x86-64 Linux box (or a WSL2 distro) with docker/podman, rsync and the two SDK clones is on your
 LAN, set `REMOTE_BUILD_HOST=user@host` (and `REMOTE_BUILD_PORT`, `REMOTE_*` paths if they differ
 from the defaults) and run `scripts/build-remote.sh`: it mirrors the working tree there, runs the
-same `scripts/build-avdk.sh` natively and copies the images back into `FW_DIR`. `--bare` builds the
-other flavour, `--shell` opens a shell there; `BUILD=build-remote.sh` makes `release.sh` use it.
+same `scripts/build.sh` natively and copies the images back into `FW_DIR`. `--shell` opens a shell
+there; `BUILD=build-remote.sh` makes `release.sh` use it.
 Author's numbers on an 8-core i7 desktop: 41 s full, 15 s incremental, versus ~11 min / ~100 s
 emulated. Setup walk-through: [docs/notes/remote-build.md](docs/notes/remote-build.md).
 
@@ -143,7 +143,7 @@ key is also honoured as a real environment variable, and CLI flags override both
 | `HA_TOKEN_FILE` | long-lived HA token file (default `~/.ha_token`) |
 | `OTA_URL_BASE` | HTTP base URL the *device* can fetch images from, e.g. `http://<ha-ip>:8123/local/doorbell` |
 | `OTA_PUBLISH` | shell command that copies the image where `OTA_URL_BASE` serves it; `{rbl}` and `{name}` are substituted, e.g. `scp {rbl} user@ha:/config/www/doorbell/` |
-| `BUILD` | which build script `release.sh` runs: `build-avdk.sh` (default), `build.sh` or `build-remote.sh` |
+| `BUILD` | which build script `release.sh` runs: `build.sh` (default) or `build-remote.sh` |
 | `CONTAINER_RUNTIME` | `podman` or `docker` for the build scripts (default: podman if installed, else docker) |
 | `REMOTE_BUILD_HOST`, `REMOTE_BUILD_PORT`, `REMOTE_REPO_DIR`, `REMOTE_SDK`, `REMOTE_AVDK`, `REMOTE_OUT`, `REMOTE_FW_DIR`, `REMOTE_WAKE` | remote builder for `scripts/build-remote.sh` ([docs/notes/remote-build.md](docs/notes/remote-build.md)) |
 
@@ -173,7 +173,7 @@ flash and survive OTA.
 | `pwr` | `status` \| `sleep on\|off` \| `sleep force on\|off` \| `idle S` \| `wake_pir on\|off` \| `snap_min M` \| `sched DAY_START DAY_END DAY_MIN NIGHT_MIN` \| `sched off\|on` \| `policy URL\|auto\|off\|pull` \| `sleepnow` \| `chan ADC` \| `ratio PCT` | `db_pwr_sleep` (off), `db_pwr_force` (off), `db_pwr_idle` (60), `db_pwr_wpir` (off), `db_pwr_snap` (0, used with `sched off`), `db_pwr_sched` (07:00 22:00 15 60), `db_pwr_policy` (auto), `db_pwr_bchan` (15), `db_pwr_bratio` (200) |
 | `vol` | `vol [0-100]` (speaker volume: chime and talk `gain auto`, linear onto DAC gain 0..0x1c; `spk cfg gain N` stays a raw override, `spk cfg gain auto` releases it) | `db_vol` (100) |
 | `log` | `log [N]` (last N bytes of the 8 KB RAM log, N <= 600) \| `stat` | |
-| `cam` | `open [W H] [h264]` \| `close` \| `stat` \| `mode auto\|jpeg\|h264` \| `settle [N [MS [PCT]]]` (exposure settle gate: frames / cap / stable-size %) \| `scene auto\|day\|night\|stock` (sensor scene hint at open) \| `exp [0-11\|16-26]` (day start exposure 1 << (N-1) rows, 0 = from the light sensor; 16-26 = manual 1 << (N-16) rows for 1 s, then AEC) \| `ircut day\|night` (pulse the IR-cut coil) \| `snap HOST PORT` \| `probe [PWR_PIN ...]` \| `probe scan` \| `probe rails on\|off` \| `probe bb SCL SDA` | `db_cam_mode` (auto), `db_cam_settle` (16 4500 4), `db_cam_scene` (auto), `db_cam_exp` (0), `db_ircut` (last pulse) |
+| `cam` | `open [W H] [h264]` \| `close` \| `stat` \| `mode auto\|jpeg\|h264` \| `settle [N [MS [PCT]]]` (exposure settle gate: frames / cap / stable-size %) \| `scene auto\|day\|night\|stock` (sensor scene hint at open) \| `exp [0-11\|16-26]` (day start exposure 1 << (N-1) rows, 0 = from the light sensor; 16-26 = manual 1 << (N-16) rows for 1 s, then AEC) \| `ircut day\|night` (pulse the IR-cut coil) \| `snap HOST PORT` \| `probe [PWR_PIN ...]` \| `probe scan` \| `probe rails on\|off` \| `probe bb SCL SDA` (the `probe` forms need a bring-up build, `DOORBELL_BRINGUP 1`) | `db_cam_mode` (auto), `db_cam_settle` (16 4500 4), `db_cam_scene` (auto), `db_cam_exp` (0), `db_ircut` (last pulse) |
 | `rtsp` | `on\|off` \| `status` \| `port N` \| `q IMB PMB` \| `idr` | on/off (off), port (554), q (120/24) |
 | `spk` | `tone [HZ] [MS]` \| `play beepa\|beepb\|bell\|ADDR LEN` \| `net HOST PORT` \| `stop` \| `pa PIN\|off` \| `cfg [chl L\|R\|LR] [mode diff\|se] [gain N] [rate HZ] [clk xtal\|apll]` | gain 0x1c, PA 46 |
 | `mic` | `level [MS] [HZ]` \| `rec MS HOST PORT` \| `cfg [mic 1\|2\|both] [mode diff\|se] [gain N] [chl L\|R\|LR] [rate HZ] [clk xtal\|apll]` | |
@@ -181,7 +181,7 @@ flash and survive OTA.
 | `sd` | `status` \| `mount` (pins the card mounted) \| `umount [keep]` \| `format [TOKEN]` \| `ls [DIR] [SKIP]` \| `save [EVENT]` \| `auto on\|off` \| `keep S` \| `pre FLAGS [GAP_MS]` \| `pwr PIN\|none` \| `power on\|off` \| `probe [cmd\|pins\|lines\|regs]` \| `ntp HOST` \| `tz MIN` \| `time EPOCH` \| `sync` | `db_sd_auto` (on), `db_sd_keep` (30), `db_sd_pre` (0,10), `db_sd_pwr` (none), `db_sd_ntp` (pool.ntp.org), `db_sd_tz` (0) |
 | `pin` | `all` \| `mux` \| `dump` \| `get N` \| `in N [up\|down\|none]` \| `hiz N` \| `out N 0\|1` \| `raw N HEX` \| `blink N [count]` \| `watch SECONDS` (refuses 10/11) | |
 | `adc` | `adc CHANNEL` (one calibrated SARADC reading) | |
-| `mem` | `mem HEXADDR [N<=16]` (raw 32-bit reads; a bad address faults) | |
+| `mem` | `mem HEXADDR [N<=16]` (raw 32-bit reads; a bad address faults). Bring-up builds only (`DOORBELL_BRINGUP 1`) | |
 
 Report JSON (every event):
 
@@ -277,11 +277,12 @@ PIR cooldown, night-light arbiter, sleep/wake cycle, OTA version bump and KV per
 
 | Path | What |
 |---|---|
-| `project/main/` | the application: `app_main.c` (Wi-Fi, webhook, TCP channel, HTTP server, camera, OTA, raw audio engine, commands), `night.c`, `pir.c`, `power.c`, `rtsp.c` (H.264 + audio tracks), `audio_voc.c` (SDK voice engine with AEC), `talk.c`, `sdcard.c`, `policy.c` (policy pull, `vol`, RAM log, `/cmd`), `applog.h`; `vendor_flash*.{c,h}` are Beken's partition table (see NOTICE) |
-| `project/`, `project-avdk/` | build glue and Kconfig for the bare-SDK and the AVDK (camera) flavours; both compile the same `project/main` |
+| `src/` | the application. Startup and power hooks: `app_main.c`; `cmd.c` (command channel, dispatcher, command table), `net.c` (Wi-Fi, webhook reports, button/PIR events, OTA), `camera.c` + `cam_http.c` (camera lifecycle, HTTP server), `audio_engine.c`, `ringfx.c` (light sensor, ring effects), `board_io.c` (GPIO/ADC/KV helpers, `pin`/`adc`), `bringup.c` (board-mapping tools, only with `DOORBELL_BRINGUP`), `night.c`, `pir.c`, `power.c`, `rtsp.c` (H.264 + audio tracks), `audio_voc.c` (SDK voice engine with AEC), `talk.c`, `sdcard.c`, `policy.c` (policy pull, `vol`, RAM log, `/cmd`); `app_internal.h` is what the modules share, `version.h` / `features.h` the build-time settings; `vendor_flash*.{c,h}` are Beken's partition table (see NOTICE) |
+| `src/board.h`, `src/boards/` | the board profile: every GPIO, ADC channel and divider ratio (`boards/ip108_main_v05.h`). Another board = another profile, selected with `-DDOORBELL_BOARD_HEADER='"boards/<board>.h"'`; `DOORBELL_BRINGUP 1` in `features.h` adds the probe tools for mapping it |
+| `project/` | the bk_avdk project the build compiles `src/` in: CMake, Kconfig per core, partition table |
 | `patches/`, `patches-avdk/`, `avdk-overlay/` | changes to bk_idk / bk_avdk, applied by the build scripts ([docs/notes/sdk-patches.md](docs/notes/sdk-patches.md)); the OV9650 driver lives in the overlay |
-| `scripts/` | `build.sh`, `build-avdk.sh`, `flash.sh`, `release.sh`, `env.example` |
-| `tools/` | host-side Python: ROM flasher (`bkwrite.py`, `bkread.py`, `bkdump.py`, `bkreboot.py`, `linkcheck.py`), serial (`shell.py`, `serial_capture.py`), LAN (`dbcmd.py`), HA (`ha_generic_camera.py`), RTSP two-way audio test client (`rtsp_backchannel.py`), audio and pin-mapping helpers |
+| `scripts/` | `build.sh`, `build-remote.sh`, `flash.sh`, `release.sh`, `env.example` |
+| `tools/` | host-side Python: ROM flasher (`bkwrite.py`, `bkread.py`, `bkdump.py`, `bkreboot.py`, `linkcheck.py`), serial (`shell.py`, `serial_capture.py`), LAN (`dbcmd.py`, `smoke.py`: read-only before/after snapshot of a device, for checking an OTA), HA (`ha_generic_camera.py`), RTSP two-way audio test client (`rtsp_backchannel.py`), audio and pin-mapping helpers |
 | `sim/` | virtual doorbell + tests |
 | `docs/homeassistant/` | HA automation, package, TTS helper, policy file writer, setup guide |
 | `docs/notes/` | technical notes: [flashing](docs/notes/flashing.md), [camera](docs/notes/camera.md), [gpio-irq](docs/notes/gpio-irq.md), [pir](docs/notes/pir.md), [audio](docs/notes/audio.md), [night-light](docs/notes/night-light.md), [power](docs/notes/power.md), [sdcard](docs/notes/sdcard.md), [pin-mapping](docs/notes/pin-mapping.md), [sdk-patches](docs/notes/sdk-patches.md), [bench-setup](docs/notes/bench-setup.md), [remote-build](docs/notes/remote-build.md) |

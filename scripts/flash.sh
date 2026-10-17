@@ -13,7 +13,7 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 . "$HERE/scripts/env.sh"
 FW_DIR=${FW_DIR:-$HOME/data/doorbell-bk7258/firmware}
 
-img="$FW_DIR/doorbell-fw_latest.bin"
+img="$FW_DIR/doorbell-fw_latest_all-app.bin"   # refreshed by scripts/build.sh / build-remote.sh
 if [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; then
 	img=$1; shift
 fi

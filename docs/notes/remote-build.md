@@ -2,7 +2,7 @@
 
 `scripts/build-remote.sh` runs the normal build on another machine: it rsyncs the working tree
 (without `.git`, build outputs and simulator caches) to `REMOTE_BUILD_HOST`, runs
-`scripts/build-avdk.sh` there (or `scripts/build.sh` with `--bare`) with the `REMOTE_*` paths as
+`scripts/build.sh` there with the `REMOTE_*` paths as
 that script's `SDK`/`AVDK`/`OUT`/`FW_DIR`, and copies `doorbell-fw_<ver>_app_pack.rbl` and
 `doorbell-fw_<ver>_avdk_all-app.bin` back into the local `FW_DIR`, refreshing
 `doorbell-fw_latest_app_pack.rbl`. The remote runs the *same* script, so the SDK/AVDK patches are
@@ -13,8 +13,7 @@ Why: the `bekencorp/armino-idk:1.5` image is x86-64 only. On an Apple Silicon la
 it through Rosetta, a full AVDK build takes ~11 min and an incremental one ~100 s. On a modest
 x86-64 desktop the same build is native. Measured on the author's remote (below, an i7-9700, 8
 cores, Docker Desktop's engine in WSL2): full build **41 s**, incremental (touch
-`project/main/app_main.c`) **15 s**, round trip from the laptop included; the bare flavour (`--bare`)
-builds from scratch in 48 s.
+`src/app_main.c`) **15 s**, round trip from the laptop included.
 
 The remote needs: Linux (a WSL2 distro counts), docker or podman usable by the login user, git,
 rsync, ssh key login, clones of bk_idk and bk_avdk at `release/v2.0.1`, the image pulled. Nothing
@@ -30,13 +29,13 @@ In `~/.config/doorbell-bk7258/env` (see `scripts/env.example`):
 |---|---|---|
 | `REMOTE_BUILD_HOST` | `user@host` (required) | - |
 | `REMOTE_BUILD_PORT` | ssh port | `22` |
-| `REMOTE_REPO_DIR` | where the tree is mirrored | `reps/home/iot/doorbell-bk7258-fw` |
+| `REMOTE_REPO_DIR` | where the tree is mirrored | `freebell-bk7258` |
 | `REMOTE_SDK`, `REMOTE_AVDK` | bk_idk / bk_avdk clones on the remote | `reps/oss/bk_idk`, `reps/oss/bk_avdk` |
-| `REMOTE_OUT` | build tree on the remote | `data/doorbell-bk7258/avdk-build` (`data/bk_idk-build` with `--bare`) |
+| `REMOTE_OUT` | build tree on the remote | `data/doorbell-bk7258/avdk-build` |
 | `REMOTE_FW_DIR` | where the remote script leaves its images | `data/doorbell-bk7258/firmware` |
 | `REMOTE_WAKE` | local shell command run once when the ssh port does not answer, then retried for 60 s | - |
 
-Relative paths are under the remote `$HOME`. Flags: `--bare`, `--no-sync-back`, `--shell` (login
+Relative paths are under the remote `$HOME`. Flags: `--no-sync-back`, `--shell` (login
 shell on the remote in the mirrored repo, for poking at `$REMOTE_OUT` or the SDK). The script
 multiplexes its ssh connections (`ControlMaster`, socket in `/tmp`), so a run costs one key
 exchange.
@@ -109,7 +108,5 @@ Desktop and the owner's distros were left as they were. What was done, in order:
 - Mirrored networking is what makes port 2222 reachable without port forwarding; if
   `.wslconfig` ever loses `networkingMode=mirrored`, use `netsh interface portproxy add v4tov4
   listenport=2222 connectaddress=<wsl-ip> connectport=2222` instead (the WSL IP changes per boot).
-- `scripts/build.sh` names its bare image after the git revision; the remote has no `.git`, so
-  `build-remote.sh` passes the laptop's revision as `GIT_REV`.
 - The container runs as the remote uid (`-u 1000`); the build and firmware directories on the
   remote belong to `du7`, like `$OUT` belongs to you locally.

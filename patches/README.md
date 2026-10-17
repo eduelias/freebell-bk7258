@@ -1,14 +1,15 @@
 # patches/ — changes to Beken's bk_idk (Armino SDK)
 
 Applied to a checkout of [bekencorp/bk_idk](https://github.com/bekencorp/bk_idk), branch
-`release/v2.0.1` (Apache-2.0), the tree that `scripts/build.sh` and `scripts/build-avdk.sh` mount
-as the SDK (`SDK`, default `~/reps/oss/bk_idk`). Both scripts apply every `*.patch` here on each
+`release/v2.0.1` (Apache-2.0), the tree that `scripts/build.sh` mounts
+as the SDK (`SDK`, default `~/reps/oss/bk_idk`). The script applies every `*.patch` here on each
 run, idempotently: a patch that already applies in reverse is reported as "already applied", one
 that applies cleanly is applied, anything else aborts the build (the SDK checkout has drifted).
 Nothing is committed in the SDK tree; `git -C $SDK diff` shows the applied set and
 `git -C $SDK checkout .` removes it.
 
-Each hunk carries a `doorbell-bk7258-fw` comment at the change site.
+Each hunk carries a `doorbell-bk7258-fw` comment at the change site (the project's name before 0.28;
+kept, because the build detects an applied patch by reversing it).
 
 | Patch | File | What it does |
 |---|---|---|
@@ -28,6 +29,6 @@ reverted during the camera bring-up; the number was then reused for the MCLK set
 had lived only in the SDK working tree until it was captured here. Apply order does not matter
 (the patches touch different files).
 
-Patches 0001-0004 and 0007-0010 are needed by both build flavours; 0005 and 0006 only matter
-for the camera (AVDK) build but are harmless in the bare one. 0010 changes an SDK header that
+All patches are needed (0005 and 0006 are the camera ones; before 0.28 a camera-less build used the
+others alone). 0010 changes an SDK header that
 almost everything includes: expect a full rebuild (about 11 min) the first time it is applied.

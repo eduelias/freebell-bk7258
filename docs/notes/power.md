@@ -1,4 +1,4 @@
-# Battery, charger and deep sleep (v0.21 - v0.25, `project/main/power.c`)
+# Battery, charger and deep sleep (v0.21 - v0.25, `src/power.c`)
 
 ## Pins (from the shipped firmware's battery code)
 

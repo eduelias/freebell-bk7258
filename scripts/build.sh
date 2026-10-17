@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
-# Build freebell-bk7258 with Beken's armino-idk container (podman or docker; x86-64, emulated
-# through Rosetta on Apple Silicon, native on an x86-64 Linux host, see scripts/build-remote.sh).
-# Our project is mounted over the SDK's projects/app slot so the stock build flow applies.
-# Settings (SDK, OUT, FW_DIR) come from the environment or ~/.config/doorbell-bk7258/env
-# (see scripts/env.example). This is the camera-less flavour; scripts/build-avdk.sh is the
-# one the device runs.
+# Build the firmware: the sources in src/, built in Beken's bk_avdk tree (release/v2.0.1, camera +
+# multimedia) with our bk_idk mounted as its SDK. Settings (SDK, AVDK, OUT,
+# FW_DIR) come from the environment or ~/.config/doorbell-bk7258/env (see scripts/env.example).
+# The project is mounted as /avdk/projects/doorbell; output lands in $OUT/doorbell/...
 set -euo pipefail
-
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 . "$HERE/scripts/env.sh"
 SDK=${SDK:-$HOME/reps/oss/bk_idk}
-OUT=${OUT:-$HOME/data/bk_idk-build}
+AVDK=${AVDK:-$HOME/reps/oss/bk_avdk}
+OUT=${OUT:-$HOME/data/doorbell-bk7258/avdk-build}
 FW_DIR=${FW_DIR:-$HOME/data/doorbell-bk7258/firmware}
 IMAGE=docker.io/bekencorp/armino-idk:1.5
 # container runtime: CONTAINER_RUNTIME=podman|docker, else podman if installed, else docker
@@ -23,38 +21,37 @@ fi
 
 for p in "$HERE"/patches/*.patch; do
 	name=$(basename "$p")
-	if git -C "$SDK" apply --reverse --check "$p" 2>/dev/null; then
-		echo "patch already applied: $name"
-	elif git -C "$SDK" apply --check "$p" 2>/dev/null; then
-		git -C "$SDK" apply "$p" && echo "patch applied: $name"
-	else
-		echo "patch does not apply to $SDK: $name" >&2
-		exit 1
-	fi
+	if git -C "$SDK" apply --reverse --check "$p" 2>/dev/null; then echo "patch already applied: $name"
+	elif git -C "$SDK" apply --check "$p" 2>/dev/null; then git -C "$SDK" apply "$p" && echo "patch applied: $name"
+	else echo "patch does not apply to $SDK: $name" >&2; exit 1; fi
 done
-
+# AVDK-side changes: overlay files (new sources) + patches (edits to existing files)
+cp -R "$HERE/avdk-overlay/." "$AVDK/"
+for p in "$HERE"/patches-avdk/*.patch; do
+	[ -e "$p" ] || continue
+	name=$(basename "$p")
+	if git -C "$AVDK" apply --reverse --check "$p" 2>/dev/null; then echo "avdk patch already applied: $name"
+	elif git -C "$AVDK" apply --check "$p" 2>/dev/null; then git -C "$AVDK" apply "$p" && echo "avdk patch applied: $name"
+	else echo "avdk patch does not apply: $name" >&2; exit 1; fi
+done
 # macOS/Windows podman runs the containers in a VM ("machine"); Linux podman has none
 if [ "$RUNTIME" = podman ] && [ -n "$(podman machine list --format '{{.Name}}' 2>/dev/null)" ]; then
 	podman machine inspect --format '{{.State}}' 2>/dev/null | grep -q running || podman machine start
 fi
-
 mkdir -p "$OUT" "$FW_DIR"
 start=$(date +%s)
 "$RUNTIME" run --platform linux/amd64 --rm \
-	-v "$SDK":/armino \
-	-v "$HERE/project":/armino/projects/app \
-	-v "$OUT":/armino/build \
-	-w /armino -u "$(id -u)" \
-	"$IMAGE" make bk7258 PROJECT=app
+	-v "$AVDK":/avdk \
+	-v "$SDK":/avdk/bk_idk \
+	-v "$HERE/project":/avdk/projects/doorbell \
+	-v "$HERE/src":/avdk/projects/doorbell/shared \
+	-v "$OUT":/avdk/build \
+	-w /avdk -u "$(id -u)" \
+	"$IMAGE" make bk7258 PROJECT=doorbell
 echo "build took $(( $(date +%s) - start ))s"
-
-stamp=$(date +%Y%m%d-%H%M)
-rev=${GIT_REV:-$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo nogit)}   # GIT_REV: set by build-remote.sh (no .git on the remote)
-dst="$FW_DIR/doorbell-fw_${stamp}_${rev}.bin"
-cp "$OUT/app/bk7258/all-app.bin" "$dst"
-ln -sf "$(basename "$dst")" "$FW_DIR/doorbell-fw_latest.bin"
-ver=$(sed -nE 's/^#define FW_VERSION "([^"]+)"/\1/p' "$HERE/project/main/app_main.c")
-cp "$OUT/app/bk7258/encrypt/app_pack.rbl" "$FW_DIR/doorbell-fw_${ver}_app_pack.rbl"
+ver=$(sed -nE 's/^#define FW_VERSION "([^"]+)"/\1/p' "$HERE/src/version.h")
+cp "$OUT/doorbell/bk7258/all-app.bin" "$FW_DIR/doorbell-fw_${ver}_avdk_all-app.bin"
+cp "$OUT/doorbell/bk7258/encrypt/app_pack.rbl" "$FW_DIR/doorbell-fw_${ver}_app_pack.rbl"
 ln -sf "doorbell-fw_${ver}_app_pack.rbl" "$FW_DIR/doorbell-fw_latest_app_pack.rbl"
+ln -sf "doorbell-fw_${ver}_avdk_all-app.bin" "$FW_DIR/doorbell-fw_latest_all-app.bin"   # scripts/flash.sh default
 echo "ota image: $FW_DIR/doorbell-fw_${ver}_app_pack.rbl"
-echo "image: $dst ($(stat -c %s "$dst" 2>/dev/null || stat -f %z "$dst") bytes)"
