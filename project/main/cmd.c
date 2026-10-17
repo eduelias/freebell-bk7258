@@ -254,7 +254,9 @@ static void cli_reboot_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, c
 static const struct cli_command s_doorbell_commands[] = {
 	{"pin", "pin all|mux|dump|cfg|get|in|out|hiz|blink|watch ... (GPIO mapping)", cli_pin_cmd},
 	{"adc", "adc CHANNEL (one calibrated SARADC reading)", cli_adc_read_cmd},
+#if DOORBELL_BRINGUP
 	{"mem", "mem HEXADDR [N] (raw 32-bit reads, debug)", cli_mem_cmd},
+#endif
 	{"reboot", "reset the SoC (ROM download mode is reachable right after)", cli_reboot_cmd},
 #if (CONFIG_SYS_CPU0)
 	{"wifi", "wifi set SSID PASS | clear | connect | (status)", cli_wifi_cmd},

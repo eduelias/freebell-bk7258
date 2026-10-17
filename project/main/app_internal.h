@@ -58,6 +58,7 @@
 #include "night.h"   /* LED arbiter, night light, ring indicator, `night` / `sys` commands (night.c) */
 #include "applog.h"  /* last: our os_printf lines go to the RAM log ring (policy.c); CPU0 only */
 
+#include "features.h"  /* DOORBELL_BRINGUP */
 #include "version.h"   /* FW_NAME, FW_VERSION (the build scripts read it too) */
 
 /* Pins our own commands must never reconfigure: UART0 console (RX/TX). */
@@ -100,11 +101,15 @@ int kv_get_str(const char *key, char *out, int cap);
 void kv_set_str(const char *key, const char *val);
 uint32_t adc_read_mv(uint32_t chan);
 
-/* bringup.c: board mapping tools */
+/* board_io.c: diagnostics */
 void cli_pin_cmd(CLI_ARGS);
-void cli_mem_cmd(CLI_ARGS);
 void cli_adc_read_cmd(CLI_ARGS);
+
+#if DOORBELL_BRINGUP
+/* bringup.c: board mapping tools */
+void cli_mem_cmd(CLI_ARGS);
 void cli_cam_probe(int argc, char **argv);
+#endif
 
 /* net.c: Wi-Fi, webhook reports, button/PIR events */
 extern char s_ip[16];

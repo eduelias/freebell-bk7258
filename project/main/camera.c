@@ -565,7 +565,11 @@ void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 {
 #if CONFIG_DVP_CAMERA
 	if (argc >= 2 && os_strcmp(argv[1], "probe") == 0) {
+#if DOORBELL_BRINGUP
 		cli_cam_probe(argc, argv);
+#else
+		REPLY("[cam] probe: bring-up build only (DOORBELL_BRINGUP 1 in features.h)\r\n");
+#endif
 		return;
 	}
 #endif
