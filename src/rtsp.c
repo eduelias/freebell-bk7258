@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* doorbell-bk7258-fw: minimal RTSP/1.0 + RTP server: H.264 (RFC 6184) video, G.711 microphone track,
+/* freebell-bk7258: minimal RTSP/1.0 + RTP server: H.264 (RFC 6184) video, G.711 microphone track,
  * ONVIF backchannel (two-way audio) for the hardware encoder and the voc audio engine. */
 /* rtsp.c - minimal RTSP/1.0 + RTP server. See rtsp.h for the overview.
  *

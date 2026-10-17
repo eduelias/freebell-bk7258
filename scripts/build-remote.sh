@@ -10,7 +10,7 @@
 #   REMOTE_BUILD_HOST  user@host of the Linux build host (required; podman or docker installed,
 #                      bk_idk + bk_avdk cloned at release/v2.0.1, see docs/notes/remote-build.md)
 #   REMOTE_BUILD_PORT  ssh port (default 22)
-#   REMOTE_REPO_DIR    where the working tree is mirrored (default reps/home/iot/doorbell-bk7258-fw)
+#   REMOTE_REPO_DIR    where the working tree is mirrored (default freebell-bk7258)
 #   REMOTE_SDK / REMOTE_AVDK / REMOTE_OUT / REMOTE_FW_DIR
 #                      the remote SDK, AVDK, build and image directories (defaults mirror the local
 #                      ones: reps/oss/bk_idk, reps/oss/bk_avdk, data/doorbell-bk7258/avdk-build,
@@ -24,7 +24,7 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 . "$HERE/scripts/env.sh"
 REMOTE_BUILD_HOST=${REMOTE_BUILD_HOST:-}
 REMOTE_BUILD_PORT=${REMOTE_BUILD_PORT:-22}
-REMOTE_REPO_DIR=${REMOTE_REPO_DIR:-reps/home/iot/doorbell-bk7258-fw}
+REMOTE_REPO_DIR=${REMOTE_REPO_DIR:-freebell-bk7258}
 REMOTE_SDK=${REMOTE_SDK:-reps/oss/bk_idk}
 REMOTE_AVDK=${REMOTE_AVDK:-reps/oss/bk_avdk}
 REMOTE_OUT=${REMOTE_OUT:-}

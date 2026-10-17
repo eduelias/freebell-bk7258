@@ -1,8 +1,8 @@
 # patches-avdk/ — changes to Beken's bk_avdk (audio/video kit)
 
 Applied to a checkout of [bekencorp/bk_avdk](https://github.com/bekencorp/bk_avdk), branch
-`release/v2.0.1` (Apache-2.0), the tree that `scripts/build-avdk.sh` uses for the camera
-flavour (`AVDK`, default `~/reps/oss/bk_avdk`). The script first copies `avdk-overlay/` over the
+`release/v2.0.1` (Apache-2.0), the tree that `scripts/build.sh` builds in
+(`AVDK`, default `~/reps/oss/bk_avdk`). The script first copies `avdk-overlay/` over the
 checkout (new files only: our OV9650 driver, `components/bk_peripheral/src/dvp/dvp_ov9650.c`),
 then applies every `*.patch` here the same idempotent way as `patches/` (already applied ->
 reported, applies cleanly -> applied, anything else -> the build stops). Nothing is committed in

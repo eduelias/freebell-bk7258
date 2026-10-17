@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* doorbell-bk7258-fw: policy pull, volume, RAM log and the authenticated HTTP command endpoint (fw 0.25). */
+/* freebell-bk7258: policy pull, volume, RAM log and the authenticated HTTP command endpoint (fw 0.25). */
 /* policy.c (CPU0 only):
  *  - RAM log: an 8 KB ring fed by applog_printf() (applog.h redirects our os_printf there);
  *    `log [N]` replies the last N bytes (<= 600), GET /log?t=<token> streams the whole ring.

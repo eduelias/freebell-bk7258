@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Virtual doorbell: a network stand-in for doorbell-bk7258-fw without the hardware.
+"""Virtual doorbell: a network stand-in for freebell-bk7258 without the hardware.
 
 It speaks the firmware's three LAN interfaces so `tools/dbcmd.py`, curl and a Home Assistant
 generic camera + webhook automation work against it unchanged:
@@ -89,7 +89,7 @@ ramlog = RamLog()
 log.addHandler(ramlog)
 
 # ---------------------------------------------------------------- constants mirrored from the firmware
-FW_NAME = "doorbell-bk7258-fw"
+FW_NAME = "freebell-bk7258"
 TCP_CMD_PORT = 2323
 CAM_HTTP_PORT = 8080
 RTSP_DEFAULT_PORT = 554          # the firmware's default; the simulator defaults to 8554 (no root)

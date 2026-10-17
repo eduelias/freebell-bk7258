@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* doorbell-bk7258-fw: full-duplex voice engine on the SDK's aud_intf voice mode (AEC + NS on CPU1). */
+/* freebell-bk7258: full-duplex voice engine on the SDK's aud_intf voice mode (AEC + NS on CPU1). */
 /* audio_voc.c — see audio_voc.h. What the SDK does for us (bk_avdk components/multimedia, v2.0.1):
  *   - CPU1 runs ADC (MIC1, differential) and DAC at 8 kHz with 20 ms frames, the AEC (reference =
  *     the decoded speaker PCM), NS, and G.711 encode/decode; CPU0 only sees A-law bytes.

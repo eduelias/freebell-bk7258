@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* doorbell-bk7258-fw: LED arbiter, night light and blue-ring indicator patterns, `night`/`led`/`sys` commands. */
+/* freebell-bk7258: LED arbiter, night light and blue-ring indicator patterns, `night`/`led`/`sys` commands. */
 /* Night light, LED arbiter, blue-ring indicator patterns, `night` and `sys` commands (fw v0.19).
  *
  * - White fill LED (GPIO 44, active high) is owned here: callers set/clear a *source* bit

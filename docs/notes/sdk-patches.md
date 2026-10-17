@@ -1,6 +1,6 @@
 # SDK and AVDK patches
 
-Applied by `scripts/build.sh` / `scripts/build-avdk.sh` to the `release/v2.0.1` checkouts of
+Applied by `scripts/build.sh` to the `release/v2.0.1` checkouts of
 bk_idk (`patches/`) and bk_avdk (`patches-avdk/`, plus the added files in `avdk-overlay/`). All of
 them are derivative works of Beken's Apache-2.0 code (see `NOTICE`).
 
@@ -73,7 +73,7 @@ them are derivative works of Beken's Apache-2.0 code (see `NOTICE`).
     to the SDK's).
 
   Core scope: `CONFIG_GPIO_DEFAULT_SET_SUPPORT` is `y` only in `bk7258.defconfig` (CPU0) and `n` in
-  `bk7258_cp1.defconfig` / `bk7258_cp2.defconfig`; `project-avdk/config/bk7258_cp{1,2}/config` do
+  `bk7258_cp1.defconfig` / `bk7258_cp2.defconfig`; `project/config/bk7258_cp{1,2}/config` do
   not override it, so CPU1/CPU2 apply no table at all, exactly like the stock cp1/cp2. With the
   default map off, the I2C driver maps its own pins (`i2c_init_gpio()` -> `I2C_SET_PIN`, so the
   sensor's I2C1 on CPU1 works today without any table) and the SDIO driver likewise. No change to
@@ -97,6 +97,6 @@ them are derivative works of Beken's Apache-2.0 code (see `NOTICE`).
 - CPU0 (`project/config/bk7258/config`, rewritten by the build: sorted, comments stripped):
   `CONFIG_PSRAM_AUTO_DETECT=n`, `CONFIG_PSRAM_APS128XXO_OB9=y`, `CFG_LOG_LEVEL=2`,
   `CONFIG_SDCARD_POWER_GPIO_CTRL=n`.
-- CPU1 (`project-avdk/config/bk7258_cp1/config`): `CONFIG_H264_P_FRAME_CNT=29` (GOP 30), H.264
+- CPU1 (`project/config/bk7258_cp1/config`): `CONFIG_H264_P_FRAME_CNT=29` (GOP 30), H.264
   SEI/buffer sizes for 720p. After changing anything here delete `$OUT/doorbell/bk7258_cp1`,
   `_cp2` and `bk7258` before rebuilding.

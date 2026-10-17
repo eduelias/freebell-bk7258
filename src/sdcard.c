@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* doorbell-bk7258-fw: optional microSD storage: mount, snapshots on events, SNTP time for FAT timestamps. */
-/* sdcard.c — optional microSD storage (doorbell-bk7258-fw, feature "sd").
+/* freebell-bk7258: optional microSD storage: mount, snapshots on events, SNTP time for FAT timestamps. */
+/* sdcard.c — optional microSD storage (freebell-bk7258, feature "sd").
  *
  * Hardware (stock firmware + SDK defaults, see TESTPLAN-sd.md for the verification steps):
  *   SDIO host, 1-bit mode: GPIO 2 = CLK, GPIO 3 = CMD, GPIO 4 = DAT0 (SDK default pin group 1,

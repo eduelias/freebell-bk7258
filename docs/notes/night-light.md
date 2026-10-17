@@ -1,4 +1,4 @@
-# Night light, ring indicator, light sensor (v0.18-v0.19, `project/main/night.c`)
+# Night light, ring indicator, light sensor (v0.18-v0.19, `src/night.c`)
 
 ## Light sensor
 

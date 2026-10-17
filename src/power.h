@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* doorbell-bk7258-fw: battery / charger / deep sleep interface. */
+/* freebell-bk7258: battery / charger / deep sleep interface. */
 /* Battery, charger and deep sleep for the BK7258 doorbell (feat/power).
  *
  * Everything that can put the device to sleep is OFF by default and only enabled through

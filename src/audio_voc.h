@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* doorbell-bk7258-fw: full-duplex voice engine (SDK aud_intf voice mode, AEC + NS on CPU1). */
+/* freebell-bk7258: full-duplex voice engine (SDK aud_intf voice mode, AEC + NS on CPU1). */
 /* audio_voc.h — the "voc" audio engine: Beken's aud_intf voice mode. The ADC/DAC, the acoustic
  * echo canceller, noise suppression and the G.711 codec run on CPU1 (multimedia/aud/aud_tras_drv.c);
  * CPU0 talks to it over the media mailbox and gets encoded microphone frames in a callback.

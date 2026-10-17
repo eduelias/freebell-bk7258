@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* doorbell-bk7258-fw: half-duplex two-way audio over HTTP (/speak, /mic.wav, /talk). */
+/* freebell-bk7258: half-duplex two-way audio over HTTP (/speak, /mic.wav, /talk). */
 /* talk.c — two-way audio over HTTP for the doorbell (feature "talk"), plus the `talk` command that
  * also drives the voc engine settings (feature "duplex": `talk aec`, `talk vocmic`, `talk voc`).
  *

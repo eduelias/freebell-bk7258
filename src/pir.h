@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* doorbell-bk7258-fw: PIR motion sensor interface. */
+/* freebell-bk7258: PIR motion sensor interface. */
 /* PIR motion sensor: GPIO 24 output (ISR), GPIO 50 enable, GPIO 25/26 sensitivity.
  * CPU0 only (GPIO ISR + KV). See TESTPLAN-motion.md and the stock notes in pir.c. */
 #ifndef DOORBELL_PIR_H

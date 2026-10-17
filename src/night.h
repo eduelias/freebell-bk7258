@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* doorbell-bk7258-fw: LED arbiter / night light / ring indicator interface. */
+/* freebell-bk7258: LED arbiter / night light / ring indicator interface. */
 /* night.c: LED arbiter, night light, blue-ring indicator patterns, `night` and `sys` commands.
  * CPU0 only (everything here is a no-op / absent on CPU1 and CPU2). */
 #pragma once

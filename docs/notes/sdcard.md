@@ -1,4 +1,4 @@
-# microSD storage (v0.24.x, `project/main/sdcard.c`)
+# microSD storage (v0.24.x, `src/sdcard.c`)
 
 Optional: a FAT32/exFAT microSD card in the slot gets a JPEG per ring and motion
 (`/doorbell/YYYYMMDD-HHMMSS-<event>.jpg`, local time once SNTP has synced, `up<uptime>-...`

@@ -1,4 +1,4 @@
-# PIR motion sensor (v0.20, `project/main/pir.c`)
+# PIR motion sensor (v0.20, `src/pir.c`)
 
 ## Pins (from the shipped firmware's PIR code)
 

@@ -52,11 +52,11 @@ data. Keep the dump private.
 
 ## Partitions and the AVDK build
 
-The flash layout the application assumes (`project/main/vendor_flash_partition.h`) is mirrored by
-the packaging CSVs in `project-avdk/config/bk7258/*.csv`. After touching those, delete
+The flash layout the application assumes (`src/vendor_flash_partition.h`) is mirrored by
+the packaging CSVs in `project/config/bk7258/*.csv`. After touching those, delete
 `$OUT/doorbell/bk7258_cp1` and `_cp2`, otherwise the CPU1 image keeps its old flash origin and
 never boots (`cp0 boot cp1 time out`). The same applies after changing Kconfig options in
-`project-avdk/config/bk7258_cp1/config`: delete `$OUT/doorbell/bk7258_cp1`, `_cp2` and `bk7258`
+`project/config/bk7258_cp1/config`: delete `$OUT/doorbell/bk7258_cp1`, `_cp2` and `bk7258`
 before rebuilding. The OTA image (`app_pack.rbl`) carries all three cores.
 
 The build rewrites `project/config/bk7258/config` (sorts keys, strips comments), so option choices

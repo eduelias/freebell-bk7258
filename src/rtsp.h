@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* doorbell-bk7258-fw: RTSP server interface. */
+/* freebell-bk7258: RTSP server interface. */
 /* rtsp.h - minimal RTSP/1.0 server for the camera's hardware H.264 stream (AVDK build, CPU0).
  *
  * rtsp://<ip>:<port>/live  - track0 video H264/90000, RFC 6184 packetization-mode=1 (single NAL +

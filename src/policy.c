@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* doorbell-bk7258-fw: RAM log ring, speaker volume, boot-time policy pull from Home Assistant, GET /cmd and /log. */
+/* freebell-bk7258: RAM log ring, speaker volume, boot-time policy pull from Home Assistant, GET /cmd and /log. */
 /* See policy.h for the overview. Everything here is CPU0 only. */
 #include <common/bk_include.h>
 #include "policy.h"

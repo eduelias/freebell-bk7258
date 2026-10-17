@@ -13,11 +13,11 @@ Beken Armino SDK (bk_idk) and Audio/Video Development Kit (bk_avdk), release/v2.
   avdk-overlay/ are additions to the AVDK tree; all are derivative works of
   the Beken code and are distributed under the same Apache-2.0 terms.
 
-project/main/vendor_flash.c
+src/vendor_flash.c
   Copyright (c) 2017 BEKEN Inc. Licensed under the MIT License; the full
   licence text is in the file header, which is kept unchanged.
 
-project/main/vendor_flash_partition.h
+src/vendor_flash_partition.h
   Copyright 2020-2021 Beken. Licensed under the Apache License, Version 2.0
   (header kept unchanged).
 
