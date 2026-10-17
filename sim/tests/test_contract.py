@@ -26,8 +26,8 @@ def firmware_commands() -> dict[str, set[str]]:
 
 def test_firmware_command_table_is_parsed():
     found = firmware_commands()
-    assert "app_main.c" in found, "s_doorbell_commands[] not found in app_main.c"
-    assert {"hook", "pir", "pwr", "cam", "sys"} <= found["app_main.c"]
+    assert "cmd.c" in found, "s_doorbell_commands[] not found in cmd.c"
+    assert {"hook", "pir", "pwr", "cam", "sys"} <= found["cmd.c"]
 
 
 def test_simulator_covers_every_firmware_command():
@@ -40,13 +40,13 @@ def test_simulator_covers_every_firmware_command():
 
 
 def test_fw_version_follows_the_source():
-    m = re.search(r'#define FW_VERSION "([^"]+)"', (REPO / "project" / "main" / "app_main.c").read_text())
+    m = re.search(r'#define FW_VERSION "([^"]+)"', (REPO / "project" / "main" / "version.h").read_text())
     assert m and vdb.fw_version_from_source() == m.group(1)
 
 
 def test_report_json_has_the_firmware_fields():
-    """The field list of report_ex() in app_main.c + power_json() in power.c + policy_json() in policy.c (boot report)."""
-    src = "".join((REPO / "project" / "main" / f).read_text() for f in ("app_main.c", "power.c", "policy.c"))
+    """The field list of report_ex() in net.c + power_json() in power.c + policy_json() in policy.c (boot report)."""
+    src = "".join((REPO / "project" / "main" / f).read_text() for f in ("net.c", "power.c", "policy.c"))
     fw_fields = set(re.findall(r'\\"([a-z_]+)\\":', src))
     args = vdb.parse_args(["--state", "/dev/null", "--ip", "127.0.0.1"])
     dev = vdb.Device.__new__(vdb.Device)   # no sockets: only the JSON formatter is exercised

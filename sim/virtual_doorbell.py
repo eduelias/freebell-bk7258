@@ -148,8 +148,8 @@ RESET_REASONS = {               # bk_idk include/components/system.h
 
 
 def fw_version_from_source(default: str = "0.0.0-sim") -> str:
-    """FW_VERSION from project/main/app_main.c when the simulator runs inside the repo."""
-    src = Path(__file__).resolve().parent.parent / "project" / "main" / "app_main.c"
+    """FW_VERSION from project/main/version.h when the simulator runs inside the repo."""
+    src = Path(__file__).resolve().parent.parent / "project" / "main" / "version.h"
     try:
         m = re.search(r'#define FW_VERSION "([^"]+)"', src.read_text(errors="replace"))
         return m.group(1) if m else default
