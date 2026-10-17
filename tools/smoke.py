@@ -32,7 +32,11 @@ COMMANDS = [
     "rtsp status", "talk status", "sd status", "vol", "log stat",
 ]
 EXACT = ("pin cfg",)   # blocks compared exactly by `diff` (pin direction/pull/function must not move)
-VOLATILE_PINS = {27: "camera MCLK: upper bits follow the DVP pipeline state between runs"}
+# AON GPIO config word (soc/bk7258/soc/gpio_struct.h): bit 0 = live input level, 1 output, 2 input_en,
+# 3 output_en, 4 pull up/down, 5 pull_en, 6 second function, 7 input monitor, 8-9 drive, 10-11 int
+# type, 12 int_en, 13 int_clear, 14-31 reserved. Compare bits 1-12 only: bit 0 and 13 are live state,
+# and the reserved bits change between runs of the same firmware (seen on GPIO 11 and 27).
+PIN_CFG_MASK = 0x1FFE
 NUM = re.compile(r"[-+]?(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)?)")
 
 
@@ -77,12 +81,11 @@ def run(args):
         print(f"## {cmd}")
         print(mask(reply))
         time.sleep(0.3)   # the firmware's TCP task drops commands sent back to back
-    print("## pin cfg")   # AON config word per pin, bit 0 (live input level) masked
+    print("## pin cfg")   # AON config word per pin, configuration bits only (PIN_CFG_MASK)
     for first in range(0, 56, 8):
         reply = dbcmd.send(f"pin dump {first}", host=host, port=args.port, tok=args.token, timeout=10)
         m = re.search(r"CFG (\d+): ((?:[0-9a-f]{8} ?){8})", reply)
-        words = " ".join("--------" if first + i in VOLATILE_PINS else "%08x" % (int(w, 16) & ~1)
-                         for i, w in enumerate(m.group(2).split())) if m else "no reply: " + reply
+        words = " ".join("%04x" % (int(w, 16) & PIN_CFG_MASK) for w in m.group(2).split()) if m else "no reply: " + reply
         print(f"CFG {first:02d}: {words}")
         time.sleep(0.3)
     print("## http /")
