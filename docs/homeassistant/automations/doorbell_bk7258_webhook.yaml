@@ -31,6 +31,10 @@
       wake_pir: "{{ trigger.json.wake_pir | default(none) }}"
       policy: "{{ trigger.json.policy | default('') }}"
       policy_rev: "{{ trigger.json.policy_rev | default('') }}"
+      sd: "{{ trigger.json.sd | default('') }}"
+      crashes: "{{ trigger.json.crashes | default(none) }}"
+      reset_reason: "{{ trigger.json.reset_reason | default(none) }}"
+      forced: "{{ trigger.json.forced | default(none) }}"
   - action: input_text.set_value
     target:
       entity_id: input_text.doorbell_bk7258_last_report
@@ -115,6 +119,32 @@
         data:
           name: Doorbell BK7258
           message: booted, fw {{ trigger.json.fw | default("?") }}, ip {{ trigger.json.ip | default("?") }}, policy {{ trigger.json.policy | default("-") }} rev {{ trigger.json.policy_rev | default("-") }}, next wake {{ trigger.json.sleep_min | default("?") }} min
+    # fw 0.28.1: the device restarted into rescue mode (3 crash resets in a row, or `rescue on`): rings are not
+    # reported until a fixed image is installed with `ota URL` (or `rescue off` + `reboot`)
+    - conditions:
+      - condition: template
+        value_template: '{{ trigger.json.event == "rescue" }}'
+      sequence:
+      - action: persistent_notification.create
+        data:
+          notification_id: doorbell_rescue
+          title: Doorbell in rescue mode
+          message: >-
+            {{ 'Forced with `rescue on`.' if (trigger.json.forced | int(0)) == 1 else 'After ' ~ trigger.json.crashes ~
+            ' crash restarts in a row (last reset reason ' ~ trigger.json.reset_reason ~ ').' }} fw {{ trigger.json.fw }}:
+            only Wi-Fi, the command channel and OTA run. Install a fixed image with `ota URL`, or `rescue off` + `reboot`.
+      - action: notify.doorbell_family
+        continue_on_error: true
+        data:
+          title: Doorbell needs attention
+          message: >-
+            The doorbell restarted into rescue mode{{ '' if (trigger.json.forced | int(0)) == 1 else ' after ' ~
+            trigger.json.crashes ~ ' crashes' }}: rings are not reported until it is fixed.
+          data:
+            priority: high
+            importance: high
+            tag: doorbell_rescue
+            channel: doorbell
     - conditions:
       - condition: template
         value_template: '{{ trigger.json.event == "wake" }}'
