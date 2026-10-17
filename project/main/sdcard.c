@@ -40,6 +40,7 @@
  */
 #include <common/bk_include.h>
 #include "sdcard.h"
+#include "board.h"
 #include "applog.h"   /* last: our os_printf lines go to the RAM log ring (policy.c) */
 
 typedef int sdcard_translation_unit_is_never_empty_t;
@@ -91,7 +92,7 @@ extern void bk_sdio_clk_gate_config(uint32_t enable);
 #define SD_SYS_DEV_CLK_EN    (*(volatile uint32_t *)(0x44010000u + 0xcu * 4u))      /* sdio_cken */
 #define SD_SDIO_REG(n)       (*(volatile uint32_t *)(0x458d0000u + 4u * (n)))       /* only while the host is initialised */
 
-#define SD_CD_PIN 6                   /* card detect, input with pull-up, 0 = card present */
+#define SD_CD_PIN BOARD_PIN_SD_DETECT /* card detect, input with pull-up, 0 = card present */
 
 #define KV_SD_AUTO "db_sd_auto"   /* "1" (default) / "0": save a JPEG on ring and motion */
 #define KV_SD_PWR  "db_sd_pwr"    /* card power GPIO, default 13; "none" = no pin; a stored 6 (pre-0.24.2) is migrated to 13 */
@@ -540,9 +541,9 @@ static void sd_probe_pins(void)
 	n = sd_probe_add(n, " cd");
 	n = sd_probe_pin(n, SD_CD_PIN);
 	n = sd_probe_add(n, " lvl%d", sd_cd_level());
-	n = sd_probe_add(n, " 13");
-	n = sd_probe_pin(n, 13);
-	n = sd_probe_add(n, " lvl%d pwr%d%s", bk_gpio_get_input(13) ? 1 : 0, s_pwr_pin, s_pwr_on ? " on" : "");
+	n = sd_probe_add(n, " " BOARD_STR(BOARD_PIN_BATTERY));
+	n = sd_probe_pin(n, BOARD_PIN_BATTERY);
+	n = sd_probe_add(n, " lvl%d pwr%d%s", bk_gpio_get_input(BOARD_PIN_BATTERY) ? 1 : 0, s_pwr_pin, s_pwr_on ? " on" : "");
 	n = sd_probe_add(n, " | sys clkdiv2 %08x devclk %08x (sdio_cken bit?)\r\n", SD_SYS_CLK_DIV_MODE2, SD_SYS_DEV_CLK_EN);
 }
 

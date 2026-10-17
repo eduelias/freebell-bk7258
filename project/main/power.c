@@ -19,6 +19,7 @@
  * of the BK7258 sits in the AON domain and can be a wake source (dynamic map, max 4). */
 #include <common/bk_include.h>   /* sdkconfig.h: CONFIG_SYS_CPU0 must be visible before the guard below */
 #include "power.h"
+#include "board.h"
 
 #if (CONFIG_SYS_CPU0)
 #include <stdio.h>
@@ -35,15 +36,15 @@
 #include "policy.h"   /* `pwr policy ...` (policy.c) */
 #include "applog.h"   /* last: our os_printf lines go to the RAM log ring */
 
-#define PIN_USB_PRESENT 19
-#define PIN_CHARGING    15
-#define PIN_PIR_ENABLE  50
-#define PIN_PIR_SENS0   25   /* pir.c: 25 = sens bit 0, 26 = bit 1 */
-#define PIN_PIR_SENS1   26
-#define PIN_PWR_BUTTON  53
-#define PIN_PWR_PIR     24
-#define PIN_PWR_AMP     46
-#define PIN_UART_RX     10   /* in the SDK's static wake map (falling edge): console input wakes the device too */
+#define PIN_USB_PRESENT BOARD_PIN_USB_PRESENT
+#define PIN_CHARGING    BOARD_PIN_CHARGING
+#define PIN_PIR_ENABLE  BOARD_PIN_PIR_EN
+#define PIN_PIR_SENS0   BOARD_PIN_PIR_SENS0
+#define PIN_PIR_SENS1   BOARD_PIN_PIR_SENS1
+#define PIN_PWR_BUTTON  BOARD_PIN_BUTTON
+#define PIN_PWR_PIR     BOARD_PIN_PIR_OUT
+#define PIN_PWR_AMP     BOARD_PIN_AMP_EN
+#define PIN_UART_RX     BOARD_PIN_UART_RX   /* in the SDK's static wake map (falling edge): console input wakes the device too */
 
 #define KV_PWR_SLEEP  "db_pwr_sleep"    /* "1" = automatic sleep enabled (default off) */
 #define KV_PWR_FORCE  "db_pwr_force"    /* "1" = sleep even while USB is present (default off) */
@@ -64,7 +65,7 @@
 static bool s_sleep_en, s_force, s_wake_pir, s_inhibit;
 static bool s_hold9;   /* default off (0.26.2); `pwr hold9 on` keeps GPIO 9 high through the sleep */
 bool power_hold9(void) { return s_hold9; }
-static uint32_t s_idle_s = 60, s_snap_min, s_bchan = 15, s_bratio = 200;
+static uint32_t s_idle_s = 60, s_snap_min, s_bchan = BOARD_ADC_BATTERY, s_bratio = BOARD_BATT_RATIO_PCT;
 /* smart schedule (fw 0.25): day/night RTC intervals, local time from the SNTP clock + `sd tz`,
  * light sensor when unsynced; `pwr sched off` = the fixed snap_min */
 static bool s_sched_on = true;
@@ -135,7 +136,7 @@ static uint32_t batt_adc_mv(void)
 {
 	uint32_t a, b, c, t, now = rtos_get_time();
 
-	if (s_bchan == 15 && sd_adc_pin_blocked(13)) {
+	if (s_bchan == BOARD_ADC_BATTERY && sd_adc_pin_blocked(BOARD_PIN_BATTERY)) {
 		s_batt_cached = true;
 		return s_batt_last_adc;
 	}
@@ -411,7 +412,7 @@ static void power_do_sleep(const char *why)
 	/* 2. pins held through the sleep: amp enable low (floating leaks audio + current), PIR enabled */
 	keep_pin_in_sleep(PIN_PWR_AMP, false);
 	if (s_hold9)
-		keep_pin_in_sleep(9, true);   /* optional (off by default): sensor rail stays up through the sleep; a 0.26.1 experiment, see docs/notes/power.md */
+		keep_pin_in_sleep(BOARD_PIN_SENSOR_RAIL, true);   /* optional (off by default): sensor rail stays up through the sleep; a 0.26.1 experiment, see docs/notes/power.md */
 	/* USB present (GPIO 19) is a floating input while awake; pull it DOWN through the sleep so a
 	 * charger's rising edge is a clean wake (0.25.0; UNVERIFIED until a charger is at hand: the
 	 * pin's polarity itself is still unconfirmed, see docs/notes/power.md). power_init() restores

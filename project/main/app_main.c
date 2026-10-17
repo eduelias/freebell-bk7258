@@ -27,6 +27,7 @@
 #include <driver/aud_adc_types.h>
 #include <driver/flash.h>
 #include <driver/dma.h>
+#include "board.h"   /* every GPIO / ADC channel of the board (boards/<board>.h) */
 #include "pir.h"
 #include "power.h"   /* feat/power: battery, charger, deep sleep */
 #include "aud_engine.h"   /* engine API implemented below, used by talk.c */
@@ -340,9 +341,9 @@ static void cli_adc_read_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc,
 
 /* ---- doorbell prototype: Wi-Fi + Home Assistant webhook ---- */
 /* PIR (GPIO 24 output, 50 enable, 25/26 sensitivity) lives in pir.c since v0.19.0 */
-#define PIN_BUTTON 53   /* externally pulled high, drops on press. The same line keys the on-board 433 MHz chime TX:
+#define PIN_BUTTON BOARD_PIN_BUTTON   /* externally pulled high, drops on press. The same line keys the on-board 433 MHz chime TX:
                          * driving it low (as the SDK's boot pin map did until patch 0010) rings every paired chime */
-#define PIN_KEY2   51   /* second key in the stock firmware (long press); not wired on this board, parked as input + pull-up */
+#define PIN_KEY2   BOARD_PIN_KEY2     /* second key in the stock firmware (long press); not wired on this board, parked as input + pull-up */
 #define HEARTBEAT_MS (5 * 60 * 1000)
 #define KV_SSID "db_ssid"
 #define KV_PASS "db_pass"
@@ -357,7 +358,7 @@ static uint32_t s_dark_mv = 1000;     /* light sensor mV ABOVE this = dark (LDR 
 static bool s_fx_enabled = true;
 #define KV_DARK "db_dark_mv"
 #define KV_FX "db_fx"
-static uint32_t s_light_chan = 14;   /* LDR on GPIO 12 = ADC14 (stock), powered by GPIO 28; higher = darker */
+static uint32_t s_light_chan = BOARD_ADC_LIGHT;   /* LDR on GPIO 12 = ADC14 (stock), powered by GPIO 28; higher = darker */
 #define LIGHT_ADC_CHAN s_light_chan
 #define KV_LIGHT_CHAN "db_light_chan"
 #define WHITE_LIGHT_MS 30000
@@ -747,7 +748,7 @@ static volatile bool s_spk_busy, s_spk_stop;
 static beken_thread_t s_spk_thread;
 static uint32_t s_spk_hz, s_spk_ms, s_spk_addr, s_spk_len;
 /* runtime audio config (spk cfg / mic cfg); PA = amplifier enable, SDK reference design uses GPIO 5 */
-static int s_pa_pin = 46;   /* speaker amplifier enable, active high (found by sweep 2026-10-03) */
+static int s_pa_pin = BOARD_PIN_AMP_EN;   /* speaker amplifier enable, active high (found by sweep 2026-10-03) */
 static aud_dac_chl_t s_dac_chl = AUD_DAC_CHL_L;
 static aud_dac_work_mode_t s_dac_mode = AUD_DAC_WORK_MODE_DIFFEN;
 static int s_dac_gain_raw = -1;      /* `spk cfg gain N`: raw DAC gain override; -1 = follow `vol` (policy.c: 100 % = 0x1c, the loudest clean level
@@ -1711,8 +1712,8 @@ enum { CAM_SCENE_AUTO = 0, CAM_SCENE_DAY = 1, CAM_SCENE_NIGHT = 2, CAM_SCENE_STO
 #define KV_CAM_SCENE "db_cam_scene"
 #define KV_CAM_SETTLE "db_cam_settle"   /* "N MS PCT" */
 #define KV_IRCUT "db_ircut"             /* "day" | "night": the last IR-cut pulse applied */
-#define PIN_IRCUT_DAY 54
-#define PIN_IRCUT_NIGHT 55
+#define PIN_IRCUT_DAY BOARD_PIN_IRCUT_DAY
+#define PIN_IRCUT_NIGHT BOARD_PIN_IRCUT_NIGHT
 #define IRCUT_PULSE_MS 300
 static int s_cam_scene_pref = CAM_SCENE_AUTO;
 static uint32_t s_cam_exp_fixed, s_cam_exp_class;   /* `cam exp N` override, and the class sent at the last open */
@@ -1875,8 +1876,8 @@ static void cam_pwrscan_task(beken_thread_arg_t arg)
 	static const int sweep[] = {2, 3, 4, 5, 6, 8, 12, 13, 16, 17, 18, 19, 22, 23, 25, 26, 40, 41, 47, 48, 49, 50, 51, 52, 54, 55};
 	int lv[6], base[6];
 
-	pin_configure(9, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE); bk_gpio_set_output_high(9);
-	pin_configure(28, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE); bk_gpio_set_output_high(28);
+	pin_configure(BOARD_PIN_SENSOR_RAIL, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE); bk_gpio_set_output_high(BOARD_PIN_SENSOR_RAIL);
+	pin_configure(BOARD_PIN_CAM_PWR, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE); bk_gpio_set_output_high(BOARD_PIN_CAM_PWR);
 	bk_video_gpio_init(DVP_GPIO_CLK);
 	bk_video_dvp_mclk_enable(YUV_MODE);
 	rtos_delay_milliseconds(50);
@@ -1999,7 +2000,7 @@ static void cam_bb_task(beken_thread_arg_t arg)
  * (stock firmware, verified 2026-10-04) and belongs to sdcard.c now. */
 static void cam_rails(int on)
 {
-	static const int rails[] = {9, 28, 5};
+	static const int rails[] = {BOARD_PIN_SENSOR_RAIL, BOARD_PIN_CAM_PWR, BOARD_PIN_CAM_LDO};
 	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
 		pin_configure(rails[i], GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
 		if (on) bk_gpio_set_output_high(rails[i]); else bk_gpio_set_output_low(rails[i]);
@@ -2013,7 +2014,7 @@ static void cam_rails(int on)
  * (light sensor / LED rail) is left alone. */
 static void cam_power(int on)   /* s_cam_off_ms / s_cam_open_ms live with the settle state above */
 {
-	static const int pins[] = {28, 5};
+	static const int pins[] = {BOARD_PIN_CAM_PWR, BOARD_PIN_CAM_LDO};
 	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
 		pin_configure(pins[i], GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
 		if (on) bk_gpio_set_output_high(pins[i]); else bk_gpio_set_output_low(pins[i]);
@@ -2162,12 +2163,12 @@ static int cam_open_locked(uint32_t w, uint32_t h, bool h264)
 	if ((scene == CAM_SCENE_DAY || scene == CAM_SCENE_NIGHT) && scene != s_ircut_state)
 		ircut_begin(scene);   /* overlaps the 250 ms reset pulse below; ircut_end() pads to 300 ms */
 	/* stock bk_dvp_camera_enumerate: GPIO 52 low 100 ms, high 100 ms, low (sensor PWDN/RESET pulse) */
-	pin_configure(52, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
-	bk_gpio_set_output_low(52);
+	pin_configure(BOARD_PIN_CAM_PWDN, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+	bk_gpio_set_output_low(BOARD_PIN_CAM_PWDN);
 	rtos_delay_milliseconds(100);
-	bk_gpio_set_output_high(52);
+	bk_gpio_set_output_high(BOARD_PIN_CAM_PWDN);
 	rtos_delay_milliseconds(100);
-	bk_gpio_set_output_low(52);
+	bk_gpio_set_output_low(BOARD_PIN_CAM_PWDN);
 	rtos_delay_milliseconds(50);
 	ircut_end();
 #else
@@ -2746,8 +2747,8 @@ static void cli_rtsp_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, cha
 
 /* ---- LEDs (found 2026-10-03 with the Mac camera): GPIO 44 = white fill LED, GPIO 45 = the four blue
  * button-ring LEDs (night locator light), both active high. The IR LED above the camera is still unmapped. ---- */
-#define PIN_LED_WHITE 44
-#define PIN_LED_RING 45
+#define PIN_LED_WHITE BOARD_PIN_LED_WHITE
+#define PIN_LED_RING BOARD_PIN_LED_RING
 static void cli_led_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
 {
 	int which = -1, state;
@@ -2819,13 +2820,13 @@ static uint32_t light_read_mv(void)
 #endif
 
 	if (!cam) {
-		pin_configure(28, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
-		bk_gpio_set_output_high(28);
+		pin_configure(BOARD_PIN_CAM_PWR, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
+		bk_gpio_set_output_high(BOARD_PIN_CAM_PWR);
 		rtos_delay_milliseconds(80);
 	}
 	mv = adc_read_mv(LIGHT_ADC_CHAN);
 	if (!cam)
-		bk_gpio_set_output_low(28);
+		bk_gpio_set_output_low(BOARD_PIN_CAM_PWR);
 #if defined(DOORBELL_AVDK) && (CONFIG_SYS_CPU0)
 	if (mv >= 100)
 		s_light_last_mv = mv;
@@ -2945,7 +2946,7 @@ bool app_power_busy(void)
 /* amp off, LEDs off, camera closed, sensor rails low: everything we switched on */
 void app_power_prepare_sleep(void)
 {
-	static const uint8_t rails[] = {28, 5, 6, 9};
+	static const uint8_t rails[] = {BOARD_PIN_CAM_PWR, BOARD_PIN_CAM_LDO, BOARD_PIN_SD_DETECT, BOARD_PIN_SENSOR_RAIL};   /* SD_DETECT: see docs (card-detect input driven low in sleep) */
 	unsigned i;
 
 	pa_set(0);
@@ -2964,7 +2965,7 @@ void app_power_prepare_sleep(void)
 	}
 #endif
 	for (i = 0; i < sizeof(rails); i++) {
-		if (rails[i] == 9 && power_hold9())   /* `pwr hold9 on` (default off): leave the sensor rail up through the sleep */
+		if (rails[i] == BOARD_PIN_SENSOR_RAIL && power_hold9())   /* `pwr hold9 on` (default off): leave the sensor rail up through the sleep */
 			continue;
 		pin_configure(rails[i], GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);
 		bk_gpio_set_output_low(rails[i]);
@@ -3060,8 +3061,8 @@ void user_app_main(void)
 #if (CONFIG_SYS_CPU0)
 	pa_set(0);   /* amplifier enable floats at boot and half-turns the speaker on: park it low */
 	voc_init();  /* KV: db_talk_aec / db_voc_mic; the engine itself starts with the first RTSP audio track */
-	pin_configure(9, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);   /* sensor rail: light sensor (ADC10) reads ~25 mV dead without it */
-	bk_gpio_set_output_high(9);
+	pin_configure(BOARD_PIN_SENSOR_RAIL, GPIO_OUTPUT_ENABLE, GPIO_PULL_DISABLE);   /* sensor rail: light sensor reads ~25 mV dead without it */
+	bk_gpio_set_output_high(BOARD_PIN_SENSOR_RAIL);
 #if defined(DOORBELL_AVDK)
 	{
 		beken_thread_t http;

@@ -24,6 +24,7 @@
 #include <common/bk_include.h>   /* sdkconfig.h: CONFIG_SYS_CPU0 */
 #if (CONFIG_SYS_CPU0)   /* GPIO ISR + easyflash KV exist on CPU0 only; the file is compiled for all three cores */
 #include "pir.h"
+#include "board.h"
 #include "applog.h"   /* last: our os_printf lines go to the RAM log ring (policy.c) */
 #include <os/os.h>
 #include <os/str.h>
@@ -32,10 +33,10 @@
 #include <string.h>
 #include <driver/gpio.h>
 
-#define PIR_PIN_OUT 24
-#define PIR_PIN_EN 50
-#define PIR_PIN_SET1 25   /* sensitivity bit 0 */
-#define PIR_PIN_SET0 26   /* sensitivity bit 1 */
+#define PIR_PIN_OUT BOARD_PIN_PIR_OUT
+#define PIR_PIN_EN BOARD_PIN_PIR_EN
+#define PIR_PIN_SET1 BOARD_PIN_PIR_SENS0   /* sensitivity bit 0 */
+#define PIR_PIN_SET0 BOARD_PIN_PIR_SENS1   /* sensitivity bit 1 */
 
 #define KV_PIR_ON "db_pir_on"       /* "1" / "0", default on (stock default, and what v0.18 did implicitly) */
 #define KV_PIR_SENS "db_pir_sens"   /* "0".."3", default 1 (stock default) */

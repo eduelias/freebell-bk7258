@@ -25,12 +25,13 @@
 #include <driver/gpio.h>
 #include <components/system.h>
 #include "night.h"
+#include "board.h"
 #include "applog.h"   /* last: our os_printf lines go to the RAM log ring (policy.c) */
 
 #if (CONFIG_SYS_CPU0)
 
-#define PIN_LED_WHITE 44
-#define PIN_LED_RING 45
+#define PIN_LED_WHITE BOARD_PIN_LED_WHITE
+#define PIN_LED_RING BOARD_PIN_LED_RING
 
 #define KV_NIGHT_AUTO "db_night_auto"
 #define KV_NIGHT_RING "db_night_ring"
