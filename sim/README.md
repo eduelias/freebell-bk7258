@@ -25,7 +25,7 @@ Stop it with Ctrl-C.
 | Webhook | `POST` JSON to the KV hook on boot, ring, motion, wake, test, heartbeat (5 min) | same JSON (`event fw ip mv light_mv uptime_s motion_count ring_count pir_on pir_sens batt_mv batt_pct usb charging sleep_min wake_pir [reason] [policy policy_rev]`), same timing; `pwr policy` really GETs and applies a policy.json |
 | RTSP | `rtsp://IP:554/live`, own H.264 server + PCMA microphone track + ONVIF backchannel (fw 0.26) | optional stand-in: `--rtsp` + ffmpeg serve a test pattern with a PCMA sine track at `rtsp://HOST:8554/live` for one client after `rtsp on` (no backchannel; FFmpeg 8.0's `-rtsp_flags listen` is broken, use an older ffmpeg). `talk aec|vocmic|voc` and the `rtsp status` audio line are modelled |
 
-The reported firmware version is the `FW_VERSION` of `project/main/version.h` next to the
+The reported firmware version is the `FW_VERSION` of `src/version.h` next to the
 script (override with `--fw-version`); an `ota` bumps it to the version in the file name.
 
 ## Driving it
@@ -133,7 +133,7 @@ The suite starts simulators on ephemeral ports (one per module at real time, fre
 for sleep/reboot/OTA), a webhook sink and a local OTA file server, and checks dbcmd.py
 round-trips, reply strings, snapshot/stream validity, the report JSON, state persistence, the
 sleep and OTA cycles. `test_contract.py` parses `s_doorbell_commands[]` (and any other
-`struct cli_command` table under `project/main/`) and fails when the firmware grows a command the
+`struct cli_command` table under `src/`) and fails when the firmware grows a command the
 simulator does not handle. `.github/workflows/sim-tests.yml` runs it on push.
 
 ## Options

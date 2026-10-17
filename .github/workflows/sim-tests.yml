@@ -5,13 +5,15 @@ on:
     paths:
       - "sim/**"
       - "tools/dbcmd.py"
-      - "project/main/*.c"
+      - "src/*.c"
+      - "src/*.h"
       - ".github/workflows/sim-tests.yml"
   pull_request:
     paths:
       - "sim/**"
       - "tools/dbcmd.py"
-      - "project/main/*.c"
+      - "src/*.c"
+      - "src/*.h"
   workflow_dispatch:
 
 jobs:

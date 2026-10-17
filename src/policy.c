@@ -78,7 +78,7 @@ int applog_tail(char *dst, int cap, int n)
 	return n;
 }
 
-/* os_printf() of every project/main file lands here (applog.h): format once, ring + UART */
+/* os_printf() of every src file lands here (applog.h): format once, ring + UART */
 void applog_printf(const char *fmt, ...)
 {
 	char buf[200];

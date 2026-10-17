@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* doorbell-bk7258-fw: route this firmware's own os_printf() lines into the RAM log ring (policy.c). */
-/* applog.h: include it LAST in every project/main source file (after the SDK and module headers).
+/* applog.h: include it LAST in every src source file (after the SDK and module headers).
  *
  * The SDK's async log path (shell_log_out_port) has no output callback, so the ring captures what
  * this firmware prints itself: every os_printf()/REPLY() in app_main.c, power.c, night.c, pir.c,

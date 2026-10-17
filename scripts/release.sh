@@ -5,8 +5,8 @@
 #   scripts/release.sh --dry-run   # print what would run (build script, image, publish command,
 #                                  # OTA URL) and exit before any copy; combine with --no-build
 # Settings come from the environment or ~/.config/doorbell-bk7258/env (scripts/env.example):
-#   BUILD         build-avdk.sh (default, camera flavour), build.sh, or build-remote.sh (same
-#                 flavour built on REMOTE_BUILD_HOST, see scripts/build-remote.sh)
+#   BUILD         build.sh (default) or build-remote.sh (the same build on REMOTE_BUILD_HOST, see
+#                 scripts/build-remote.sh); build-avdk.sh is accepted as the pre-0.28 name of build.sh
 #   FW_DIR        where the build put doorbell-fw_<ver>_app_pack.rbl
 #   OTA_URL_BASE  HTTP base URL the device fetches from, e.g. http://<ha-ip>:8123/local/doorbell
 #   OTA_PUBLISH   shell command that copies the image there; {rbl} = full path, {name} = basename,
@@ -17,7 +17,8 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 . "$HERE/scripts/env.sh"
 FW_DIR=${FW_DIR:-$HOME/data/doorbell-bk7258/firmware}
-BUILD=${BUILD:-build-avdk.sh}
+BUILD=${BUILD:-build.sh}
+[ "$BUILD" = build-avdk.sh ] && BUILD=build.sh   # renamed in 0.28 (one build flavour)
 OTA_URL_BASE=${OTA_URL_BASE:-}
 OTA_PUBLISH=${OTA_PUBLISH:-}
 
@@ -32,15 +33,15 @@ for arg in "$@"; do
 done
 
 case "$BUILD" in
-	build.sh|build-avdk.sh|build-remote.sh) ;;
-	*) echo "BUILD must be build-avdk.sh, build.sh or build-remote.sh (got '$BUILD')" >&2; exit 2 ;;
+	build.sh|build-remote.sh) ;;
+	*) echo "BUILD must be build.sh or build-remote.sh (got '$BUILD')" >&2; exit 2 ;;
 esac
 
 if [ $build = 1 ] && [ $dry = 0 ]; then
 	"$HERE/scripts/$BUILD"
 fi
 
-ver=$(sed -nE 's/^#define FW_VERSION "([^"]+)"/\1/p' "$HERE/project/main/version.h")
+ver=$(sed -nE 's/^#define FW_VERSION "([^"]+)"/\1/p' "$HERE/src/version.h")
 rbl="$FW_DIR/doorbell-fw_${ver}_app_pack.rbl"
 name=$(basename "$rbl")
 
