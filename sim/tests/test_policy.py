@@ -111,8 +111,7 @@ def test_policy_pull_applies_whitelisted_keys(fast_sim, sink, tmp_path):
         assert "(0 changed 8 same)" in sim.cmd("pwr policy pull")
         mark = sink.mark()
         sim.cmd("reboot")
-        # real time: 6 s reset (REBOOT_DOWN_S) + 1 s IP + the policy fetch; 10 s was too tight for CI runners
-        boot = sink.wait_for("boot", 20, since=mark)
+        boot = sink.wait_for("boot", 10, since=mark)
         assert boot["policy"] == "applied" and boot["policy_rev"] == "1759600000"
         assert wait_until(lambda: sim.cmd("vol").startswith("ok\n[vol] 55%"), 5)
         # `pwr sched off` on the device wins over the schedule keys

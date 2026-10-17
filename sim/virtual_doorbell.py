@@ -2171,6 +2171,9 @@ class CamHttpServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def server_bind(self) -> None:   # skip HTTPServer's getfqdn(): a slow reverse DNS stalled the boot on macOS
+        # TCPServer.server_bind() is what applies allow_reuse_address; without it Linux refuses the rebind after a
+        # sleep/reboot while the last connections sit in TIME_WAIT (EADDRINUSE)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         socket.socket.bind(self.socket, self.server_address)
         self.server_address = self.socket.getsockname()
         self.server_name, self.server_port = self.server_address[0], self.server_address[1]
@@ -2200,19 +2203,23 @@ class Network:
         with self._lock:
             self.generation += 1
             if self.tcp:
-                try:
-                    self.tcp.close()
-                except OSError:
-                    pass
+                # Linux: close() alone leaves the socket listening while _tcp_loop sits in accept(), and the
+                # next up() then fails with EADDRINUSE; shutdown() wakes accept() (macOS raises ENOTCONN here)
+                for stop in (lambda: self.tcp.shutdown(socket.SHUT_RDWR), self.tcp.close):
+                    try:
+                        stop()
+                    except OSError:
+                        pass
                 self.tcp = None
             if self.http:
                 http = self.http
                 self.http = None
                 threading.Thread(target=http.shutdown, daemon=True).start()
-                try:
-                    http.server_close()
-                except OSError:
-                    pass
+                for stop in (lambda: http.socket.shutdown(socket.SHUT_RDWR), http.server_close):   # same as TCP above
+                    try:
+                        stop()
+                    except OSError:
+                        pass
             for s in list(self.dev._http_sockets):
                 try:
                     s.shutdown(socket.SHUT_RDWR)

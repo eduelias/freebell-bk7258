@@ -26,7 +26,7 @@ def test_sleep_rtc_wake_cycle(fast_sim, sink):
     assert r == "ok\n[pwr] sleeping in 10 s: wake on button, usb plug, uart rx, rtc in 1 min (cancel: pwr sleep off)"
     mark = sink.mark()
     assert wait_until(lambda: not port_open(sim.tcp), 5), "TCP port still open after sleepnow (10 s at 20x)"
-    assert not port_open(sim.http)
+    assert wait_until(lambda: not port_open(sim.http), 2), "HTTP port still open after sleep (closed right after TCP)"
     assert sim.ctl_cmd("sim status").startswith("ok\n[sim] asleep ")
     assert wait_until(lambda: port_open(sim.tcp), 10), "device did not wake (60 s rtc at 20x)"
     boot = sink.wait_for("boot", 5, since=mark)
