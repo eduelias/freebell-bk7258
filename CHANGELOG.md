@@ -17,7 +17,8 @@ report JSON and in `sys info`). Dates are 2026 unless stated; most of this was w
   frame has the sky back in it). No SDK patch.
   The H.264 per-macroblock budgets (`rtsp q`, 120/24) are scaled by 720/1024 in full mode so an
   access unit keeps the 720p byte size: unscaled, 2 of 8 night keyframes passed the 96 KB RTSP cap
-  and were dropped. Deployed 2026-11-09 with `cam fov full` (the 720p/304 crop is the same picture
+  and were dropped. The first IDR after an H.264 open still carries the SDK preset and is dropped
+  (`big 1` per open); PLAY forces a new IDR, so nobody sees it. Deployed 2026-11-09 with `cam fov full` (the 720p/304 crop is the same picture
   minus the top 304 rows; both verified at night, a daylight dusk check is still open).
 
 ## 0.29.0

@@ -277,6 +277,10 @@ H.264: the `rtsp q` budgets are bits per macroblock, chosen for 720p's 3600 MB; 
 5120 and at 120 bits/MB a noisy night IDR passed `RTSP_FRAME_MAX` (96 KB) and was dropped (2 of 8
 keyframes on 2026-11-09). `cam_h264_apply_q()` therefore scales both budgets by 720/height, so an
 access unit keeps its 720p byte size (the same bitrate spread over more macroblocks).
+The one frame that escapes this is the first IDR after an H.264 open: the SDK applies its own
+preset (160/60) at the first frame and refuses a budget until then, and 5120 MB x 160 bits is
+~102 KB, so `rtsp status` shows `big 1` per open. No client is playing at that moment and every
+PLAY forces a fresh IDR, so it costs nothing visible; it is counted, not hidden.
 
 Deployed 2026-11-09 evening: `cam fov full`. Compared at night: the full frame is the 720p/304
 crop plus the 304 sky rows above it at the same pixel density, so a face at the doorstep is as
