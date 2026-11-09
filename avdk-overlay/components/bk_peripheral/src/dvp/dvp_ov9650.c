@@ -106,11 +106,32 @@ int ov9650_init(void)
 	return 0;
 }
 
+/* fw 0.30: two readouts of the same SXGA timing. The init table ends with the 1280x720 window (rows
+ * 6..364 in the 2-row units of the vertical counter, i.e. the top 720 of the 1024 rows); 1280x1024
+ * reopens the window to the SXGA table's own 6..516 = the sensor's whole field of view (5:4). The
+ * frame period is the same (windowing only masks rows), so the frame rate does not change. The DVP
+ * driver validates a non-default size against ppi_cap and has no 1280x1024 bit, so 1280x1024 is the
+ * driver's def_ppi and 1280x720 the capability bit (dvp_sensor_ov9650 below). */
+#define OV9650_PPI_1280X1024 ((media_ppi_t)((1280u << 16) | 1024u))
 int ov9650_set_ppi(media_ppi_t ppi)
 {
-	/* the init table already selects 1280x720; the vendor driver accepts 1280x720 and 800x480 */
+	uint8_t vstop;
+
 	LOGI("%s %ux%u\n", __func__, ppi >> 16, ppi & 0xffff);
-	return (ppi == PPI_1280X720 || ppi == PPI_800X480) ? 0 : -1;
+	if (ppi == PPI_1280X720)
+		vstop = 0x5b;    /* 364: the table's own 720-row window */
+	else if (ppi == OV9650_PPI_1280X1024)
+		vstop = 0x81;    /* 516: all 1024 rows (the SXGA table's window) */
+	else
+		return -1;
+	SENSOR_I2C_WRITE(0x19, 0x01);   /* VSTRT[9:2] = 6 >> 2 */
+	rtos_delay_milliseconds(1);
+	SENSOR_I2C_WRITE(0x1a, vstop);  /* VSTOP[9:2] */
+	rtos_delay_milliseconds(1);
+	SENSOR_I2C_WRITE(0x03, 0x12);   /* VREF: VSTRT[1:0] = 2, VSTOP[1:0] = 0, bit 4 as in the table */
+	rtos_delay_milliseconds(1);
+	BK_LOGW(TAG, "%s %ux%u: vstop 0x%02x\n", __func__, ppi >> 16, ppi & 0xffff, vstop);
+	return 0;
 }
 
 /* Scene hint from CPU0 (fw 0.27): the application packs it into media_camera_device_t.info.fps,
@@ -318,10 +339,10 @@ const dvp_sensor_config_t dvp_sensor_ov9650 =
 	.fmt = PIXEL_FMT_YUYV,
 	.vsync = SYNC_HIGH_LEVEL,
 	.hsync = SYNC_HIGH_LEVEL,
-	.def_ppi = PPI_1280X720,
+	.def_ppi = OV9650_PPI_1280X1024,   /* fw 0.30: full array as the default (no cap bit exists for it) ... */
 	.def_fps = FPS15,
 	.fps_cap = FPS15,
-	.ppi_cap = PPI_CAP_1280X720,
+	.ppi_cap = PPI_CAP_1280X720,       /* ... and the 720-row window as the capability the driver checks */
 	.id = ID_OV9650,
 	.address = (OV9650_WRITE_ADDRESS >> 1),
 	.init = ov9650_init,

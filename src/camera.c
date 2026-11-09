@@ -75,6 +75,14 @@ enum { CAM_SCENE_AUTO = 0, CAM_SCENE_DAY = 1, CAM_SCENE_NIGHT = 2, CAM_SCENE_STO
 #define OV9650_WIN_MAGIC 0x96           /* same value as avdk-overlay/.../dvp_ov9650.c: d_info.fps marker */
 #define CAM_WIN_MAX_ROWS 304            /* (1024 - 720) sensor rows below the stock window */
 static uint32_t s_cam_win_rows;         /* `cam win ROWS`: how far below the top of the sensor the 720-row window starts */
+#define KV_CAM_FOV "db_cam_fov"         /* fw 0.30: "full" = 1280x1024 full-array readout, else "crop" = 1280x720 window (+ cam win) */
+#define CAM_FULL_W 1280
+#define CAM_FULL_H 1024
+#define CAM_CROP_W 1280
+#define CAM_CROP_H 720
+static bool s_cam_full;                 /* `cam fov full`: read all 1024 rows of the OV9650 (5:4), the sensor's whole field of view */
+static inline uint32_t cam_frame_w(void) { return s_cam_full ? CAM_FULL_W : CAM_CROP_W; }
+static inline uint32_t cam_frame_h(void) { return s_cam_full ? CAM_FULL_H : CAM_CROP_H; }
 #define KV_IRCUT "db_ircut"             /* "day" | "night": the last IR-cut pulse applied */
 #define PIN_IRCUT_DAY BOARD_PIN_IRCUT_DAY
 #define PIN_IRCUT_NIGHT BOARD_PIN_IRCUT_NIGHT
@@ -251,7 +259,8 @@ static uint32_t cam_exp_class(uint32_t mv)
 	 * +1 class (x4 rows) per 152 rows of offset; a sunny overshoot comes down within ~1 s. */
 	{
 		uint32_t c = mv < 700 ? 16 : mv < 850 ? 18 : mv < 1000 ? 20 : mv < 1200 ? 22 : 24;   /* 1, 4, 16, 64, 256 rows */
-		c += s_cam_win_rows / 152;
+		if (!s_cam_full)   /* the full-array frame has the sky in it again: the table as measured */
+			c += s_cam_win_rows / 152;
 		return c > 26 ? 26 : c;
 	}
 }
@@ -328,7 +337,7 @@ static int cam_open_locked(uint32_t w, uint32_t h, bool h264)
 	/* fw 0.29: vertical window offset for the CPU1 OV9650 driver. The stock table reads the 720 rows
 	 * from the top of the 1024-row array; on the wall that is mostly sky. d_info is unused by the DVP
 	 * path and crosses the mailbox untouched; the driver moves VSTART/VSTOP by this many 2-row units. */
-	if (s_cam_win_rows) {
+	if (s_cam_win_rows && !s_cam_full) {   /* fw 0.30: full-array readout has no spare rows to pan over */
 		dev.d_info.fps = (frame_fps_t)OV9650_WIN_MAGIC;
 		dev.d_info.resolution.height = s_cam_win_rows / 2;
 	}
@@ -421,14 +430,17 @@ static int cam_h264_apply_q(void)
 	r.qp.i_max_qp = 45;
 	r.qp.p_min_qp = 10;
 	r.qp.p_max_qp = 45;
-	r.imb_bits = s_h264_imb;
-	r.pmb_bits = s_h264_pmb;
+	/* fw 0.30: the budgets are per macroblock and were chosen for 720p (3600 MB); the full-array frame
+	 * has 5120, and at 120 bits/MB a noisy night IDR passed RTSP_FRAME_MAX (96 KB: 2 of 8 keyframes
+	 * dropped, measured 2026-11-09). Scale by 720/height so the bits per frame stay as at 720p. */
+	r.imb_bits = s_h264_imb * CAM_CROP_H / (s_cam_h ? s_cam_h : cam_frame_h());
+	r.pmb_bits = s_h264_pmb * CAM_CROP_H / (s_cam_h ? s_cam_h : cam_frame_h());
 	for (tries = 0; tries < 3 && ret != BK_OK; tries++) {
 		ret = media_app_set_compression_ratio(&r);
 		if (ret != BK_OK)
 			rtos_delay_milliseconds(150);
 	}
-	os_printf("[cam] h264 q imb %u pmb %u -> %d\r\n", s_h264_imb, s_h264_pmb, ret);
+	os_printf("[cam] h264 q imb %u pmb %u (set %u %u) -> %d\r\n", (unsigned)r.imb_bits, (unsigned)r.pmb_bits, s_h264_imb, s_h264_pmb, ret);
 	return ret;
 }
 
@@ -466,7 +478,7 @@ int cam_want_jpeg(void)
 		}
 		cam_close_locked();
 	}
-	ret = cam_open_locked(1280, 720, false);
+	ret = cam_open_locked(cam_frame_w(), cam_frame_h(), false);
 out:
 	rtos_unlock_mutex(&s_cam_ctl);
 	return ret;
@@ -487,7 +499,7 @@ int rtsp_cam_acquire(void)
 		if (s_cam_open && !s_cam_h264)
 			cam_close_locked();
 		if (!s_cam_open)
-			ret = cam_open_locked(1280, 720, true);
+			ret = cam_open_locked(cam_frame_w(), cam_frame_h(), true);
 		if (ret == 0) {
 			for (w = 0; w < 300 && s_cam_h264_frames == 0; w++)   /* first access unit ~1 s after open */
 				rtos_delay_milliseconds(10);
@@ -592,7 +604,7 @@ void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 		/* cam open | open h264 | open W H | open W H h264 */
 		bool h264 = os_strcmp(argv[argc - 1], "h264") == 0;
 		int dims = argc - 2 - (h264 ? 1 : 0), ret;
-		uint32_t w = dims >= 2 ? os_strtoul(argv[2], NULL, 10) : 1280, h = dims >= 2 ? os_strtoul(argv[3], NULL, 10) : 720;
+		uint32_t w = dims >= 2 ? os_strtoul(argv[2], NULL, 10) : cam_frame_w(), h = dims >= 2 ? os_strtoul(argv[3], NULL, 10) : cam_frame_h();
 		rtos_lock_mutex(&s_cam_ctl);
 		if (s_cam_open && s_cam_h264 != h264)
 			cam_close_locked();
@@ -607,12 +619,12 @@ void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 	} else if (argc >= 2 && os_strcmp(argv[1], "stat") == 0) {
 		static const char *const pref[] = {"auto", "jpeg", "h264"};
 		REPLY("[cam] open %d %s (mode %s) frames %u h264 %u dropped %u last jpeg %u bytes %ux%u seq %u age %u ms"
-		      " | scene %s (%s, %u mV, exp %u) open_frames %u settled %c@%u ms wait %u ms x%u settle %u/%u ms/%u%% ircut %s win %u\r\n", s_cam_open,
+		      " | scene %s (%s, %u mV, exp %u) open_frames %u settled %c@%u ms wait %u ms x%u settle %u/%u ms/%u%% ircut %s win %u fov %s\r\n", s_cam_open,
 		      s_cam_open ? (s_cam_h264 ? "h264" : "jpeg") : "-", pref[s_cam_pref], s_cam_frames, s_cam_h264_frames,
 		      s_cam_drop, s_cam_len, s_cam_w, s_cam_h, s_cam_seq, s_cam_last_ms ? rtos_get_time() - s_cam_last_ms : 0,
 		      s_cam_scene ? cam_scene_name(s_cam_scene) : "stock", cam_scene_name(s_cam_scene_pref), s_cam_open_mv, s_cam_exp_class, s_cam_open_frames,
 		      s_cam_settle_how, s_cam_settled_ms, s_cam_settle_wait_ms, s_cam_settle_waits, s_cam_settle_n, s_cam_settle_ms, s_cam_settle_pct,
-		      s_ircut_state < 0 ? "unknown" : cam_scene_name(s_ircut_state), (unsigned)s_cam_win_rows);
+		      s_ircut_state < 0 ? "unknown" : cam_scene_name(s_ircut_state), (unsigned)s_cam_win_rows, s_cam_full ? "full" : "crop");
 	} else if (argc >= 2 && os_strcmp(argv[1], "settle") == 0) {   /* cam settle [N [MS [PCT]]] */
 		char buf[32];
 		if (argc >= 3) {
@@ -629,6 +641,17 @@ void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 			kv_set_str(KV_CAM_SETTLE, buf);
 		}
 		REPLY("[cam] settle %u frames, cap %u ms, stable < %u %% (applies at the next open)\r\n", s_cam_settle_n, s_cam_settle_ms, s_cam_settle_pct);
+	} else if (argc >= 2 && os_strcmp(argv[1], "fov") == 0) {   /* cam fov [crop|full]: 1280x720 window or the whole 1280x1024 array */
+		if (argc >= 3) {
+			if (os_strcmp(argv[2], "crop") != 0 && os_strcmp(argv[2], "full") != 0) {
+				REPLY("cam fov crop|full (crop = 1280x720 window, panned with cam win; full = all 1024 rows of the sensor, 5:4)\r\n");
+				return;
+			}
+			s_cam_full = os_strcmp(argv[2], "full") == 0;
+			kv_set_str(KV_CAM_FOV, argv[2]);
+		}
+		REPLY("[cam] fov %s (%ux%u%s; applies at the next open%s)\r\n", s_cam_full ? "full" : "crop", (unsigned)cam_frame_w(), (unsigned)cam_frame_h(),
+		      s_cam_full ? ", cam win ignored" : "", s_cam_open ? ", the camera is open now: cam close first" : "");
 	} else if (argc >= 2 && os_strcmp(argv[1], "win") == 0) {   /* cam win [ROWS]: start the 720-row window ROWS below the top of the sensor */
 		char buf[8];
 		if (argc >= 3) {
@@ -643,8 +666,8 @@ void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 			snprintf(buf, sizeof(buf), "%u", (unsigned)s_cam_win_rows);
 			kv_set_str(KV_CAM_WIN, buf);
 		}
-		REPLY("[cam] win %u rows below the top of the sensor (0-%u; applies at the next open%s)\r\n", (unsigned)s_cam_win_rows, CAM_WIN_MAX_ROWS,
-		      s_cam_open ? ", the camera is open now: cam close first" : "");
+		REPLY("[cam] win %u rows below the top of the sensor (0-%u; applies at the next open%s%s)\r\n", (unsigned)s_cam_win_rows, CAM_WIN_MAX_ROWS,
+		      s_cam_open ? ", the camera is open now: cam close first" : "", s_cam_full ? "; ignored while cam fov full" : "");
 	} else if (argc >= 2 && os_strcmp(argv[1], "scene") == 0) {   /* cam scene auto|day|night|stock */
 		if (argc >= 3) {
 			int sc = os_strcmp(argv[2], "auto") == 0 ? CAM_SCENE_AUTO : os_strcmp(argv[2], "day") == 0 ? CAM_SCENE_DAY :
@@ -798,6 +821,8 @@ void camera_init(void)   /* KV settings, the HTTP server, RTSP when enabled */
 			s_cam_settle_pct = pct;
 		}
 	}
+	if (kv_get_str(KV_CAM_FOV, v, sizeof(v)))
+		s_cam_full = os_strcmp(v, "full") == 0;
 	if (kv_get_str(KV_CAM_WIN, v, sizeof(v)) && os_strtoul(v, NULL, 10) <= CAM_WIN_MAX_ROWS)
 		s_cam_win_rows = os_strtoul(v, NULL, 10) & ~1u;
 	if (kv_get_str(KV_CAM_SCENE, v, sizeof(v)))

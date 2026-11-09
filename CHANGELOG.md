@@ -4,6 +4,22 @@ Versions are the `FW_VERSION` in `src/version.h` (`project/main/app_main.c` befo
 report JSON and in `sys info`). Dates are 2026 unless stated; most of this was written between 2026-10-01 and
 2026-10-03.
 
+## 0.30.0
+- **Full field of view: `cam fov crop|full`** (KV `db_cam_fov`, default crop). `full` reads all 1024 rows
+  of the OV9650 (1280x1024, 5:4) instead of the 720-row window: the whole field of view of the lens
+  at the same pixel density, so a face is as large as before and the frame simply gains the rows the
+  720p crop could only pan over. The frame period is that of the SXGA timing in both modes, so the
+  frame rate is unchanged; JPEGs are ~40 % larger (~70 KB), H.264 I-frames too (IMB 120: 77 KB,
+  inside the 128 KB CPU1 buffer). The DVP driver validates a non-default size against the sensor's
+  capability bits and the SDK has no 1280x1024 bit, so the overlay driver declares 1280x1024 as its
+  default size and 1280x720 as the capability; `set_ppi()` writes VSTRT/VSTOP/VREF for either.
+  `cam win` only applies to crop. The start-exposure bias of 0.29 applies to crop only (the full
+  frame has the sky back in it). No SDK patch.
+  The H.264 per-macroblock budgets (`rtsp q`, 120/24) are scaled by 720/1024 in full mode so an
+  access unit keeps the 720p byte size: unscaled, 2 of 8 night keyframes passed the 96 KB RTSP cap
+  and were dropped. Deployed 2026-11-09 with `cam fov full` (the 720p/304 crop is the same picture
+  minus the top 304 rows; both verified at night, a daylight dusk check is still open).
+
 ## 0.29.0
 - **Vertical window offset: `cam win ROWS`** (KV `db_cam_win`, 0-304, default 0). The OV9650 has 1024
   rows and the stock register table reads the 1280x720 frame from the top of the array (VSTART 6,

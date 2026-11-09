@@ -257,6 +257,32 @@ struct through the mailbox whole and `media_app_camera_open()` only rewrites `uv
 `0x19/0x1a/0x03` right after the init table. Applies at the next open (every wake opens the
 camera cold).
 
+## Full field of view: 1280x1024 (v0.30.0, `cam fov full`)
+
+`cam fov full` (KV `db_cam_fov`) reads the whole array: `set_ppi()` writes VSTOP `0x1a = 0x81`
+(VSTRT `0x19 = 0x01`, VREF `0x03 = 0x12`), the SXGA table's own window 6..516 = 1024 rows; `crop`
+writes the table's `0x5b` (720 rows) and `cam win` then pans it. Same SXGA frame timing, so the
+frame rate does not move; the pixel density is the same, the frame only grows by the 304 rows the
+crop had to choose between. Costs: JPEG ~70 KB instead of ~50 KB, 5:4 pictures and stream
+(Home Assistant's generic camera, go2rtc and the local_file cameras do not care), the H.264
+encoder accepts 1024 (height % 16 == 0; IMB 120 x 5120 macroblocks = 77 KB I-frames, buffer
+128 KB). The DVP driver only accepts a size that is either the sensor's `def_ppi` or has a
+`ppi_cap` bit, and the SDK has no 1280x1024 bit: the overlay driver therefore declares 1280x1024
+as `def_ppi` and `PPI_CAP_1280X720` as the capability, and the driver's fallback for an unknown
+size is now the full array. The zone scorer's polygon (fractions of the frame height) has to be
+re-mapped when the frame changes: full = the stock crop plus 304 rows at the bottom, so
+`y_full = y_stock * 720 / 1024`.
+
+H.264: the `rtsp q` budgets are bits per macroblock, chosen for 720p's 3600 MB; the full frame has
+5120 and at 120 bits/MB a noisy night IDR passed `RTSP_FRAME_MAX` (96 KB) and was dropped (2 of 8
+keyframes on 2026-11-09). `cam_h264_apply_q()` therefore scales both budgets by 720/height, so an
+access unit keeps its 720p byte size (the same bitrate spread over more macroblocks).
+
+Deployed 2026-11-09 evening: `cam fov full`. Compared at night: the full frame is the 720p/304
+crop plus the 304 sky rows above it at the same pixel density, so a face at the doorstep is as
+readable as in the crop. Not yet seen: a daylight/dusk open in full mode (the AE now averages the
+sky in again; the 0.29 start-exposure bias is off in full mode).
+
 ## Debug: reading CPU1 counters from CPU0
 
 `mem HEXADDR [N]` reads raw 32-bit words. CPU1's `media_debug_t` counters are reachable from CPU0

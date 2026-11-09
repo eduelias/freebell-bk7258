@@ -537,6 +537,7 @@ class Device:
         self.ircut = kv("db_ircut", "")
         self.cam_exp_fixed = int(kv("db_cam_exp", "0"))
         self.cam_win_rows = int(kv("db_cam_win", "0")) & ~1   # fw 0.29: vertical window offset in sensor rows (0-304)
+        self.cam_full = kv("db_cam_fov", "crop") == "full"   # fw 0.30: 1280x1024 full-array readout
         self.fx_enabled = kv("db_fx", "1") != "0"
         self.light_chan = int(kv("db_light_chan", "14"))
         self.pir_on = kv("db_pir_on", "1") != "0"
@@ -1717,7 +1718,7 @@ class Device:
         elif len(argv) >= 2 and argv[1] == "open":
             h264 = argv[-1] == "h264"
             dims = len(argv) - 2 - (1 if h264 else 0)
-            w, h = (int(argv[2]), int(argv[3])) if dims >= 2 and argv[2].isdigit() and argv[3].isdigit() else (1280, 720)
+            w, h = (int(argv[2]), int(argv[3])) if dims >= 2 and argv[2].isdigit() and argv[3].isdigit() else (1280, 1024 if self.cam_full else 720)
             ret = self.cam_open(w, h, h264)
             r.add("[cam] open %ux%u %s -> %d%s\r\n" % (w, h, "h264" if h264 else "jpeg", ret, " (open)" if self.cam.open else ""))
         elif len(argv) >= 2 and argv[1] == "close":
@@ -1726,11 +1727,11 @@ class Device:
         elif len(argv) >= 2 and argv[1] == "stat":
             c = self.cam
             r.add("[cam] open %d %s (mode %s) frames %u h264 %u dropped %u last jpeg %u bytes %ux%u seq %u age %u ms"
-                  " | scene %s (%s, %u mV, exp %u) open_frames %u settled %s@%u ms wait %u ms x%u settle %u/%u ms/%u%% ircut %s win %u\r\n" % (
+                  " | scene %s (%s, %u mV, exp %u) open_frames %u settled %s@%u ms wait %u ms x%u settle %u/%u ms/%u%% ircut %s win %u fov %s\r\n" % (
                 int(c.open), ("h264" if c.h264 else "jpeg") if c.open else "-", ("auto", "jpeg", "h264")[c.pref], c.frames,
                 c.h264_frames, c.drop, len(c.jpeg), c.w, c.h, c.seq, self.clock.now_ms() - c.last_ms if c.last_ms else 0,
                 c.scene, self.cam_scene_pref, c.open_mv, c.exp_class, c.open_frames, c.settle_how, c.settled_ms, c.wait_ms, c.waits,
-                self.cam_settle[0], self.cam_settle[1], self.cam_settle[2], self.ircut or "unknown", self.cam_win_rows))
+                self.cam_settle[0], self.cam_settle[1], self.cam_settle[2], self.ircut or "unknown", self.cam_win_rows, "full" if self.cam_full else "crop"))
         elif len(argv) >= 2 and argv[1] == "settle":
             if len(argv) >= 3:
                 vals = [int(x) if x.isdigit() else -1 for x in argv[2:5]] + list(self.cam_settle[len(argv) - 2:])
@@ -1741,6 +1742,16 @@ class Device:
                 self.cam_settle = (n, ms, pct)
                 self.store.kv_set("db_cam_settle", "%u %u %u" % self.cam_settle)
             r.add("[cam] settle %u frames, cap %u ms, stable < %u %% (applies at the next open)\r\n" % self.cam_settle)
+        elif len(argv) >= 2 and argv[1] == "fov":   # fw 0.30: cam fov [crop|full]
+            if len(argv) >= 3:
+                if argv[2] not in ("crop", "full"):
+                    r.add("cam fov crop|full (crop = 1280x720 window, panned with cam win; full = all 1024 rows of the sensor, 5:4)\r\n")
+                    return
+                self.cam_full = argv[2] == "full"
+                self.store.kv_set("db_cam_fov", argv[2])
+            r.add("[cam] fov %s (%ux%u%s; applies at the next open%s)\r\n" % (
+                "full" if self.cam_full else "crop", 1280, 1024 if self.cam_full else 720, ", cam win ignored" if self.cam_full else "",
+                ", the camera is open now: cam close first" if self.cam.open else ""))
         elif len(argv) >= 2 and argv[1] == "win":   # fw 0.29: cam win [ROWS]
             if len(argv) >= 3:
                 if not argv[2].isdigit() or int(argv[2]) > 304:
@@ -1748,8 +1759,9 @@ class Device:
                     return
                 self.cam_win_rows = int(argv[2]) & ~1
                 self.store.kv_set("db_cam_win", str(self.cam_win_rows))
-            r.add("[cam] win %u rows below the top of the sensor (0-304; applies at the next open%s)\r\n" % (
-                self.cam_win_rows, ", the camera is open now: cam close first" if self.cam.open else ""))
+            r.add("[cam] win %u rows below the top of the sensor (0-304; applies at the next open%s%s)\r\n" % (
+                self.cam_win_rows, ", the camera is open now: cam close first" if self.cam.open else "",
+                "; ignored while cam fov full" if self.cam_full else ""))
         elif len(argv) >= 2 and argv[1] == "scene":
             if len(argv) >= 3:
                 if argv[2] not in ("auto", "day", "night", "stock"):
