@@ -235,10 +235,47 @@ static const uint8_t ov9650_night_regs[][2] = {
 	{0x3a, 0x11}, {0x67, 0x80}, {0x68, 0x80},
 };
 
+/* Vertical window offset (fw 0.29): the stock table reads 1280x720 from the top of the sensor's
+ * 1024-row array (VSTART 6, VSTOP 364 in the 2-row units the SXGA vertical counter uses, VREF
+ * 0x03 = 0x12), which on the wall gives a frame that is mostly sky with the visitor's face at the
+ * bottom edge. CPU0 can ask for the window to start lower: it puts OV9650_WIN_MAGIC in
+ * media_camera_device_t.d_info.fps and the offset in 2-row units (0..152 = 0..304 rows) in
+ * d_info.resolution.height; the DVP path never looks at d_info for a DVP sensor and camera_act.c
+ * copies the whole struct through the mailbox (media_app_camera_open() only rewrites
+ * uvc_device[0]). Applied right after the init table, before the scene registers. Both start and
+ * stop move, so the frame stays 720 rows and the pipeline is unchanged. */
+#define OV9650_WIN_MAGIC    0x96
+#define OV9650_WIN_VSTART   6u
+#define OV9650_WIN_VSTOP    364u
+#define OV9650_WIN_MAX_UNITS 152u   /* (1024 - 720) / 2 */
+static void ov9650_window(void)
+{
+	const media_camera_device_t *dev = bk_dvp_camera_get_device();
+	uint32_t off, vs, ve;
+
+	if (!dev || ((uint32_t)dev->d_info.fps & 0xff) != OV9650_WIN_MAGIC)
+		return;
+	off = dev->d_info.resolution.height;
+	if (off > OV9650_WIN_MAX_UNITS)
+		off = OV9650_WIN_MAX_UNITS;
+	if (!off)
+		return;   /* the table's own window */
+	vs = OV9650_WIN_VSTART + off;
+	ve = OV9650_WIN_VSTOP + off;
+	SENSOR_I2C_WRITE(0x19, (vs >> 2) & 0xff);   /* VSTRT[9:2] */
+	rtos_delay_milliseconds(1);
+	SENSOR_I2C_WRITE(0x1a, (ve >> 2) & 0xff);   /* VSTOP[9:2] */
+	rtos_delay_milliseconds(1);
+	SENSOR_I2C_WRITE(0x03, 0x10 | ((ve & 3) << 2) | (vs & 3));   /* VREF: bit 4 as in the table, [3:2] VSTOP[1:0], [1:0] VSTRT[1:0] */
+	rtos_delay_milliseconds(1);
+	BK_LOGW(TAG, "window +%u rows: vstart %u vstop %u (2-row units)\n", off * 2, vs, ve);
+}
+
 int ov9650_set_fps(frame_fps_t fps)
 {
 	uint32_t v = (uint32_t)fps & 0xff;
 
+	ov9650_window();
 	ov9650_gen++;   /* retire the trace thread of the previous open before anything is programmed */
 	ov9650_manual_first = false;
 	ov9650_dbg[0] = 0x96500000u | v;

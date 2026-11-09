@@ -1,0 +1,15 @@
+diff --git a/middleware/driver/camera/dvp_camera.c b/middleware/driver/camera/dvp_camera.c
+index 794d1fbb..405ba283 100755
+--- a/middleware/driver/camera/dvp_camera.c
++++ b/middleware/driver/camera/dvp_camera.c
+@@ -2090,7 +2090,9 @@ bk_err_t bk_dvp_camera_driver_deinit(void)
+ 
+ media_camera_device_t *bk_dvp_camera_get_device(void)
+ {
+-	if (dvp_state == MASTER_TURN_ON)
++	/* also while turning on: the sensor driver's init/set_ppi/set_fps run before the state flips,
++	 * and a driver may read application fields of the device struct there (freebell-bk7258) */
++	if ((dvp_state == MASTER_TURN_ON || dvp_state == MASTER_TURNING_ON) && dvp_camera_config)
+ 		return dvp_camera_config->device;
+ 	else
+ 		return NULL;

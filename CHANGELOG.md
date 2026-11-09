@@ -4,6 +4,23 @@ Versions are the `FW_VERSION` in `src/version.h` (`project/main/app_main.c` befo
 report JSON and in `sys info`). Dates are 2026 unless stated; most of this was written between 2026-10-01 and
 2026-10-03.
 
+## 0.29.0
+- **Vertical window offset: `cam win ROWS`** (KV `db_cam_win`, 0-304, default 0). The OV9650 has 1024
+  rows and the stock register table reads the 1280x720 frame from the top of the array (VSTART 6,
+  VSTOP 364 in the sensor's 2-row units), so on the wall the picture was mostly sky and a visitor's
+  face sat at the bottom edge. The window can now start up to 304 rows lower (the unused rows), which
+  pans the view down by up to 42 % of the frame height at the same resolution; the sensor has no
+  scaler at 720p, so a wider field of view would need a 640x480 (4:3) mode instead. CPU0 hands the
+  offset to the CPU1 sensor driver in `media_camera_device_t.d_info` (unused by the DVP path, copied
+  through the mailbox untouched; `d_info.fps` = 0x96 marks it), the driver writes VSTRT/VSTOP/VREF
+  right after the init table. Applies at the next open (every wake is one). No SDK patch: the SDK's
+  `bk_dvp_camera_get_device()` exposes the struct on CPU1. Mirror/flip (MVFP 0x1e = 0x34 in the
+  table) is right for the mounted sensor and stays as it is.
+  Side effect handled: the day start-exposure class (`cam_exp_class()`, measured for the sky-heavy
+  stock frame) is raised by one class (x4 rows) per 152 rows of offset, because the ground-only frame
+  converges a stop or two higher (measured 2026-11-09 at dusk: luma 45 at the settle gate, 87
+  converged); `cam exp N` still overrides it. The light-to-class table itself was not re-measured.
+
 ## 0.28.1
 - **Rescue mode: boot-loop protection for OTA updates** (`src/rescue.c`). The bootloader installs an
   update over the running image and has no rollback, so an image that crashes at every boot needed

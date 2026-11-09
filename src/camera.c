@@ -71,6 +71,10 @@ enum { CAM_SCENE_AUTO = 0, CAM_SCENE_DAY = 1, CAM_SCENE_NIGHT = 2, CAM_SCENE_STO
 #define CAM_EXP_ROWS(c) ((c) >= 16 ? (1u << ((c) - 16 > 10 ? 10 : (c) - 16)) : (c) ? (1u << (((c) > 11 ? 11 : (c)) - 1)) : 4u)
 #define KV_CAM_SCENE "db_cam_scene"
 #define KV_CAM_SETTLE "db_cam_settle"   /* "N MS PCT" */
+#define KV_CAM_WIN "db_cam_win"         /* fw 0.29: vertical window offset in sensor rows (0-304, even), see cam_open_locked() */
+#define OV9650_WIN_MAGIC 0x96           /* same value as avdk-overlay/.../dvp_ov9650.c: d_info.fps marker */
+#define CAM_WIN_MAX_ROWS 304            /* (1024 - 720) sensor rows below the stock window */
+static uint32_t s_cam_win_rows;         /* `cam win ROWS`: how far below the top of the sensor the 720-row window starts */
 #define KV_IRCUT "db_ircut"             /* "day" | "night": the last IR-cut pulse applied */
 #define PIN_IRCUT_DAY BOARD_PIN_IRCUT_DAY
 #define PIN_IRCUT_NIGHT BOARD_PIN_IRCUT_NIGHT
@@ -241,11 +245,15 @@ static uint32_t cam_exp_class(uint32_t mv)
 	 * then take over. Measured 2026-10-05 (sunny, 515-663 mV): the AEC settles at 1 row, gain 1x;
 	 * started there the first frame is right and the AEC stays put, whereas any AEC-on start
 	 * overshoots to ~130 rows on the dark start-up frames and needs ~4 s to come back. */
-	if (mv < 700) return 16;    /* 1 row */
-	if (mv < 850) return 18;    /* 4 */
-	if (mv < 1000) return 20;   /* 16 */
-	if (mv < 1200) return 22;   /* 64 */
-	return 24;                  /* 256 */
+	/* fw 0.29: the table was measured with the stock window (top of the sensor = mostly sky); a
+	 * lowered window (`cam win`) frames the ground, a stop or two darker, and the AEC climbs slowly
+	 * from a short start (2026-11-09 16:24, 693 mV, win 304: luma 45 at the gate, 87 converged).
+	 * +1 class (x4 rows) per 152 rows of offset; a sunny overshoot comes down within ~1 s. */
+	{
+		uint32_t c = mv < 700 ? 16 : mv < 850 ? 18 : mv < 1000 ? 20 : mv < 1200 ? 22 : 24;   /* 1, 4, 16, 64, 256 rows */
+		c += s_cam_win_rows / 152;
+		return c > 26 ? 26 : c;
+	}
 }
 
 static const char *cam_scene_name(int scene)
@@ -317,6 +325,13 @@ static int cam_open_locked(uint32_t w, uint32_t h, bool h264)
 	dev.fmt = h264 ? PIXEL_FMT_H264 : PIXEL_FMT_JPEG;
 	dev.info.resolution.width = w;
 	dev.info.resolution.height = h;
+	/* fw 0.29: vertical window offset for the CPU1 OV9650 driver. The stock table reads the 720 rows
+	 * from the top of the 1024-row array; on the wall that is mostly sky. d_info is unused by the DVP
+	 * path and crosses the mailbox untouched; the driver moves VSTART/VSTOP by this many 2-row units. */
+	if (s_cam_win_rows) {
+		dev.d_info.fps = (frame_fps_t)OV9650_WIN_MAGIC;
+		dev.d_info.resolution.height = s_cam_win_rows / 2;
+	}
 	/* scene hint for the CPU1 sensor driver, see the block comment above cam_frame_cb() */
 	s_cam_exp_class = scene == CAM_SCENE_DAY ? cam_exp_class(mv) : 0;
 	dev.info.fps = (frame_fps_t)(FPS15 | (scene == CAM_SCENE_DAY ? (OV9650_SCENE_DAY | OV9650_EXP_ENCODE(s_cam_exp_class)) :
@@ -592,12 +607,12 @@ void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 	} else if (argc >= 2 && os_strcmp(argv[1], "stat") == 0) {
 		static const char *const pref[] = {"auto", "jpeg", "h264"};
 		REPLY("[cam] open %d %s (mode %s) frames %u h264 %u dropped %u last jpeg %u bytes %ux%u seq %u age %u ms"
-		      " | scene %s (%s, %u mV, exp %u) open_frames %u settled %c@%u ms wait %u ms x%u settle %u/%u ms/%u%% ircut %s\r\n", s_cam_open,
+		      " | scene %s (%s, %u mV, exp %u) open_frames %u settled %c@%u ms wait %u ms x%u settle %u/%u ms/%u%% ircut %s win %u\r\n", s_cam_open,
 		      s_cam_open ? (s_cam_h264 ? "h264" : "jpeg") : "-", pref[s_cam_pref], s_cam_frames, s_cam_h264_frames,
 		      s_cam_drop, s_cam_len, s_cam_w, s_cam_h, s_cam_seq, s_cam_last_ms ? rtos_get_time() - s_cam_last_ms : 0,
 		      s_cam_scene ? cam_scene_name(s_cam_scene) : "stock", cam_scene_name(s_cam_scene_pref), s_cam_open_mv, s_cam_exp_class, s_cam_open_frames,
 		      s_cam_settle_how, s_cam_settled_ms, s_cam_settle_wait_ms, s_cam_settle_waits, s_cam_settle_n, s_cam_settle_ms, s_cam_settle_pct,
-		      s_ircut_state < 0 ? "unknown" : cam_scene_name(s_ircut_state));
+		      s_ircut_state < 0 ? "unknown" : cam_scene_name(s_ircut_state), (unsigned)s_cam_win_rows);
 	} else if (argc >= 2 && os_strcmp(argv[1], "settle") == 0) {   /* cam settle [N [MS [PCT]]] */
 		char buf[32];
 		if (argc >= 3) {
@@ -614,6 +629,22 @@ void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 			kv_set_str(KV_CAM_SETTLE, buf);
 		}
 		REPLY("[cam] settle %u frames, cap %u ms, stable < %u %% (applies at the next open)\r\n", s_cam_settle_n, s_cam_settle_ms, s_cam_settle_pct);
+	} else if (argc >= 2 && os_strcmp(argv[1], "win") == 0) {   /* cam win [ROWS]: start the 720-row window ROWS below the top of the sensor */
+		char buf[8];
+		if (argc >= 3) {
+			char *e = NULL;
+			uint32_t n = os_strtoul(argv[2], &e, 10);
+			if (!e || *e || n > CAM_WIN_MAX_ROWS) {
+				REPLY("cam win ROWS (0-%u, even: how far below the top of the sensor the 1280x720 window starts; 0 = stock, %u = bottom)\r\n",
+				      CAM_WIN_MAX_ROWS, CAM_WIN_MAX_ROWS);
+				return;
+			}
+			s_cam_win_rows = n & ~1u;
+			snprintf(buf, sizeof(buf), "%u", (unsigned)s_cam_win_rows);
+			kv_set_str(KV_CAM_WIN, buf);
+		}
+		REPLY("[cam] win %u rows below the top of the sensor (0-%u; applies at the next open%s)\r\n", (unsigned)s_cam_win_rows, CAM_WIN_MAX_ROWS,
+		      s_cam_open ? ", the camera is open now: cam close first" : "");
 	} else if (argc >= 2 && os_strcmp(argv[1], "scene") == 0) {   /* cam scene auto|day|night|stock */
 		if (argc >= 3) {
 			int sc = os_strcmp(argv[2], "auto") == 0 ? CAM_SCENE_AUTO : os_strcmp(argv[2], "day") == 0 ? CAM_SCENE_DAY :
@@ -767,6 +798,8 @@ void camera_init(void)   /* KV settings, the HTTP server, RTSP when enabled */
 			s_cam_settle_pct = pct;
 		}
 	}
+	if (kv_get_str(KV_CAM_WIN, v, sizeof(v)) && os_strtoul(v, NULL, 10) <= CAM_WIN_MAX_ROWS)
+		s_cam_win_rows = os_strtoul(v, NULL, 10) & ~1u;
 	if (kv_get_str(KV_CAM_SCENE, v, sizeof(v)))
 		s_cam_scene_pref = os_strcmp(v, "day") == 0 ? CAM_SCENE_DAY : os_strcmp(v, "night") == 0 ? CAM_SCENE_NIGHT :
 				   os_strcmp(v, "stock") == 0 ? CAM_SCENE_STOCK : CAM_SCENE_AUTO;

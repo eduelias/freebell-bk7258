@@ -235,6 +235,28 @@ engine does not restart when enabled on a correctly exposed stream. The first fr
 (~1 s after the open) is already right; what HA sees is bounded by the gate's N/2 floor (8 frames,
 ~1.9 s) and the open (~1 s), i.e. about 3 s after its request, inside the target.
 
+## Field of view: the 720p window is the top of the sensor (v0.29.0, `cam win`)
+
+The OV9650 array is 1300x1028; the stock table runs it in SXGA mode (COM7 `0x12 = 0x00`) and
+then narrows the window to 1280x720: HSTART/HSTOP `0x17/0x18 = 0x1e/0xbe` (full width) and
+VSTRT/VSTOP `0x19/0x1a = 0x01/0x5b` with VREF `0x03 = 0x12`, i.e. rows 6..364 in the 2-row units
+the SXGA vertical counter uses (the SXGA table's own window is 6..516 = 1020 rows). So the frame
+is the **top 70 %** of what the lens sees, and on the wall (camera pointing down) a snapshot is
+mostly sky with the visitor's face at the bottom edge. The picture is the right way up: MVFP
+`0x1e = 0x34` (mirror + vertical flip) matches how the sensor sits on the board.
+
+`cam win ROWS` (KV `db_cam_win`, 0-304 even, default 0 = stock) starts the window that many rows
+lower; 304 uses the bottom of the array. Both VSTRT and VSTOP move, the frame stays 1280x720 and
+the JPEG/H.264 pipeline does not know. There is no scaler in this mode, so "zoom out" at 720p is
+not possible; the full field of view would be the sensor's 640x480 (4:3) subsampled mode, a
+different pipeline configuration, not done. Plumbing: CPU0 puts `0x96` in
+`media_camera_device_t.d_info.fps` and the offset in 2-row units in `d_info.resolution.height`
+(`cam_open_locked()`); the DVP path ignores `d_info` for a DVP sensor, `camera_act.c` copies the
+struct through the mailbox whole and `media_app_camera_open()` only rewrites `uvc_device[0]`;
+`ov9650_set_fps()` reads it back with the SDK's `bk_dvp_camera_get_device()` and writes
+`0x19/0x1a/0x03` right after the init table. Applies at the next open (every wake opens the
+camera cold).
+
 ## Debug: reading CPU1 counters from CPU0
 
 `mem HEXADDR [N]` reads raw 32-bit words. CPU1's `media_debug_t` counters are reachable from CPU0
