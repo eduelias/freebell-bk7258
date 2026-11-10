@@ -4,6 +4,23 @@ Versions are the `FW_VERSION` in `src/version.h` (`project/main/app_main.c` befo
 report JSON and in `sys info`). Dates are 2026 unless stated; most of this was written between 2026-10-01 and
 2026-10-03.
 
+## 0.32.0
+- **JPEG quality: the SDK's 50 KB cap is lifted (`cam jpeg UP LOW`).** Every picture the doorbell ever
+  served was encoded at IJG quality ~20 (1280x1024) to ~25 (720p): `jpeg_hal_init()` in bk_idk turns on
+  the hardware encoder's rate control with `JPEG_BITRATE_MAX_SIZE_1280_720` = 50 KB (floor 30 KB) for any
+  1280-wide frame, and the encoder multiplies its ~Q75 base quantisation table (x5 at 1.3 MP) until the
+  frame fits, so 42-51 KB per picture whatever the scene. The only knob, `media_app_set_compression_ratio`
+  in `JPEG_MODE` (`jpeg_up`/`jpeg_low`), carried the bounds as `uint16_t` (max 63 KB): SDK patch 0013
+  widens the struct field, the API and the driver's copy to 32 bits (the HAL registers always were).
+  `cam_jpeg_apply()` now sends the bounds after every JPEG open (the SDK re-inits the encoder with its
+  defaults at each open; the driver commits them at the next frame-end ISR, so the first frame of an open
+  still carries the cap). Default 110/70 KB for the full frame, scaled by the frame height for the 720p
+  crop (77/49), KV `db_cam_jpeg`; `cam jpeg 0 0` keeps the SDK default; `cam stat` shows `jpeg UP/LOW KB
+  (bytes sent -> result)`. Pictures are about twice the size; CAM_BUF_MAX (150 KB), the 0.31 snapshot
+  client buffer (frame + 16 KB) and the SD save buffer (200 KB) all have room. Disabling the control
+  instead is not an option: the fixed base table gives ~150-200 KB at 1.3 MP, past the CPU1 frame buffer
+  (`CONFIG_JPEG_FRAME_SIZE` 150 KB = the DMA end address).
+
 ## 0.31.0
 - **A snapshot preempts a live viewer.** `GET /snapshot.jpg` while an RTSP client is playing used
   to get the last JPEG taken before the switch to H.264, or a 503 when there was none (documented

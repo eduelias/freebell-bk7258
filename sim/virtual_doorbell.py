@@ -539,6 +539,10 @@ class Device:
         self.cam_exp_fixed = int(kv("db_cam_exp", "0"))
         self.cam_win_rows = int(kv("db_cam_win", "0")) & ~1   # fw 0.29: vertical window offset in sensor rows (0-304)
         self.cam_full = kv("db_cam_fov", "crop") == "full"   # fw 0.30: 1280x1024 full-array readout
+        jq = kv("db_cam_jpeg", "110 70").split()   # fw 0.32: JPEG size bounds (KB, full frame; "0 0" = SDK default 50/30)
+        self.cam_jpeg = (int(jq[0]), int(jq[1])) if len(jq) == 2 and all(x.isdigit() for x in jq) else (110, 70)
+        self.cam_jpeg_set = (0, 0)   # bytes sent at the last JPEG open (0 = SDK default)
+        self.cam_jpeg_ret = -1
         self.fx_enabled = kv("db_fx", "1") != "0"
         self.light_chan = int(kv("db_light_chan", "14"))
         self.pir_on = kv("db_pir_on", "1") != "0"
@@ -1088,8 +1092,21 @@ class Device:
                 log.info("[cam] ir-cut -> %s (GPIO %d pulse)", scene, 54 if scene == "day" else 55)
             log.info("[cam] open %ux%u %s: rails 9/28/5/6 high, PWDN pulse, sensor ov9650 (first frame in ~1 s)", w, h,
                      "h264" if h264 else "jpeg")
+            if not h264:
+                self.cam_jpeg_apply()   # fw 0.32: lift the SDK's 50 KB JPEG cap
             self.activity()
             return 0
+
+    def cam_jpeg_apply(self) -> int:
+        """fw 0.32: send the JPEG size bounds (KB for the full frame, scaled by the frame height) to the encoder."""
+        self.cam_jpeg_set = (0, 0)
+        if not self.cam_jpeg[0]:
+            return 0
+        h = self.cam.h or (1024 if self.cam_full else 720)
+        self.cam_jpeg_set = (self.cam_jpeg[0] * 1024 * h // 1024, self.cam_jpeg[1] * 1024 * h // 1024)
+        self.cam_jpeg_ret = 0
+        log.info("[cam] jpeg bounds %u/%u KB (frame %u rows: %u/%u bytes) -> 0", self.cam_jpeg[0], self.cam_jpeg[1], h, *self.cam_jpeg_set)
+        return 0
 
     def cam_close(self) -> None:
         with self.lock:
@@ -1742,11 +1759,12 @@ class Device:
         elif len(argv) >= 2 and argv[1] == "stat":
             c = self.cam
             r.add("[cam] open %d %s (mode %s) frames %u h264 %u dropped %u last jpeg %u bytes %ux%u seq %u age %u ms"
-                  " | scene %s (%s, %u mV, exp %u) open_frames %u settled %s@%u ms wait %u ms x%u settle %u/%u ms/%u%% ircut %s win %u fov %s resumes %u\r\n" % (
+                  " | scene %s (%s, %u mV, exp %u) open_frames %u settled %s@%u ms wait %u ms x%u settle %u/%u ms/%u%% ircut %s win %u fov %s resumes %u jpeg %u/%u KB (%u/%u -> %d)\r\n" % (
                 int(c.open), ("h264" if c.h264 else "jpeg") if c.open else "-", ("auto", "jpeg", "h264")[c.pref], c.frames,
                 c.h264_frames, c.drop, len(c.jpeg), c.w, c.h, c.seq, self.clock.now_ms() - c.last_ms if c.last_ms else 0,
                 c.scene, self.cam_scene_pref, c.open_mv, c.exp_class, c.open_frames, c.settle_how, c.settled_ms, c.wait_ms, c.waits,
-                self.cam_settle[0], self.cam_settle[1], self.cam_settle[2], self.ircut or "unknown", self.cam_win_rows, "full" if self.cam_full else "crop", c.resumes))
+                self.cam_settle[0], self.cam_settle[1], self.cam_settle[2], self.ircut or "unknown", self.cam_win_rows, "full" if self.cam_full else "crop", c.resumes,
+                self.cam_jpeg[0], self.cam_jpeg[1], self.cam_jpeg_set[0], self.cam_jpeg_set[1], self.cam_jpeg_ret))
         elif len(argv) >= 2 and argv[1] == "settle":
             if len(argv) >= 3:
                 vals = [int(x) if x.isdigit() else -1 for x in argv[2:5]] + list(self.cam_settle[len(argv) - 2:])
@@ -1757,6 +1775,29 @@ class Device:
                 self.cam_settle = (n, ms, pct)
                 self.store.kv_set("db_cam_settle", "%u %u %u" % self.cam_settle)
             r.add("[cam] settle %u frames, cap %u ms, stable < %u %% (applies at the next open)\r\n" % self.cam_settle)
+        elif len(argv) >= 2 and argv[1] == "jpeg":   # fw 0.32: cam jpeg [UP LOW] (KB, full frame)
+            if len(argv) >= 4:
+                if not (argv[2].isdigit() and argv[3].isdigit()):
+                    up, low = -1, -1
+                else:
+                    up, low = int(argv[2]), int(argv[3])
+                off = up == 0 and low == 0
+                if up < 0 or (not off and (up > 140 or low < 10 or low >= up)):
+                    r.add("cam jpeg UP LOW (KB for the 1280x1024 frame, 10 <= LOW < UP <= 140, scaled to the crop; 0 0 = the SDK's 50/30 KB cap)\r\n")
+                    return
+                self.cam_jpeg = (up, low)
+                self.store.kv_set("db_cam_jpeg", "%u %u" % self.cam_jpeg)
+                if self.cam.open and not self.cam.h264:
+                    self.cam_jpeg_apply()
+            elif len(argv) == 3:
+                r.add("cam jpeg UP LOW (two values)\r\n")
+                return
+            if self.cam_jpeg[0]:
+                r.add("[cam] jpeg bounds %u/%u KB (full frame; crop %u/%u), applied %s\r\n" % (
+                    self.cam_jpeg[0], self.cam_jpeg[1], self.cam_jpeg[0] * 720 // 1024, self.cam_jpeg[1] * 720 // 1024,
+                    "now (takes effect at the next frame)" if self.cam.open and not self.cam.h264 else "at the next JPEG open"))
+            else:
+                r.add("[cam] jpeg bounds off: the SDK's 50/30 KB cap (quality ~20 at 1280x1024), applied at the next JPEG open\r\n")
         elif len(argv) >= 2 and argv[1] == "fov":   # fw 0.30: cam fov [crop|full]
             if len(argv) >= 3:
                 if argv[2] not in ("crop", "full"):

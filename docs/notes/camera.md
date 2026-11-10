@@ -314,6 +314,43 @@ crop plus the 304 sky rows above it at the same pixel density, so a face at the 
 readable as in the crop. Not yet seen: a daylight/dusk open in full mode (the AE now averages the
 sky in again; the 0.29 start-exposure bias is off in full mode).
 
+## JPEG quality: the SDK's 50 KB rate-control cap (v0.32.0, `cam jpeg`)
+
+Read the quantisation tables of the pictures Home Assistant kept (2026-11-10): a 1280x1024 daylight
+frame carried the luminance table 40, 30, 25, 40, 60, 100, ... = IJG quality ~20, a 720p frame x4 =
+~25, a night 720p frame x3 = ~33, and every file was 42-51 KB whatever the content (bricks turned
+to mush, night grain to blocks). The BK7258 JPEG encoder has one base table (bk_idk
+`soc/bk7258/hal/jpeg_ll.c`, roughly IJG Q75) and a hardware rate control that multiplies it per
+frame until the frame fits between two byte bounds; `jpeg_hal_init()` (`soc/common/hal/jpeg_hal.c`)
+enables that control for every open with `JPEG_BITRATE_MAX_SIZE_1280_720` = 50 KB and a 30 KB floor
+for any frame 1280 wide. 1.3 MP in 50 KB is 0.3 bit/pixel. Nothing in our firmware asked for it.
+
+The only application knob is `media_app_set_compression_ratio()` with `mode = JPEG_MODE`,
+`enable = 1`, `jpeg_up`/`jpeg_low` in bytes (CPU1 `camera_act.c` ->
+`bk_video_compression_ratio_config()` -> `bk_jpeg_enc_encode_config()`, committed at the next
+frame-end ISR), and those fields were `uint16_t` end to end (max 63 KB) while the HAL registers
+`target_byte_h/l` are 32-bit: SDK patch 0013 widens them. `cam_jpeg_apply()` runs after every
+successful JPEG open (each open re-inits the encoder with the SDK defaults) with the `cam jpeg UP
+LOW` setting (KB for the full frame, default 110/70, KV `db_cam_jpeg`) scaled by the frame height
+(720p crop: 77/49 KB). Since the driver only commits at a frame end, the first frame of an open
+still has the cap; the settle gate (N/2 = 8 frames minimum) covers that. `cam jpeg 0 0` leaves the
+SDK default, `cam stat` shows `jpeg UP/LOW KB (bytes sent -> result)`.
+
+Why not disable the control (`enable = 0`, fixed base table): ~Q75 at 1.3 MP is 150-200 KB, past
+`CONFIG_JPEG_FRAME_SIZE` (153600, the CPU1 DMA end address), and a noisy night frame is larger
+still. The bounds stay under 140 KB (`CAM_JPEG_UP_MAX`) so the step overshoot never reaches the
+buffer; `CAM_BUF_MAX` (150 KB), the snapshot client buffer (frame + 16 KB) and the SD save buffer
+(200 KB) are unchanged. Cost: pictures about twice the size (push attachments, SD saves, the zone
+scorer's five frames, MJPEG only for a browser).
+
+Sensor-side settings that are still at the stock values and worth an A/B after this change: noise
+cancelling (COM22[5] `0x8c`, off in the stock table; the night frames are pure grain at 4x gain),
+edge enhancement (EDGE `0x3f = 0xf2` = threshold 15, factor 2, the minimum; raising it before
+this fix only added ringing to a Q20 picture), the day AE targets (AEW/AEB `0x78/0x68`, the datasheet
+defaults; the full frame averages the sky in and a face at the door sits in shadow) or the AEC
+window (COM11[4:3] is center-half in both tables; center-quarter = `10`). The night flare streaks
+from the top-left corner are the white fill LED scattering in the front window, not a register.
+
 ## Debug: reading CPU1 counters from CPU0
 
 `mem HEXADDR [N]` reads raw 32-bit words. CPU1's `media_debug_t` counters are reachable from CPU0

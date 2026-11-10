@@ -1,0 +1,52 @@
+diff --git a/include/driver/jpeg_enc.h b/include/driver/jpeg_enc.h
+index dcda8d33..4c7abfbb 100755
+--- a/include/driver/jpeg_enc.h
++++ b/include/driver/jpeg_enc.h
+@@ -290,7 +290,7 @@ uint32_t bk_jpeg_get_em_base_addr(void);
+  *    - BK_OK: succeed
+  *    - others: other errors.
+  */
+-bk_err_t bk_jpeg_enc_encode_config(uint8_t enable, uint16_t up_size, uint16_t low_size);
++bk_err_t bk_jpeg_enc_encode_config(uint8_t enable, uint32_t up_size, uint32_t low_size);   /* 32-bit bounds (doorbell-bk7258-fw) */
+ 
+ /**
+  * @brief     jpeg encode mode and yuv mode switch
+diff --git a/include/driver/media_types.h b/include/driver/media_types.h
+index 063bd06a..bbd4a5a8 100755
+--- a/include/driver/media_types.h
++++ b/include/driver/media_types.h
+@@ -434,8 +434,8 @@ typedef struct {
+ 	yuv_mode_t mode;
+ 	h264_qp_t qp;
+ 	uint8_t  enable;
+-	uint16_t jpeg_up;
+-	uint16_t jpeg_low;
++	uint32_t jpeg_up;    /* bytes; 32-bit so the JPEG bound can exceed 64 KB (doorbell-bk7258-fw) */
++	uint32_t jpeg_low;
+ 	uint16_t imb_bits;
+ 	uint16_t pmb_bits;
+ } compress_ratio_t;
+diff --git a/middleware/driver/jpeg_enc/jpeg_driver.c b/middleware/driver/jpeg_enc/jpeg_driver.c
+index 4b14d723..24edecb5 100755
+--- a/middleware/driver/jpeg_enc/jpeg_driver.c
++++ b/middleware/driver/jpeg_enc/jpeg_driver.c
+@@ -38,8 +38,8 @@ typedef struct {
+ typedef struct {
+ 	uint8_t  set_enable  : 1; // 0:1/enable:disable config jpeg_encode
+ 	uint8_t  auto_enable : 1; // enable/disable set encode size
+-	uint16_t up_size;
+-	uint16_t low_size;
++	uint32_t up_size;    /* bytes; the HAL target registers are 32-bit, the old uint16_t capped the bound at 64 KB (doorbell-bk7258-fw) */
++	uint32_t low_size;
+ } jpeg_encode_size_t;
+ 
+ #define JPEG_RETURN_ON_NOT_INIT() do {\
+@@ -335,7 +335,7 @@ bk_err_t bk_jpeg_enc_set_mclk_div(mclk_div_t div)
+ 	return BK_OK;
+ }
+ 
+-bk_err_t bk_jpeg_enc_encode_config(uint8_t enable, uint16_t up_size, uint16_t low_size)
++bk_err_t bk_jpeg_enc_encode_config(uint8_t enable, uint32_t up_size, uint32_t low_size)
+ {
+ 	JPEG_RETURN_ON_NOT_INIT();
+ 
