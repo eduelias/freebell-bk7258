@@ -49,12 +49,23 @@ def test_reply_formats(sim):
                     r"motion_left \d+ s \| white src 0x[0-9a-f]+ manual -1 out [01] \| ring manual -1 out 0 wifi 1 fx [01]$",
                     sim.cmd("night status"))
     assert re.match(r"ok\n\[cam\] open [01] \S+ \(mode auto\) frames \d+ h264 \d+ dropped \d+ last jpeg \d+ bytes \d+x\d+ seq \d+ age \d+ ms"
-                    r" \| scene \S+ \(auto, \d+ mV, exp \d+\) open_frames \d+ settled [-nst]@\d+ ms wait \d+ ms x\d+ settle 16/4500 ms/4% ircut \S+$",
+                    r" \| scene \S+ \(auto, \d+ mV, exp \d+\) open_frames \d+ settled [-nst]@\d+ ms wait \d+ ms x\d+ settle 16/4500 ms/4% ircut \S+ win \d+ fov (crop|full) resumes \d+ jpeg \d+/\d+ KB \(\d+/\d+ -> -?\d+\)$",
                     sim.cmd("cam stat"))
     assert sim.cmd("cam settle 6 2000") == "ok\n[cam] settle 6 frames, cap 2000 ms, stable < 4 % (applies at the next open)"
     assert sim.cmd("cam settle 0") == "ok\ncam settle N(1-60) [MS(100-8000) [PCT(1-50)]]"
     assert sim.cmd("cam scene day").startswith("ok\n[cam] scene day (applies at the next open; light now ")
     assert sim.cmd("cam scene dusk") == "ok\ncam scene auto|day|night|stock"
+    assert sim.cmd("cam win 150") == "ok\n[cam] win 150 rows below the top of the sensor (0-304; applies at the next open)"
+    assert sim.cmd("cam win 305").startswith("ok\ncam win ROWS (0-304, even") and sim.cmd("cam win") == "ok\n[cam] win 150 rows below the top of the sensor (0-304; applies at the next open)"
+    assert sim.cmd("cam win 0").startswith("ok\n[cam] win 0 rows")
+    assert sim.cmd("cam fov full") == "ok\n[cam] fov full (1280x1024, cam win ignored; applies at the next open)"
+    assert sim.cmd("cam win 10").endswith("; ignored while cam fov full)") and sim.cmd("cam fov wide").startswith("ok\ncam fov crop|full")
+    assert sim.cmd("cam fov crop") == "ok\n[cam] fov crop (1280x720; applies at the next open)" and sim.cmd("cam win 0").startswith("ok\n[cam] win 0 rows")
+    assert sim.cmd("cam jpeg") == "ok\n[cam] jpeg bounds 110/70 KB (full frame; crop 77/49), applied at the next JPEG open"
+    assert sim.cmd("cam jpeg 120 80") == "ok\n[cam] jpeg bounds 120/80 KB (full frame; crop 84/56), applied at the next JPEG open"
+    assert sim.cmd("cam jpeg 150 80").startswith("ok\ncam jpeg UP LOW (KB") and sim.cmd("cam jpeg 80 80").startswith("ok\ncam jpeg UP LOW (KB")
+    assert sim.cmd("cam jpeg 90") == "ok\ncam jpeg UP LOW (two values)" and sim.cmd("cam jpeg 0 0").startswith("ok\n[cam] jpeg bounds off: the SDK's 50/30 KB cap")
+    assert sim.cmd("cam jpeg 110 70").startswith("ok\n[cam] jpeg bounds 110/70 KB")
     assert sim.cmd("cam ircut day") == "ok\n[cam] ir-cut pulsed to day (remembered)"
     assert re.match(r"ok\n\[cam\] exp class 3 \(fixed; light now \d+ mV -> class 3 = 4 rows; applies at the next day open\)$", sim.cmd("cam exp 3"))
     assert sim.cmd("cam exp 40") == "ok\ncam exp 0-11 (0 = from the light sensor, else 1 << (N-1) rows; 16-26 = manual 1 << (N-16) rows for 1 s, then AEC)" and sim.cmd("cam exp 0").startswith("ok\n[cam] exp class 0 (auto")

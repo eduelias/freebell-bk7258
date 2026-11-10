@@ -177,6 +177,8 @@ extern volatile uint32_t s_cam_len, s_cam_frames, s_cam_seq, s_cam_w, s_cam_h;
 extern beken_mutex_t s_cam_mutex;
 int cam_copy_latest(uint8_t *dst, uint32_t cap, uint32_t *seq);
 int cam_want_jpeg(void);
+int cam_want_snapshot(void);           /* fw 0.31: GET /snapshot, preempts a live RTSP viewer */
+#define CAM_H264_RESUME_MS 3000        /* HTTP idle before the camera goes back to H.264 for the viewer */
 uint32_t cam_settle_wait(void);
 void cam_rails(int on);
 void camera_init(void);
@@ -187,6 +189,7 @@ void cli_rtsp_cmd(CLI_ARGS);
 /* cam_http.c */
 void cam_http_start(void);
 bool cam_http_busy(void);
+uint32_t cam_http_idle_ms(void);
 #endif
 
 #endif

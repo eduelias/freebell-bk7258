@@ -33,8 +33,11 @@ interleaved and UDP unicast, up to 3 clients), fed by the BK7258 hardware H.264 
 Baseline, IDR with SPS/PPS every 30 frames = `CONFIG_H264_P_FRAME_CNT=29` on CPU1, plus an IDR on
 every PLAY). The DVP pipeline runs one encoder at a time, so the camera has a mode: JPEG (HTTP) or
 H.264 (RTSP), chosen by `cam mode auto|jpeg|h264`. In `auto` an RTSP client switches to H.264 and
-an HTTP request switches back to JPEG unless an RTSP client is playing; then `/snapshot.jpg` serves
-the last JPEG and `/stream` answers 503. The first `/snapshot.jpg` after a switch back can still be
+an HTTP request switches back to JPEG unless an RTSP client is playing; then `/stream` answers 503
+and, **until 0.30**, `/snapshot.jpg` served the last JPEG. Since **0.31** a snapshot preempts the
+viewer: the camera switches to JPEG for the picture and the RTSP client loop takes it back
+(`cam_h264_resume()`) after 3 s without HTTP clients, see "Snapshot while a viewer is playing"
+below. The first `/snapshot.jpg` after a switch back can still be
 the previous JPEG (the handler does not wait for a new frame). `rtsp q IMB PMB` sets bits per
 macroblock for I/P frames (default 120/24, about 1.5 Mbit/s nominal, applied live).
 
@@ -78,10 +81,34 @@ timeout half the time, which would also break the `camera.snapshot` ring/motion 
 therefore keeps **both** URLs: still `http://<device-ip>:8080/snapshot.jpg`, stream
 `rtsp://<device-ip>:554/live` with `rtsp_transport: tcp` (HA 2026.9 keeps it under `advanced`),
 framerate 5. With the still URL the thumbnail/snapshot takes 45 ms (the first one after a live view
-about 2.4 s, because the camera switches back to JPEG; while someone is watching it is the last
-JPEG). The HA live view uses go2rtc (WebRTC/HLS) and shows up in `rtsp status` as one TCP client
+about 2.4 s, because the camera switches back to JPEG; until 0.30, while someone was watching it
+was the last JPEG, see below). The HA live view uses go2rtc (WebRTC/HLS) and shows up in `rtsp status` as one TCP client
 from the HA host. `tools/ha_generic_camera.py options ENTRY_ID --still ... --stream ...
 --rtsp-transport tcp --framerate 5` sets this over the config-flow API.
+
+### Snapshot while a viewer is playing (v0.31.0)
+
+HA's live view goes through go2rtc, which keeps the RTSP session up for as long as the more-info
+dialog (or a live card) is open and, when the device sleeps, reconnects at every wake while that
+consumer exists. So "someone is watching" is not a corner case: it covers the minutes after a
+motion push, exactly when the next motion event arrives. Measured 2026-11-10 (fw 0.30): 6 of 8
+motion events between 08:26 and 08:48 got a 503 for HA's `camera.snapshot` (and for the zone
+scorer's first requests), and 7 of 9 gallery pictures were byte-identical (the stale JPEG). The RTC
+wakes in between, with no viewer, were all fine.
+
+Since 0.31 `/snapshot.jpg` calls `cam_want_snapshot()`: if a viewer is playing it closes H.264,
+opens JPEG (cold open, so the settle gate applies: the picture is a settled one) and sets a resume
+flag. The RTSP client loop, while it has nothing to send, polls `cam_h264_resume_due()` (flag set
+and `cam_http_idle_ms() >= CAM_H264_RESUME_MS` = 3 s, long enough for the zone scorer's five
+snapshots 0.5 s apart) and calls `cam_h264_resume()` = `rtsp_cam_acquire()` (close JPEG, open
+H.264, wait for the first access unit) + `rtsp_resync_clients()` (every client waits for the next
+IDR, `s_idr_req`). `rtsp_feed_frame()` keeps the RTP clock monotonic across the restart (the
+encoder's timestamps start over). `rtsp_cam_acquire()` itself (called at DESCRIBE, so a bare RTSP
+connect already switches the camera) waits for the same 3 s of HTTP idle, capped at 5 s, so a
+viewer that reconnects during the sequence (go2rtc does, after a few seconds without frames) does
+not take the camera between two snapshots. Cost for the viewer: a gap of roughly the snapshot's settle time
+plus 3 s plus the H.264 reopen (~2 s). `/stream` (MJPEG, open-ended) still yields to a viewer, and
+`cam mode h264` still pins H.264.
 
 ## Exposure at a cold open: scene hint + settle gate (v0.27.0)
 
@@ -234,6 +261,95 @@ CPU1 trace for both: 1 row with AEC off, AEC on after 1 s, 1 row / gain 0 from t
 engine does not restart when enabled on a correctly exposed stream. The first frame itself
 (~1 s after the open) is already right; what HA sees is bounded by the gate's N/2 floor (8 frames,
 ~1.9 s) and the open (~1 s), i.e. about 3 s after its request, inside the target.
+
+## Field of view: the 720p window is the top of the sensor (v0.29.0, `cam win`)
+
+The OV9650 array is 1300x1028; the stock table runs it in SXGA mode (COM7 `0x12 = 0x00`) and
+then narrows the window to 1280x720: HSTART/HSTOP `0x17/0x18 = 0x1e/0xbe` (full width) and
+VSTRT/VSTOP `0x19/0x1a = 0x01/0x5b` with VREF `0x03 = 0x12`, i.e. rows 6..364 in the 2-row units
+the SXGA vertical counter uses (the SXGA table's own window is 6..516 = 1020 rows). So the frame
+is the **top 70 %** of what the lens sees, and on the wall (camera pointing down) a snapshot is
+mostly sky with the visitor's face at the bottom edge. The picture is the right way up: MVFP
+`0x1e = 0x34` (mirror + vertical flip) matches how the sensor sits on the board.
+
+`cam win ROWS` (KV `db_cam_win`, 0-304 even, default 0 = stock) starts the window that many rows
+lower; 304 uses the bottom of the array. Both VSTRT and VSTOP move, the frame stays 1280x720 and
+the JPEG/H.264 pipeline does not know. There is no scaler in this mode, so "zoom out" at 720p is
+not possible; the full field of view would be the sensor's 640x480 (4:3) subsampled mode, a
+different pipeline configuration, not done. Plumbing: CPU0 puts `0x96` in
+`media_camera_device_t.d_info.fps` and the offset in 2-row units in `d_info.resolution.height`
+(`cam_open_locked()`); the DVP path ignores `d_info` for a DVP sensor, `camera_act.c` copies the
+struct through the mailbox whole and `media_app_camera_open()` only rewrites `uvc_device[0]`;
+`ov9650_set_fps()` reads it back with the SDK's `bk_dvp_camera_get_device()` and writes
+`0x19/0x1a/0x03` right after the init table. Applies at the next open (every wake opens the
+camera cold).
+
+## Full field of view: 1280x1024 (v0.30.0, `cam fov full`)
+
+`cam fov full` (KV `db_cam_fov`) reads the whole array: `set_ppi()` writes VSTOP `0x1a = 0x81`
+(VSTRT `0x19 = 0x01`, VREF `0x03 = 0x12`), the SXGA table's own window 6..516 = 1024 rows; `crop`
+writes the table's `0x5b` (720 rows) and `cam win` then pans it. Same SXGA frame timing, so the
+frame rate does not move; the pixel density is the same, the frame only grows by the 304 rows the
+crop had to choose between. Costs: JPEG ~70 KB instead of ~50 KB, 5:4 pictures and stream
+(Home Assistant's generic camera, go2rtc and the local_file cameras do not care), the H.264
+encoder accepts 1024 (height % 16 == 0; IMB 120 x 5120 macroblocks = 77 KB I-frames, buffer
+128 KB). The DVP driver only accepts a size that is either the sensor's `def_ppi` or has a
+`ppi_cap` bit, and the SDK has no 1280x1024 bit: the overlay driver therefore declares 1280x1024
+as `def_ppi` and `PPI_CAP_1280X720` as the capability, and the driver's fallback for an unknown
+size is now the full array. The zone scorer's polygon (fractions of the frame height) has to be
+re-mapped when the frame changes: full = the stock crop plus 304 rows at the bottom, so
+`y_full = y_stock * 720 / 1024`.
+
+H.264: the `rtsp q` budgets are bits per macroblock, chosen for 720p's 3600 MB; the full frame has
+5120 and at 120 bits/MB a noisy night IDR passed `RTSP_FRAME_MAX` (96 KB) and was dropped (2 of 8
+keyframes on 2026-11-09). `cam_h264_apply_q()` therefore scales both budgets by 720/height, so an
+access unit keeps its 720p byte size (the same bitrate spread over more macroblocks).
+The one frame that escapes this is the first IDR after an H.264 open: the SDK applies its own
+preset (160/60) at the first frame and refuses a budget until then, and 5120 MB x 160 bits is
+~102 KB, so `rtsp status` shows `big 1` per open. No client is playing at that moment and every
+PLAY forces a fresh IDR, so it costs nothing visible; it is counted, not hidden.
+
+Deployed 2026-11-09 evening: `cam fov full`. Compared at night: the full frame is the 720p/304
+crop plus the 304 sky rows above it at the same pixel density, so a face at the doorstep is as
+readable as in the crop. Not yet seen: a daylight/dusk open in full mode (the AE now averages the
+sky in again; the 0.29 start-exposure bias is off in full mode).
+
+## JPEG quality: the SDK's 50 KB rate-control cap (v0.32.0, `cam jpeg`)
+
+Read the quantisation tables of the pictures Home Assistant kept (2026-11-10): a 1280x1024 daylight
+frame carried the luminance table 40, 30, 25, 40, 60, 100, ... = IJG quality ~20, a 720p frame x4 =
+~25, a night 720p frame x3 = ~33, and every file was 42-51 KB whatever the content (bricks turned
+to mush, night grain to blocks). The BK7258 JPEG encoder has one base table (bk_idk
+`soc/bk7258/hal/jpeg_ll.c`, roughly IJG Q75) and a hardware rate control that multiplies it per
+frame until the frame fits between two byte bounds; `jpeg_hal_init()` (`soc/common/hal/jpeg_hal.c`)
+enables that control for every open with `JPEG_BITRATE_MAX_SIZE_1280_720` = 50 KB and a 30 KB floor
+for any frame 1280 wide. 1.3 MP in 50 KB is 0.3 bit/pixel. Nothing in our firmware asked for it.
+
+The only application knob is `media_app_set_compression_ratio()` with `mode = JPEG_MODE`,
+`enable = 1`, `jpeg_up`/`jpeg_low` in bytes (CPU1 `camera_act.c` ->
+`bk_video_compression_ratio_config()` -> `bk_jpeg_enc_encode_config()`, committed at the next
+frame-end ISR), and those fields were `uint16_t` end to end (max 63 KB) while the HAL registers
+`target_byte_h/l` are 32-bit: SDK patch 0013 widens them. `cam_jpeg_apply()` runs after every
+successful JPEG open (each open re-inits the encoder with the SDK defaults) with the `cam jpeg UP
+LOW` setting (KB for the full frame, default 110/70, KV `db_cam_jpeg`) scaled by the frame height
+(720p crop: 77/49 KB). Since the driver only commits at a frame end, the first frame of an open
+still has the cap; the settle gate (N/2 = 8 frames minimum) covers that. `cam jpeg 0 0` leaves the
+SDK default, `cam stat` shows `jpeg UP/LOW KB (bytes sent -> result)`.
+
+Why not disable the control (`enable = 0`, fixed base table): ~Q75 at 1.3 MP is 150-200 KB, past
+`CONFIG_JPEG_FRAME_SIZE` (153600, the CPU1 DMA end address), and a noisy night frame is larger
+still. The bounds stay under 140 KB (`CAM_JPEG_UP_MAX`) so the step overshoot never reaches the
+buffer; `CAM_BUF_MAX` (150 KB), the snapshot client buffer (frame + 16 KB) and the SD save buffer
+(200 KB) are unchanged. Cost: pictures about twice the size (push attachments, SD saves, the zone
+scorer's five frames, MJPEG only for a browser).
+
+Sensor-side settings that are still at the stock values and worth an A/B after this change: noise
+cancelling (COM22[5] `0x8c`, off in the stock table; the night frames are pure grain at 4x gain),
+edge enhancement (EDGE `0x3f = 0xf2` = threshold 15, factor 2, the minimum; raising it before
+this fix only added ringing to a Q20 picture), the day AE targets (AEW/AEB `0x78/0x68`, the datasheet
+defaults; the full frame averages the sky in and a face at the door sits in shadow) or the AEC
+window (COM11[4:3] is center-half in both tables; center-quarter = `10`). The night flare streaks
+from the top-left corner are the white fill LED scattering in the front window, not a register.
 
 ## Debug: reading CPU1 counters from CPU0
 

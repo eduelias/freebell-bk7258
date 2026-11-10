@@ -4,6 +4,74 @@ Versions are the `FW_VERSION` in `src/version.h` (`project/main/app_main.c` befo
 report JSON and in `sys info`). Dates are 2026 unless stated; most of this was written between 2026-10-01 and
 2026-10-03.
 
+## 0.32.0
+- **JPEG quality: the SDK's 50 KB cap is lifted (`cam jpeg UP LOW`).** Every picture the doorbell ever
+  served was encoded at IJG quality ~20 (1280x1024) to ~25 (720p): `jpeg_hal_init()` in bk_idk turns on
+  the hardware encoder's rate control with `JPEG_BITRATE_MAX_SIZE_1280_720` = 50 KB (floor 30 KB) for any
+  1280-wide frame, and the encoder multiplies its ~Q75 base quantisation table (x5 at 1.3 MP) until the
+  frame fits, so 42-51 KB per picture whatever the scene. The only knob, `media_app_set_compression_ratio`
+  in `JPEG_MODE` (`jpeg_up`/`jpeg_low`), carried the bounds as `uint16_t` (max 63 KB): SDK patch 0013
+  widens the struct field, the API and the driver's copy to 32 bits (the HAL registers always were).
+  `cam_jpeg_apply()` now sends the bounds after every JPEG open (the SDK re-inits the encoder with its
+  defaults at each open; the driver commits them at the next frame-end ISR, so the first frame of an open
+  still carries the cap). Default 110/70 KB for the full frame, scaled by the frame height for the 720p
+  crop (77/49), KV `db_cam_jpeg`; `cam jpeg 0 0` keeps the SDK default; `cam stat` shows `jpeg UP/LOW KB
+  (bytes sent -> result)`. Pictures are about twice the size; CAM_BUF_MAX (150 KB), the 0.31 snapshot
+  client buffer (frame + 16 KB) and the SD save buffer (200 KB) all have room. Disabling the control
+  instead is not an option: the fixed base table gives ~150-200 KB at 1.3 MP, past the CPU1 frame buffer
+  (`CONFIG_JPEG_FRAME_SIZE` 150 KB = the DMA end address).
+
+## 0.31.0
+- **A snapshot preempts a live viewer.** `GET /snapshot.jpg` while an RTSP client is playing used
+  to get the last JPEG taken before the switch to H.264, or a 503 when there was none (documented
+  since 0.22 as "while someone is watching it is the last JPEG"). With go2rtc that is not a corner
+  case: HA keeps the RTSP session up for as long as a live view is open and reconnects at every
+  wake, so a motion event during (or shortly after) a look at the live picture recorded a stale
+  frame; on 2026-11-10 seven of nine motion pictures in the HA gallery were the same picture.
+  `cam_want_snapshot()` now closes H.264, opens JPEG for the picture (the usual cold-open settle
+  gate applies) and the RTSP client loop takes the camera back (`cam_h264_resume()`,
+  `rtsp_cam_acquire` + `rtsp_resync_clients`) once HTTP has been idle for 3 s
+  (`CAM_H264_RESUME_MS`, so HA's zone scorer's five snapshots do not ping-pong the encoder). The
+  viewer sees a gap of a few seconds and resumes at the next IDR; the RTP clock is kept monotonic
+  across the encoder restart. `rtsp_cam_acquire()` (DESCRIBE/PLAY) now also waits for that
+  same 3 s of HTTP idle (capped at 5 s) so a viewer reconnecting in the middle of the sequence
+  does not take the camera between two snapshots. `/stream` (MJPEG) still yields to a playing
+  viewer (503), and `cam mode h264` still pins H.264. `cam stat` shows `resumes N`.
+
+## 0.30.0
+- **Full field of view: `cam fov crop|full`** (KV `db_cam_fov`, default crop). `full` reads all 1024 rows
+  of the OV9650 (1280x1024, 5:4) instead of the 720-row window: the whole field of view of the lens
+  at the same pixel density, so a face is as large as before and the frame simply gains the rows the
+  720p crop could only pan over. The frame period is that of the SXGA timing in both modes, so the
+  frame rate is unchanged; JPEGs are ~40 % larger (~70 KB), H.264 I-frames too (IMB 120: 77 KB,
+  inside the 128 KB CPU1 buffer). The DVP driver validates a non-default size against the sensor's
+  capability bits and the SDK has no 1280x1024 bit, so the overlay driver declares 1280x1024 as its
+  default size and 1280x720 as the capability; `set_ppi()` writes VSTRT/VSTOP/VREF for either.
+  `cam win` only applies to crop. The start-exposure bias of 0.29 applies to crop only (the full
+  frame has the sky back in it). No SDK patch.
+  The H.264 per-macroblock budgets (`rtsp q`, 120/24) are scaled by 720/1024 in full mode so an
+  access unit keeps the 720p byte size: unscaled, 2 of 8 night keyframes passed the 96 KB RTSP cap
+  and were dropped. The first IDR after an H.264 open still carries the SDK preset and is dropped
+  (`big 1` per open); PLAY forces a new IDR, so nobody sees it. Deployed 2026-11-09 with `cam fov full` (the 720p/304 crop is the same picture
+  minus the top 304 rows; both verified at night, a daylight dusk check is still open).
+
+## 0.29.0
+- **Vertical window offset: `cam win ROWS`** (KV `db_cam_win`, 0-304, default 0). The OV9650 has 1024
+  rows and the stock register table reads the 1280x720 frame from the top of the array (VSTART 6,
+  VSTOP 364 in the sensor's 2-row units), so on the wall the picture was mostly sky and a visitor's
+  face sat at the bottom edge. The window can now start up to 304 rows lower (the unused rows), which
+  pans the view down by up to 42 % of the frame height at the same resolution; the sensor has no
+  scaler at 720p, so a wider field of view would need a 640x480 (4:3) mode instead. CPU0 hands the
+  offset to the CPU1 sensor driver in `media_camera_device_t.d_info` (unused by the DVP path, copied
+  through the mailbox untouched; `d_info.fps` = 0x96 marks it), the driver writes VSTRT/VSTOP/VREF
+  right after the init table. Applies at the next open (every wake is one). No SDK patch: the SDK's
+  `bk_dvp_camera_get_device()` exposes the struct on CPU1. Mirror/flip (MVFP 0x1e = 0x34 in the
+  table) is right for the mounted sensor and stays as it is.
+  Side effect handled: the day start-exposure class (`cam_exp_class()`, measured for the sky-heavy
+  stock frame) is raised by one class (x4 rows) per 152 rows of offset, because the ground-only frame
+  converges a stop or two higher (measured 2026-11-09 at dusk: luma 45 at the settle gate, 87
+  converged); `cam exp N` still overrides it. The light-to-class table itself was not re-measured.
+
 ## 0.28.1
 - **Rescue mode: boot-loop protection for OTA updates** (`src/rescue.c`). The bootloader installs an
   update over the running image and has no rollback, so an image that crashes at every boot needed

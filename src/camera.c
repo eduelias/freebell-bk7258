@@ -71,6 +71,39 @@ enum { CAM_SCENE_AUTO = 0, CAM_SCENE_DAY = 1, CAM_SCENE_NIGHT = 2, CAM_SCENE_STO
 #define CAM_EXP_ROWS(c) ((c) >= 16 ? (1u << ((c) - 16 > 10 ? 10 : (c) - 16)) : (c) ? (1u << (((c) > 11 ? 11 : (c)) - 1)) : 4u)
 #define KV_CAM_SCENE "db_cam_scene"
 #define KV_CAM_SETTLE "db_cam_settle"   /* "N MS PCT" */
+#define KV_CAM_WIN "db_cam_win"         /* fw 0.29: vertical window offset in sensor rows (0-304, even), see cam_open_locked() */
+#define OV9650_WIN_MAGIC 0x96           /* same value as avdk-overlay/.../dvp_ov9650.c: d_info.fps marker */
+#define CAM_WIN_MAX_ROWS 304            /* (1024 - 720) sensor rows below the stock window */
+static uint32_t s_cam_win_rows;         /* `cam win ROWS`: how far below the top of the sensor the 720-row window starts */
+#define KV_CAM_FOV "db_cam_fov"         /* fw 0.30: "full" = 1280x1024 full-array readout, else "crop" = 1280x720 window (+ cam win) */
+#define CAM_FULL_W 1280
+#define CAM_FULL_H 1024
+#define CAM_CROP_W 1280
+#define CAM_CROP_H 720
+static bool s_cam_full;                 /* `cam fov full`: read all 1024 rows of the OV9650 (5:4), the sensor's whole field of view */
+static inline uint32_t cam_frame_w(void) { return s_cam_full ? CAM_FULL_W : CAM_CROP_W; }
+static inline uint32_t cam_frame_h(void) { return s_cam_full ? CAM_FULL_H : CAM_CROP_H; }
+/* fw 0.32: JPEG size bounds for the CPU1 hardware encoder's rate control. The SDK's jpeg_hal_init()
+ * turns that control on with a 50 KB cap (30 KB floor) for any frame 1280 wide (JPEG_BITRATE_MAX_
+ * SIZE_1280_720 in bk_idk soc/common/hal/jpeg_hal.c) and the encoder multiplies its ~Q75 base
+ * quantisation table until a frame fits: every 1280x1024 picture came out at 42-51 KB = the table
+ * x5 = IJG quality ~20 (x4 at 720p). The only knob is media_app_set_compression_ratio(JPEG_MODE,
+ * jpeg_up/jpeg_low), uint16_t in the SDK (max 63 KB): SDK patch 0013 widens it to 32 bits. The
+ * bounds are KB for the full frame and scale with the frame height (the 720p crop gets 70 %); they
+ * must stay under CONFIG_JPEG_FRAME_SIZE (150 KB, the CPU1 DMA end address) and CAM_BUF_MAX.
+ * Applied after every JPEG open (the SDK re-inits the encoder with its defaults at each open, and
+ * the driver only commits a config at the next frame-end ISR); `cam jpeg UP LOW` (KB, 0 0 = leave
+ * the SDK default), KV db_cam_jpeg. Disabling the control instead is not an option: the fixed base
+ * table gives ~150-200 KB at 1.3 MP, past the frame buffer. */
+#define KV_CAM_JPEG "db_cam_jpeg"       /* "UP LOW" in KB for the full frame */
+#define CAM_JPEG_UP_DEFAULT 110
+#define CAM_JPEG_LOW_DEFAULT 70
+#define CAM_JPEG_UP_MAX 140             /* < CONFIG_JPEG_FRAME_SIZE 150 KB with a margin for the SDK's step overshoot */
+#define CAM_JPEG_LOW_MIN 10
+static uint32_t s_cam_jpeg_up = CAM_JPEG_UP_DEFAULT, s_cam_jpeg_low = CAM_JPEG_LOW_DEFAULT;
+static uint32_t s_cam_jpeg_set_up, s_cam_jpeg_set_low;   /* bytes sent at the last JPEG open (0 = SDK default) */
+static int s_cam_jpeg_ret = -1;         /* result of that call */
+static int cam_jpeg_apply(void);        /* defined next to cam_h264_apply_q() */
 #define KV_IRCUT "db_ircut"             /* "day" | "night": the last IR-cut pulse applied */
 #define PIN_IRCUT_DAY BOARD_PIN_IRCUT_DAY
 #define PIN_IRCUT_NIGHT BOARD_PIN_IRCUT_NIGHT
@@ -241,11 +274,16 @@ static uint32_t cam_exp_class(uint32_t mv)
 	 * then take over. Measured 2026-10-05 (sunny, 515-663 mV): the AEC settles at 1 row, gain 1x;
 	 * started there the first frame is right and the AEC stays put, whereas any AEC-on start
 	 * overshoots to ~130 rows on the dark start-up frames and needs ~4 s to come back. */
-	if (mv < 700) return 16;    /* 1 row */
-	if (mv < 850) return 18;    /* 4 */
-	if (mv < 1000) return 20;   /* 16 */
-	if (mv < 1200) return 22;   /* 64 */
-	return 24;                  /* 256 */
+	/* fw 0.29: the table was measured with the stock window (top of the sensor = mostly sky); a
+	 * lowered window (`cam win`) frames the ground, a stop or two darker, and the AEC climbs slowly
+	 * from a short start (2026-11-09 16:24, 693 mV, win 304: luma 45 at the gate, 87 converged).
+	 * +1 class (x4 rows) per 152 rows of offset; a sunny overshoot comes down within ~1 s. */
+	{
+		uint32_t c = mv < 700 ? 16 : mv < 850 ? 18 : mv < 1000 ? 20 : mv < 1200 ? 22 : 24;   /* 1, 4, 16, 64, 256 rows */
+		if (!s_cam_full)   /* the full-array frame has the sky in it again: the table as measured */
+			c += s_cam_win_rows / 152;
+		return c > 26 ? 26 : c;
+	}
 }
 
 static const char *cam_scene_name(int scene)
@@ -317,6 +355,13 @@ static int cam_open_locked(uint32_t w, uint32_t h, bool h264)
 	dev.fmt = h264 ? PIXEL_FMT_H264 : PIXEL_FMT_JPEG;
 	dev.info.resolution.width = w;
 	dev.info.resolution.height = h;
+	/* fw 0.29: vertical window offset for the CPU1 OV9650 driver. The stock table reads the 720 rows
+	 * from the top of the 1024-row array; on the wall that is mostly sky. d_info is unused by the DVP
+	 * path and crosses the mailbox untouched; the driver moves VSTART/VSTOP by this many 2-row units. */
+	if (s_cam_win_rows && !s_cam_full) {   /* fw 0.30: full-array readout has no spare rows to pan over */
+		dev.d_info.fps = (frame_fps_t)OV9650_WIN_MAGIC;
+		dev.d_info.resolution.height = s_cam_win_rows / 2;
+	}
 	/* scene hint for the CPU1 sensor driver, see the block comment above cam_frame_cb() */
 	s_cam_exp_class = scene == CAM_SCENE_DAY ? cam_exp_class(mv) : 0;
 	dev.info.fps = (frame_fps_t)(FPS15 | (scene == CAM_SCENE_DAY ? (OV9650_SCENE_DAY | OV9650_EXP_ENCODE(s_cam_exp_class)) :
@@ -347,6 +392,8 @@ static int cam_open_locked(uint32_t w, uint32_t h, bool h264)
 	s_cam_last_ms = s_cam_open_ms;
 	s_cam_opening = false;
 	os_printf("[cam] open %ux%u %s scene %s (%u mV, exp class %u) -> %d\r\n", w, h, h264 ? "h264" : "jpeg", cam_scene_name(s_cam_scene), (unsigned)mv, (unsigned)s_cam_exp_class, ret);
+	if (s_cam_open && !h264)
+		cam_jpeg_apply();   /* fw 0.32: lift the SDK's 50 KB JPEG cap (committed by CPU1 at the next frame end) */
 	return ret;
 }
 
@@ -389,6 +436,37 @@ static void cam_close_locked(void)
 #endif
 }
 
+/* Push the JPEG size bounds to the CPU1 encoder (see the block at KV_CAM_JPEG). Caller holds
+ * s_cam_ctl and the camera is open in JPEG mode; the driver commits the bounds at the next
+ * frame-end ISR, so the first frame of an open still carries the SDK's 50 KB cap. */
+static int cam_jpeg_apply(void)
+{
+	compress_ratio_t r = {0};
+	int ret = BK_FAIL, tries;
+	uint32_t h = cam_frame_h();
+
+	if (!s_cam_open || s_cam_h264)
+		return BK_ERR_STATE;
+	s_cam_jpeg_set_up = s_cam_jpeg_set_low = 0;
+	if (!s_cam_jpeg_up)   /* 0 = SDK default (50/30 KB for a 1280-wide frame) */
+		return BK_OK;
+	r.mode = JPEG_MODE;
+	r.enable = 1;
+	r.jpeg_up = s_cam_jpeg_up * 1024 * h / CAM_FULL_H;
+	r.jpeg_low = s_cam_jpeg_low * 1024 * h / CAM_FULL_H;
+	for (tries = 0; tries < 3 && ret != BK_OK; tries++) {
+		ret = media_app_set_compression_ratio(&r);
+		if (ret != BK_OK)
+			rtos_delay_milliseconds(100);
+	}
+	s_cam_jpeg_set_up = r.jpeg_up;
+	s_cam_jpeg_set_low = r.jpeg_low;
+	s_cam_jpeg_ret = ret;
+	os_printf("[cam] jpeg bounds %u/%u KB (frame %u rows: %u/%u bytes) -> %d\r\n", (unsigned)s_cam_jpeg_up, (unsigned)s_cam_jpeg_low,
+		  (unsigned)h, (unsigned)r.jpeg_up, (unsigned)r.jpeg_low, ret);
+	return ret;
+}
+
 /* Push our H.264 rate-control targets to the CPU1 encoder. Only valid once the first frame is
  * out: bk_h264_init() queues the SDK preset and the encoder ISR applies it at the first frame,
  * and bk_h264_set_base_config() refuses while that is pending. */
@@ -406,14 +484,17 @@ static int cam_h264_apply_q(void)
 	r.qp.i_max_qp = 45;
 	r.qp.p_min_qp = 10;
 	r.qp.p_max_qp = 45;
-	r.imb_bits = s_h264_imb;
-	r.pmb_bits = s_h264_pmb;
+	/* fw 0.30: the budgets are per macroblock and were chosen for 720p (3600 MB); the full-array frame
+	 * has 5120, and at 120 bits/MB a noisy night IDR passed RTSP_FRAME_MAX (96 KB: 2 of 8 keyframes
+	 * dropped, measured 2026-11-09). Scale by 720/height so the bits per frame stay as at 720p. */
+	r.imb_bits = s_h264_imb * CAM_CROP_H / (s_cam_h ? s_cam_h : cam_frame_h());
+	r.pmb_bits = s_h264_pmb * CAM_CROP_H / (s_cam_h ? s_cam_h : cam_frame_h());
 	for (tries = 0; tries < 3 && ret != BK_OK; tries++) {
 		ret = media_app_set_compression_ratio(&r);
 		if (ret != BK_OK)
 			rtos_delay_milliseconds(150);
 	}
-	os_printf("[cam] h264 q imb %u pmb %u -> %d\r\n", s_h264_imb, s_h264_pmb, ret);
+	os_printf("[cam] h264 q imb %u pmb %u (set %u %u) -> %d\r\n", (unsigned)r.imb_bits, (unsigned)r.pmb_bits, s_h264_imb, s_h264_pmb, ret);
 	return ret;
 }
 
@@ -431,6 +512,11 @@ static bool cam_stalled_locked(void)
 }
 
 /* HTTP wants JPEG frames. 0 = the camera is (now) in JPEG mode, -1 = stay/503 (see cam mode). */
+/* fw 0.31: a snapshot preempted a live RTSP viewer (JPEG for the picture); rtsp.c's client loop
+ * hands the camera back to H.264 through cam_h264_resume() once HTTP has been idle for a moment. */
+static bool s_cam_h264_resume;
+static uint32_t s_cam_resumes;
+
 int cam_want_jpeg(void)
 {
 	int ret = 0, playing = 0;
@@ -451,10 +537,69 @@ int cam_want_jpeg(void)
 		}
 		cam_close_locked();
 	}
-	ret = cam_open_locked(1280, 720, false);
+	ret = cam_open_locked(cam_frame_w(), cam_frame_h(), false);
 out:
 	rtos_unlock_mutex(&s_cam_ctl);
 	return ret;
+}
+
+/* fw 0.31: GET /snapshot. Like cam_want_jpeg(), but a live RTSP viewer no longer wins: the camera is
+ * switched to JPEG for the picture and goes back to H.264 (cam_h264_resume) once HTTP has been idle
+ * for CAM_H264_RESUME_MS. Before, a motion event while someone watched the live stream (go2rtc keeps
+ * the RTSP session up, and reconnects at every wake while a viewer is open) got the JPEG taken before
+ * the switch, or a 503 when there was none: the gallery filled with the same picture. The picture is
+ * what the doorbell is for; the viewer sees a few seconds of gap and resumes at the next IDR.
+ * `cam mode h264` still pins H.264 (stale JPEG / 503 as before). */
+int cam_want_snapshot(void)
+{
+	int ret = 0, playing = 0;
+
+	rtos_lock_mutex(&s_cam_ctl);
+	cam_stalled_locked();
+	if (s_cam_open && !s_cam_h264)
+		goto out;
+	if (s_cam_pref == CAM_PREF_H264) {
+		ret = -1;
+		goto out;
+	}
+	if (s_cam_open && s_cam_h264) {
+		rtsp_clients(&playing);
+		if (playing > 0) {
+			s_cam_h264_resume = true;
+			os_printf("[cam] snapshot preempts %d live viewer(s)\r\n", playing);
+		}
+		cam_close_locked();
+	}
+	ret = cam_open_locked(cam_frame_w(), cam_frame_h(), false);
+out:
+	rtos_unlock_mutex(&s_cam_ctl);
+	return ret;
+}
+
+bool cam_h264_resume_due(void)
+{
+	return s_cam_h264_resume && cam_http_idle_ms() >= CAM_H264_RESUME_MS;
+}
+
+/* Called from an RTSP client thread (the same context as the PLAY-time acquire). */
+void cam_h264_resume(void)
+{
+	int playing = 0, ret;
+
+	rtos_lock_mutex(&s_cam_ctl);
+	if (!s_cam_h264_resume) {
+		rtos_unlock_mutex(&s_cam_ctl);
+		return;
+	}
+	s_cam_h264_resume = false;
+	rtos_unlock_mutex(&s_cam_ctl);
+	rtsp_clients(&playing);
+	if (playing <= 0)
+		return;   /* the viewer left meanwhile: stay JPEG, the next PLAY acquires as usual */
+	ret = rtsp_cam_acquire();
+	s_cam_resumes++;
+	rtsp_resync_clients();   /* new encoder session: everyone waits for its IDR */
+	os_printf("[cam] H.264 back for %d viewer(s) after a snapshot -> %d\r\n", playing, ret);
 }
 
 /* ---- rtsp.c callbacks: the RTSP server wants H.264 ---- */
@@ -462,6 +607,11 @@ int rtsp_cam_acquire(void)
 {
 	int ret = 0, w;
 
+	/* fw 0.31: let a snapshot sequence finish first (HA's zone scorer takes five, 0.5 s apart; a
+	 * viewer that reconnects meanwhile would otherwise steal the camera between two of them and
+	 * the next one would take it back). Capped at 5 s: an open-ended MJPEG /stream still loses. */
+	for (w = 0; w < 500 && cam_http_idle_ms() < CAM_H264_RESUME_MS; w++)
+		rtos_delay_milliseconds(10);
 	rtos_lock_mutex(&s_cam_ctl);
 	if (s_cam_pref == CAM_PREF_JPEG) {
 		ret = -1;
@@ -472,7 +622,7 @@ int rtsp_cam_acquire(void)
 		if (s_cam_open && !s_cam_h264)
 			cam_close_locked();
 		if (!s_cam_open)
-			ret = cam_open_locked(1280, 720, true);
+			ret = cam_open_locked(cam_frame_w(), cam_frame_h(), true);
 		if (ret == 0) {
 			for (w = 0; w < 300 && s_cam_h264_frames == 0; w++)   /* first access unit ~1 s after open */
 				rtos_delay_milliseconds(10);
@@ -577,7 +727,7 @@ void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 		/* cam open | open h264 | open W H | open W H h264 */
 		bool h264 = os_strcmp(argv[argc - 1], "h264") == 0;
 		int dims = argc - 2 - (h264 ? 1 : 0), ret;
-		uint32_t w = dims >= 2 ? os_strtoul(argv[2], NULL, 10) : 1280, h = dims >= 2 ? os_strtoul(argv[3], NULL, 10) : 720;
+		uint32_t w = dims >= 2 ? os_strtoul(argv[2], NULL, 10) : cam_frame_w(), h = dims >= 2 ? os_strtoul(argv[3], NULL, 10) : cam_frame_h();
 		rtos_lock_mutex(&s_cam_ctl);
 		if (s_cam_open && s_cam_h264 != h264)
 			cam_close_locked();
@@ -592,12 +742,13 @@ void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 	} else if (argc >= 2 && os_strcmp(argv[1], "stat") == 0) {
 		static const char *const pref[] = {"auto", "jpeg", "h264"};
 		REPLY("[cam] open %d %s (mode %s) frames %u h264 %u dropped %u last jpeg %u bytes %ux%u seq %u age %u ms"
-		      " | scene %s (%s, %u mV, exp %u) open_frames %u settled %c@%u ms wait %u ms x%u settle %u/%u ms/%u%% ircut %s\r\n", s_cam_open,
+		      " | scene %s (%s, %u mV, exp %u) open_frames %u settled %c@%u ms wait %u ms x%u settle %u/%u ms/%u%% ircut %s win %u fov %s resumes %u jpeg %u/%u KB (%u/%u -> %d)\r\n", s_cam_open,
 		      s_cam_open ? (s_cam_h264 ? "h264" : "jpeg") : "-", pref[s_cam_pref], s_cam_frames, s_cam_h264_frames,
 		      s_cam_drop, s_cam_len, s_cam_w, s_cam_h, s_cam_seq, s_cam_last_ms ? rtos_get_time() - s_cam_last_ms : 0,
 		      s_cam_scene ? cam_scene_name(s_cam_scene) : "stock", cam_scene_name(s_cam_scene_pref), s_cam_open_mv, s_cam_exp_class, s_cam_open_frames,
 		      s_cam_settle_how, s_cam_settled_ms, s_cam_settle_wait_ms, s_cam_settle_waits, s_cam_settle_n, s_cam_settle_ms, s_cam_settle_pct,
-		      s_ircut_state < 0 ? "unknown" : cam_scene_name(s_ircut_state));
+		      s_ircut_state < 0 ? "unknown" : cam_scene_name(s_ircut_state), (unsigned)s_cam_win_rows, s_cam_full ? "full" : "crop", (unsigned)s_cam_resumes,
+		      (unsigned)s_cam_jpeg_up, (unsigned)s_cam_jpeg_low, (unsigned)s_cam_jpeg_set_up, (unsigned)s_cam_jpeg_set_low, s_cam_jpeg_ret);
 	} else if (argc >= 2 && os_strcmp(argv[1], "settle") == 0) {   /* cam settle [N [MS [PCT]]] */
 		char buf[32];
 		if (argc >= 3) {
@@ -614,6 +765,63 @@ void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 			kv_set_str(KV_CAM_SETTLE, buf);
 		}
 		REPLY("[cam] settle %u frames, cap %u ms, stable < %u %% (applies at the next open)\r\n", s_cam_settle_n, s_cam_settle_ms, s_cam_settle_pct);
+	} else if (argc >= 2 && os_strcmp(argv[1], "jpeg") == 0) {   /* cam jpeg [UP LOW]: JPEG size bounds in KB for the full frame (fw 0.32) */
+		char buf[24];
+		if (argc >= 4) {
+			char *e1 = NULL, *e2 = NULL;
+			uint32_t up = os_strtoul(argv[2], &e1, 10), low = os_strtoul(argv[3], &e2, 10);
+			bool off = up == 0 && low == 0;
+			if (!e1 || *e1 || !e2 || *e2 || (!off && (up > CAM_JPEG_UP_MAX || low < CAM_JPEG_LOW_MIN || low >= up))) {
+				REPLY("cam jpeg UP LOW (KB for the 1280x1024 frame, %u <= LOW < UP <= %u, scaled to the crop; 0 0 = the SDK's 50/30 KB cap)\r\n",
+				      CAM_JPEG_LOW_MIN, CAM_JPEG_UP_MAX);
+				return;
+			}
+			s_cam_jpeg_up = up;
+			s_cam_jpeg_low = low;
+			snprintf(buf, sizeof(buf), "%u %u", (unsigned)up, (unsigned)low);
+			kv_set_str(KV_CAM_JPEG, buf);
+			if (s_cam_open && !s_cam_h264) {
+				rtos_lock_mutex(&s_cam_ctl);
+				cam_jpeg_apply();
+				rtos_unlock_mutex(&s_cam_ctl);
+			}
+		} else if (argc == 3) {
+			REPLY("cam jpeg UP LOW (two values)\r\n");
+			return;
+		}
+		if (s_cam_jpeg_up)
+			REPLY("[cam] jpeg bounds %u/%u KB (full frame; crop %u/%u), applied %s\r\n", (unsigned)s_cam_jpeg_up, (unsigned)s_cam_jpeg_low,
+			      (unsigned)(s_cam_jpeg_up * CAM_CROP_H / CAM_FULL_H), (unsigned)(s_cam_jpeg_low * CAM_CROP_H / CAM_FULL_H),
+			      s_cam_open && !s_cam_h264 ? "now (takes effect at the next frame)" : "at the next JPEG open");
+		else
+			REPLY("[cam] jpeg bounds off: the SDK's 50/30 KB cap (quality ~20 at 1280x1024), applied at the next JPEG open\r\n");
+	} else if (argc >= 2 && os_strcmp(argv[1], "fov") == 0) {   /* cam fov [crop|full]: 1280x720 window or the whole 1280x1024 array */
+		if (argc >= 3) {
+			if (os_strcmp(argv[2], "crop") != 0 && os_strcmp(argv[2], "full") != 0) {
+				REPLY("cam fov crop|full (crop = 1280x720 window, panned with cam win; full = all 1024 rows of the sensor, 5:4)\r\n");
+				return;
+			}
+			s_cam_full = os_strcmp(argv[2], "full") == 0;
+			kv_set_str(KV_CAM_FOV, argv[2]);
+		}
+		REPLY("[cam] fov %s (%ux%u%s; applies at the next open%s)\r\n", s_cam_full ? "full" : "crop", (unsigned)cam_frame_w(), (unsigned)cam_frame_h(),
+		      s_cam_full ? ", cam win ignored" : "", s_cam_open ? ", the camera is open now: cam close first" : "");
+	} else if (argc >= 2 && os_strcmp(argv[1], "win") == 0) {   /* cam win [ROWS]: start the 720-row window ROWS below the top of the sensor */
+		char buf[8];
+		if (argc >= 3) {
+			char *e = NULL;
+			uint32_t n = os_strtoul(argv[2], &e, 10);
+			if (!e || *e || n > CAM_WIN_MAX_ROWS) {
+				REPLY("cam win ROWS (0-%u, even: how far below the top of the sensor the 1280x720 window starts; 0 = stock, %u = bottom)\r\n",
+				      CAM_WIN_MAX_ROWS, CAM_WIN_MAX_ROWS);
+				return;
+			}
+			s_cam_win_rows = n & ~1u;
+			snprintf(buf, sizeof(buf), "%u", (unsigned)s_cam_win_rows);
+			kv_set_str(KV_CAM_WIN, buf);
+		}
+		REPLY("[cam] win %u rows below the top of the sensor (0-%u; applies at the next open%s%s)\r\n", (unsigned)s_cam_win_rows, CAM_WIN_MAX_ROWS,
+		      s_cam_open ? ", the camera is open now: cam close first" : "", s_cam_full ? "; ignored while cam fov full" : "");
 	} else if (argc >= 2 && os_strcmp(argv[1], "scene") == 0) {   /* cam scene auto|day|night|stock */
 		if (argc >= 3) {
 			int sc = os_strcmp(argv[2], "auto") == 0 ? CAM_SCENE_AUTO : os_strcmp(argv[2], "day") == 0 ? CAM_SCENE_DAY :
@@ -674,7 +882,7 @@ void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 		if (rtos_create_thread(&t, BEKEN_APPLICATION_PRIORITY, "camsnap", camsnap_task, 4096, NULL) != BK_OK)
 			REPLY("[cam] thread failed\r\n");
 	} else {
-		REPLY("cam open [W H] [h264] | close | stat | mode auto|jpeg|h264 | settle [N [MS [PCT]]] | scene auto|day|night|stock | exp [0-11] | ircut day|night | snap HOST PORT | http://IP:8080/snapshot.jpg /stream | probe [PWR_PIN ...] | probe scan | probe rails on|off | probe bb SCL SDA\r\n");
+		REPLY("cam open [W H] [h264] | close | stat | mode auto|jpeg|h264 | settle [N [MS [PCT]]] | jpeg [UP LOW] | scene auto|day|night|stock | exp [0-11] | ircut day|night | snap HOST PORT | http://IP:8080/snapshot.jpg /stream | probe [PWR_PIN ...] | probe scan | probe rails on|off | probe bb SCL SDA\r\n");
 	}
 }
 
@@ -767,6 +975,17 @@ void camera_init(void)   /* KV settings, the HTTP server, RTSP when enabled */
 			s_cam_settle_pct = pct;
 		}
 	}
+	if (kv_get_str(KV_CAM_FOV, v, sizeof(v)))
+		s_cam_full = os_strcmp(v, "full") == 0;
+	if (kv_get_str(KV_CAM_JPEG, v, sizeof(v))) {   /* "UP LOW" KB; "0 0" = SDK default */
+		uint32_t up = os_strtoul(v, &e, 10), low = os_strtoul(e, NULL, 10);
+		if ((up == 0 && low == 0) || (up <= CAM_JPEG_UP_MAX && low >= CAM_JPEG_LOW_MIN && low < up)) {
+			s_cam_jpeg_up = up;
+			s_cam_jpeg_low = low;
+		}
+	}
+	if (kv_get_str(KV_CAM_WIN, v, sizeof(v)) && os_strtoul(v, NULL, 10) <= CAM_WIN_MAX_ROWS)
+		s_cam_win_rows = os_strtoul(v, NULL, 10) & ~1u;
 	if (kv_get_str(KV_CAM_SCENE, v, sizeof(v)))
 		s_cam_scene_pref = os_strcmp(v, "day") == 0 ? CAM_SCENE_DAY : os_strcmp(v, "night") == 0 ? CAM_SCENE_NIGHT :
 				   os_strcmp(v, "stock") == 0 ? CAM_SCENE_STOCK : CAM_SCENE_AUTO;

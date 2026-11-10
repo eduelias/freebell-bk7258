@@ -281,7 +281,7 @@ static const struct cli_command s_doorbell_commands[] = {
 	{"log", "log [N<=600] | stat (last N bytes of the RAM log; GET /log?t=TOKEN for all 8 KB)", cli_log_cmd},
 #endif
 #if defined(DOORBELL_AVDK) && (CONFIG_SYS_CPU0)
-	{"cam", "cam open [W H] [h264] | close | stat | mode auto|jpeg|h264 | settle [N [MS [PCT]]] | scene auto|day|night|stock | exp [0-11] | ircut day|night | snap HOST PORT (AVDK build)", cli_cam_cmd},
+	{"cam", "cam open [W H] [h264] | close | stat | mode auto|jpeg|h264 | settle [N [MS [PCT]]] | fov [crop|full] | win [ROWS] | scene auto|day|night|stock | exp [0-11] | ircut day|night | snap HOST PORT (AVDK build)", cli_cam_cmd},
 	{"rtsp", "rtsp on|off | status | port N | q IMB PMB | idr (H.264 live stream rtsp://IP:554/live)", cli_rtsp_cmd},
 #endif
 	{"spk", "spk tone [HZ] [MS] | play beepa|beepb|bell|ADDR LEN | net HOST PORT | stop", cli_spk_cmd},

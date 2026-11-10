@@ -40,6 +40,8 @@ int rtsp_clients(int *playing);
 void rtsp_feed_frame(const uint8_t *data, uint32_t len, uint32_t ts_ms);
 /* Ask the encoder for an IDR at the next opportunity (rate limited to one per 500 ms). */
 void rtsp_request_idr(void);
+/* The encoder was restarted (fw 0.31 snapshot preempt): every client waits for the next IDR. */
+void rtsp_resync_clients(void);
 /* Clients with an audio track set up (the voc engine runs while this is > 0). */
 int rtsp_audio_clients(void);
 /* One-line summary / audio line / per-client lines for the `rtsp status` command. Return the length. */
@@ -56,3 +58,7 @@ int rtsp_cam_acquire(void);
 void rtsp_cam_release(void);
 /* Regenerate an IDR frame now (media_app_h264_regenerate_idr). */
 void rtsp_cam_idr(void);
+/* fw 0.31: a GET /snapshot took the camera away from a playing viewer (JPEG). The client loop
+ * polls _due() while it has nothing to send and calls _resume() to get H.264 back. */
+bool cam_h264_resume_due(void);
+void cam_h264_resume(void);

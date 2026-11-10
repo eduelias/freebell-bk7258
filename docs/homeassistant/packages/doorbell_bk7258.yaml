@@ -16,6 +16,20 @@ notify:
 
 # feat/power (fw 0.21.0): trigger-based sensors fed by event doorbell_bk7258_report (fan-out from the webhook automation)
 template:
+  # 2026-11-09 snapshot gallery: script.snapshot_keep copies every pushed picture (doorbell motion/ring, stash
+  # door) to /config/www/snapshots/<YYYYMMDD-HHMMSS>_<kind>.jpg and fires event snapshot_gallery with the
+  # newest 40 names; this sensor holds them for the dashboard "Doorbell" view (markdown gallery, newest
+  # first). Event-driven on purpose: no folder/command_line platform (= no core restart), no polling.
+  - trigger:
+      - trigger: event
+        event_type: snapshot_gallery
+    sensor:
+      - name: Snapshot gallery
+        unique_id: snapshot_gallery
+        icon: mdi:image-multiple
+        state: "{{ trigger.event.data.files | count }}"
+        attributes:
+          files: "{{ trigger.event.data.files }}"
   - trigger:
       - trigger: event
         event_type: doorbell_bk7258_report
@@ -70,6 +84,20 @@ template:
         state: "{{ (trigger.event.data.charging | int(0)) == 1 if trigger.event.data.charging is not none else this.state == 'on' }}"
 
 automation:
+  # 2026-11-09: snapshot gallery retention: files older than 14 days go, at most 200 stay (~50 KB each)
+  - id: snapshot_gallery_purge
+    alias: "Snapshots: nightly purge (14 days, max 200)"
+    triggers:
+      - trigger: time
+        at: "04:10:00"
+    actions:
+      - action: shell_command.snapshot_purge
+        response_variable: r
+      - event: snapshot_gallery
+        event_data:
+          files: "{{ r.stdout.split('\n') | reject('eq', '') | list }}"
+    mode: single
+
   - id: doorbell_bk7258_low_battery
     alias: "Doorbell BK7258: low battery"
     triggers:
@@ -151,6 +179,16 @@ rest_command:
     timeout: 5
 
 shell_command:
+  # 2026-11-09 snapshot gallery: copy SRC to /config/www/snapshots/FILE, then print the newest 40 gallery names
+  # (<YYYYMMDD-HHMMSS>_<kind>.jpg, newest first). Templated commands run without a shell (shlex split), hence sh -c.
+  snapshot_keep: >-
+    sh -c 'cp "$1" "/config/www/snapshots/$2" && ls -1 /config/www/snapshots | grep -E "^[0-9]{8}-[0-9]{6}_.*[.]jpg$" | sort -r | head -40'
+    sh "{{ src }}" "{{ file }}"
+  # retention: older than 14 days out, at most 200 left; prints the newest 40 like snapshot_keep
+  snapshot_purge: >-
+    sh -c 'cd /config/www/snapshots && find . -maxdepth 1 -name "[0-9]*_*.jpg" -mtime +14 -delete;
+    ls -1 | grep -E "^[0-9]{8}-[0-9]{6}_.*[.]jpg$" | sort -r | tail -n +201 | xargs -r rm -f;
+    ls -1 | grep -E "^[0-9]{8}-[0-9]{6}_.*[.]jpg$" | sort -r | head -40'
   # message -> TTS mp3 (HA's own TTS API) -> 16 kHz mono WAV in /config/www/doorbell/<name>.wav
   doorbell_tts_wav: >-
     python3 /config/doorbell_tts_wav.py "{{ message }}" "{{ lang | default('en') }}" "{{ name | default('say') }}"
@@ -162,6 +200,24 @@ shell_command:
     "{{ states('input_boolean.doorbell_night_light') }}"
 
 script:
+  # 2026-11-09 snapshot gallery: keep a timestamped copy of a pushed picture and refresh sensor.snapshot_gallery.
+  # Called inline by the doorbell webhook automation (ring/motion) and "Stash door opened" before their pushes,
+  # so the push can link to /local/snapshots/<file>.
+  snapshot_keep:
+    alias: "Snapshots: keep a copy for the gallery"
+    mode: queued
+    max: 10
+    fields:
+      src: {description: "source file", example: "/config/www/doorbell/last_motion.jpg", required: true}
+      file: {description: "gallery name <YYYYMMDD-HHMMSS>_<kind>.jpg", example: "20261109-161500_motion.jpg", required: true}
+    sequence:
+      - action: shell_command.snapshot_keep
+        data: {src: "{{ src }}", file: "{{ file }}"}
+        response_variable: r
+      - event: snapshot_gallery
+        event_data:
+          files: "{{ r.stdout.split('\n') | reject('eq', '') | list }}"
+
   doorbell_say:
     alias: "Doorbell: say (TTS through the doorbell speaker)"
     mode: queued

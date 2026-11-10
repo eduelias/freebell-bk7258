@@ -106,11 +106,32 @@ int ov9650_init(void)
 	return 0;
 }
 
+/* fw 0.30: two readouts of the same SXGA timing. The init table ends with the 1280x720 window (rows
+ * 6..364 in the 2-row units of the vertical counter, i.e. the top 720 of the 1024 rows); 1280x1024
+ * reopens the window to the SXGA table's own 6..516 = the sensor's whole field of view (5:4). The
+ * frame period is the same (windowing only masks rows), so the frame rate does not change. The DVP
+ * driver validates a non-default size against ppi_cap and has no 1280x1024 bit, so 1280x1024 is the
+ * driver's def_ppi and 1280x720 the capability bit (dvp_sensor_ov9650 below). */
+#define OV9650_PPI_1280X1024 ((media_ppi_t)((1280u << 16) | 1024u))
 int ov9650_set_ppi(media_ppi_t ppi)
 {
-	/* the init table already selects 1280x720; the vendor driver accepts 1280x720 and 800x480 */
+	uint8_t vstop;
+
 	LOGI("%s %ux%u\n", __func__, ppi >> 16, ppi & 0xffff);
-	return (ppi == PPI_1280X720 || ppi == PPI_800X480) ? 0 : -1;
+	if (ppi == PPI_1280X720)
+		vstop = 0x5b;    /* 364: the table's own 720-row window */
+	else if (ppi == OV9650_PPI_1280X1024)
+		vstop = 0x81;    /* 516: all 1024 rows (the SXGA table's window) */
+	else
+		return -1;
+	SENSOR_I2C_WRITE(0x19, 0x01);   /* VSTRT[9:2] = 6 >> 2 */
+	rtos_delay_milliseconds(1);
+	SENSOR_I2C_WRITE(0x1a, vstop);  /* VSTOP[9:2] */
+	rtos_delay_milliseconds(1);
+	SENSOR_I2C_WRITE(0x03, 0x12);   /* VREF: VSTRT[1:0] = 2, VSTOP[1:0] = 0, bit 4 as in the table */
+	rtos_delay_milliseconds(1);
+	BK_LOGW(TAG, "%s %ux%u: vstop 0x%02x\n", __func__, ppi >> 16, ppi & 0xffff, vstop);
+	return 0;
 }
 
 /* Scene hint from CPU0 (fw 0.27): the application packs it into media_camera_device_t.info.fps,
@@ -235,10 +256,47 @@ static const uint8_t ov9650_night_regs[][2] = {
 	{0x3a, 0x11}, {0x67, 0x80}, {0x68, 0x80},
 };
 
+/* Vertical window offset (fw 0.29): the stock table reads 1280x720 from the top of the sensor's
+ * 1024-row array (VSTART 6, VSTOP 364 in the 2-row units the SXGA vertical counter uses, VREF
+ * 0x03 = 0x12), which on the wall gives a frame that is mostly sky with the visitor's face at the
+ * bottom edge. CPU0 can ask for the window to start lower: it puts OV9650_WIN_MAGIC in
+ * media_camera_device_t.d_info.fps and the offset in 2-row units (0..152 = 0..304 rows) in
+ * d_info.resolution.height; the DVP path never looks at d_info for a DVP sensor and camera_act.c
+ * copies the whole struct through the mailbox (media_app_camera_open() only rewrites
+ * uvc_device[0]). Applied right after the init table, before the scene registers. Both start and
+ * stop move, so the frame stays 720 rows and the pipeline is unchanged. */
+#define OV9650_WIN_MAGIC    0x96
+#define OV9650_WIN_VSTART   6u
+#define OV9650_WIN_VSTOP    364u
+#define OV9650_WIN_MAX_UNITS 152u   /* (1024 - 720) / 2 */
+static void ov9650_window(void)
+{
+	const media_camera_device_t *dev = bk_dvp_camera_get_device();
+	uint32_t off, vs, ve;
+
+	if (!dev || ((uint32_t)dev->d_info.fps & 0xff) != OV9650_WIN_MAGIC)
+		return;
+	off = dev->d_info.resolution.height;
+	if (off > OV9650_WIN_MAX_UNITS)
+		off = OV9650_WIN_MAX_UNITS;
+	if (!off)
+		return;   /* the table's own window */
+	vs = OV9650_WIN_VSTART + off;
+	ve = OV9650_WIN_VSTOP + off;
+	SENSOR_I2C_WRITE(0x19, (vs >> 2) & 0xff);   /* VSTRT[9:2] */
+	rtos_delay_milliseconds(1);
+	SENSOR_I2C_WRITE(0x1a, (ve >> 2) & 0xff);   /* VSTOP[9:2] */
+	rtos_delay_milliseconds(1);
+	SENSOR_I2C_WRITE(0x03, 0x10 | ((ve & 3) << 2) | (vs & 3));   /* VREF: bit 4 as in the table, [3:2] VSTOP[1:0], [1:0] VSTRT[1:0] */
+	rtos_delay_milliseconds(1);
+	BK_LOGW(TAG, "window +%u rows: vstart %u vstop %u (2-row units)\n", off * 2, vs, ve);
+}
+
 int ov9650_set_fps(frame_fps_t fps)
 {
 	uint32_t v = (uint32_t)fps & 0xff;
 
+	ov9650_window();
 	ov9650_gen++;   /* retire the trace thread of the previous open before anything is programmed */
 	ov9650_manual_first = false;
 	ov9650_dbg[0] = 0x96500000u | v;
@@ -281,10 +339,10 @@ const dvp_sensor_config_t dvp_sensor_ov9650 =
 	.fmt = PIXEL_FMT_YUYV,
 	.vsync = SYNC_HIGH_LEVEL,
 	.hsync = SYNC_HIGH_LEVEL,
-	.def_ppi = PPI_1280X720,
+	.def_ppi = OV9650_PPI_1280X1024,   /* fw 0.30: full array as the default (no cap bit exists for it) ... */
 	.def_fps = FPS15,
 	.fps_cap = FPS15,
-	.ppi_cap = PPI_CAP_1280X720,
+	.ppi_cap = PPI_CAP_1280X720,       /* ... and the 720-row window as the capability the driver checks */
 	.id = ID_OV9650,
 	.address = (OV9650_WRITE_ADDRESS >> 1),
 	.init = ov9650_init,

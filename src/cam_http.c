@@ -12,6 +12,7 @@
 #define CAM_HTTP_PORT 8080
 #define CAM_HTTP_MAX_CLIENTS 6   /* HA keeps the MJPEG stream open; leave room for snapshots and a browser */
 static volatile int s_cam_http_clients;
+static uint32_t s_cam_http_last_ms;   /* when the last client left (fw 0.31: H.264 resume after a snapshot) */
 
 #endif
 #endif
@@ -44,7 +45,8 @@ static void cam_http_client_task(beken_thread_arg_t arg)
 	if (policy_http_handle(sock, req, n))   /* /cmd?t=&c=, /log?t= (policy.c): handled, just close */
 		goto out;
 	if (os_strncmp(req, "GET /stream", 11) == 0 || os_strncmp(req, "GET /snapshot", 13) == 0) {
-		if (cam_want_jpeg() == 0) {   /* open on demand (or switch back from H.264); the first frame takes ~1 s */
+		int want = os_strncmp(req, "GET /stream", 11) == 0 ? cam_want_jpeg() : cam_want_snapshot();   /* fw 0.31: a snapshot preempts a live viewer */
+		if (want == 0) {   /* open on demand (or switch back from H.264); the first frame takes ~1 s */
 			for (int w = 0; w < 300 && s_cam_len == 0; w++)
 				rtos_delay_milliseconds(10);
 			settle = cam_settle_wait();   /* cold open: wait for the exposure to settle (X-Settle-Ms) */
@@ -124,6 +126,7 @@ out:
 	if (buf)
 		os_free(buf);
 	close(sock);
+	s_cam_http_last_ms = rtos_get_time();
 	s_cam_http_clients--;
 	rtos_delete_thread(NULL);
 }
@@ -180,5 +183,11 @@ void cam_http_start(void)
 bool cam_http_busy(void)
 {
 	return s_cam_http_clients > 0;
+}
+
+/* ms since the last HTTP camera client left; 0 while one is connected (fw 0.31, H.264 resume). */
+uint32_t cam_http_idle_ms(void)
+{
+	return s_cam_http_clients > 0 ? 0 : rtos_get_time() - s_cam_http_last_ms;
 }
 #endif
