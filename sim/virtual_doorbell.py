@@ -440,6 +440,7 @@ class CamState:
     frames: int = 0
     h264_frames: int = 0
     drop: int = 0
+    resumes: int = 0           # fw 0.31: H.264 handed back to a viewer after a snapshot preempt
     seq: int = 0
     last_ms: int = 0
     opened_ms: int = 0
@@ -1110,6 +1111,20 @@ class Device:
                 self.cam_close()
             return self.cam_open(1280, 720, False)
 
+    def cam_want_snapshot(self) -> int:
+        """fw 0.31: GET /snapshot. A playing RTSP viewer no longer wins (the camera is borrowed for the picture
+        and handed back after 3 s idle). The stand-in never reports a playing viewer, so here it is cam_want_jpeg()."""
+        with self.lock:
+            if self.cam.open and not self.cam.h264:
+                return 0
+            if self.cam.pref == 2:
+                return -1
+            if self.cam.open and self.cam.h264:
+                if self.rtsp.playing() > 0:
+                    self.cam.resumes += 1   # counted at the resume in the firmware; the stand-in has no viewer to resume for
+                self.cam_close()
+            return self.cam_open(1280, 720, False)
+
     def cam_exp_class(self, mv: int) -> int:
         """Day start-exposure class (x16 lines) from the light reading, as cam_exp_class() in app_main.c."""
         if self.cam_exp_fixed:
@@ -1727,11 +1742,11 @@ class Device:
         elif len(argv) >= 2 and argv[1] == "stat":
             c = self.cam
             r.add("[cam] open %d %s (mode %s) frames %u h264 %u dropped %u last jpeg %u bytes %ux%u seq %u age %u ms"
-                  " | scene %s (%s, %u mV, exp %u) open_frames %u settled %s@%u ms wait %u ms x%u settle %u/%u ms/%u%% ircut %s win %u fov %s\r\n" % (
+                  " | scene %s (%s, %u mV, exp %u) open_frames %u settled %s@%u ms wait %u ms x%u settle %u/%u ms/%u%% ircut %s win %u fov %s resumes %u\r\n" % (
                 int(c.open), ("h264" if c.h264 else "jpeg") if c.open else "-", ("auto", "jpeg", "h264")[c.pref], c.frames,
                 c.h264_frames, c.drop, len(c.jpeg), c.w, c.h, c.seq, self.clock.now_ms() - c.last_ms if c.last_ms else 0,
                 c.scene, self.cam_scene_pref, c.open_mv, c.exp_class, c.open_frames, c.settle_how, c.settled_ms, c.wait_ms, c.waits,
-                self.cam_settle[0], self.cam_settle[1], self.cam_settle[2], self.ircut or "unknown", self.cam_win_rows, "full" if self.cam_full else "crop"))
+                self.cam_settle[0], self.cam_settle[1], self.cam_settle[2], self.ircut or "unknown", self.cam_win_rows, "full" if self.cam_full else "crop", c.resumes))
         elif len(argv) >= 2 and argv[1] == "settle":
             if len(argv) >= 3:
                 vals = [int(x) if x.isdigit() else -1 for x in argv[2:5]] + list(self.cam_settle[len(argv) - 2:])
@@ -2478,7 +2493,8 @@ class HttpHandler(BaseHTTPRequestHandler):
             return self._raw(400, "Bad Request", "text/plain", b"GET only\n")
         settle = 0
         if path.startswith("/stream") or path.startswith("/snapshot"):
-            if dev.cam_want_jpeg() == 0:
+            want = dev.cam_want_jpeg() if path.startswith("/stream") else dev.cam_want_snapshot()   # fw 0.31
+            if want == 0:
                 deadline = time.monotonic() + 3.0 / dev.clock.speed + 0.5   # the firmware waits up to 3 s for the first frame
                 while not dev.cam.jpeg and time.monotonic() < deadline:
                     time.sleep(0.01)

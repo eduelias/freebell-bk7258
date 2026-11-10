@@ -311,7 +311,16 @@ void rtsp_feed_frame(const uint8_t *data, uint32_t len, uint32_t ts_ms)
 	d->seq = seq;
 	d->off = off;
 	d->len = len;
-	d->ts90 = (ts_ms ? ts_ms : now_ms()) * 90U;
+	{   /* fw 0.31: the encoder restarts after a snapshot preempt; keep the RTP clock monotonic */
+		static uint32_t ts_off, ts_last;
+		uint32_t t = (ts_ms ? ts_ms : now_ms()) * 90U + ts_off;
+		if (ts_last && (int32_t)(t - ts_last) <= 0) {
+			ts_off += ts_last + 6000 - t;   /* one 15 fps frame later than the previous one */
+			t = ts_last + 6000;
+		}
+		ts_last = t;
+		d->ts90 = t;
+	}
 	d->key = key;
 	d->valid = 1;
 	s_head = end;
@@ -329,6 +338,20 @@ void rtsp_feed_frame(const uint8_t *data, uint32_t len, uint32_t ts_ms)
 
 void rtsp_request_idr(void)
 {
+	s_idr_req = 1;
+}
+
+void rtsp_resync_clients(void)
+{
+	int i;
+
+	rtos_lock_mutex(&s_lock);
+	for (i = 0; i < RTSP_MAX_CLIENTS; i++)
+		if (s_cl[i].used) {
+			s_cl[i].need_key = 1;
+			s_cl[i].next_seq = s_seq ? s_seq : 1;
+		}
+	rtos_unlock_mutex(&s_lock);
 	s_idr_req = 1;
 }
 
@@ -1004,8 +1027,11 @@ static void client_task(beken_thread_arg_t arg)
 				os_printf("[rtsp] #%u audio send failed\r\n", c->idx);
 				break;
 			}
-			if (r == 0 && a == 0)
+			if (r == 0 && a == 0) {
+				if (cam_h264_resume_due())   /* fw 0.31: a snapshot borrowed the camera; take it back */
+					cam_h264_resume();
 				rtos_get_semaphore(&c->sem, 20);
+			}
 		}
 		udp_only = 1;
 		for (i = 0; i < RTSP_TRACKS; i++)

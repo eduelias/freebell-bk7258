@@ -49,7 +49,7 @@ def test_reply_formats(sim):
                     r"motion_left \d+ s \| white src 0x[0-9a-f]+ manual -1 out [01] \| ring manual -1 out 0 wifi 1 fx [01]$",
                     sim.cmd("night status"))
     assert re.match(r"ok\n\[cam\] open [01] \S+ \(mode auto\) frames \d+ h264 \d+ dropped \d+ last jpeg \d+ bytes \d+x\d+ seq \d+ age \d+ ms"
-                    r" \| scene \S+ \(auto, \d+ mV, exp \d+\) open_frames \d+ settled [-nst]@\d+ ms wait \d+ ms x\d+ settle 16/4500 ms/4% ircut \S+ win \d+ fov (crop|full)$",
+                    r" \| scene \S+ \(auto, \d+ mV, exp \d+\) open_frames \d+ settled [-nst]@\d+ ms wait \d+ ms x\d+ settle 16/4500 ms/4% ircut \S+ win \d+ fov (crop|full) resumes \d+$",
                     sim.cmd("cam stat"))
     assert sim.cmd("cam settle 6 2000") == "ok\n[cam] settle 6 frames, cap 2000 ms, stable < 4 % (applies at the next open)"
     assert sim.cmd("cam settle 0") == "ok\ncam settle N(1-60) [MS(100-8000) [PCT(1-50)]]"

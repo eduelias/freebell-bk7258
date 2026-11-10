@@ -33,8 +33,11 @@ interleaved and UDP unicast, up to 3 clients), fed by the BK7258 hardware H.264 
 Baseline, IDR with SPS/PPS every 30 frames = `CONFIG_H264_P_FRAME_CNT=29` on CPU1, plus an IDR on
 every PLAY). The DVP pipeline runs one encoder at a time, so the camera has a mode: JPEG (HTTP) or
 H.264 (RTSP), chosen by `cam mode auto|jpeg|h264`. In `auto` an RTSP client switches to H.264 and
-an HTTP request switches back to JPEG unless an RTSP client is playing; then `/snapshot.jpg` serves
-the last JPEG and `/stream` answers 503. The first `/snapshot.jpg` after a switch back can still be
+an HTTP request switches back to JPEG unless an RTSP client is playing; then `/stream` answers 503
+and, **until 0.30**, `/snapshot.jpg` served the last JPEG. Since **0.31** a snapshot preempts the
+viewer: the camera switches to JPEG for the picture and the RTSP client loop takes it back
+(`cam_h264_resume()`) after 3 s without HTTP clients, see "Snapshot while a viewer is playing"
+below. The first `/snapshot.jpg` after a switch back can still be
 the previous JPEG (the handler does not wait for a new frame). `rtsp q IMB PMB` sets bits per
 macroblock for I/P frames (default 120/24, about 1.5 Mbit/s nominal, applied live).
 
@@ -78,10 +81,34 @@ timeout half the time, which would also break the `camera.snapshot` ring/motion 
 therefore keeps **both** URLs: still `http://<device-ip>:8080/snapshot.jpg`, stream
 `rtsp://<device-ip>:554/live` with `rtsp_transport: tcp` (HA 2026.9 keeps it under `advanced`),
 framerate 5. With the still URL the thumbnail/snapshot takes 45 ms (the first one after a live view
-about 2.4 s, because the camera switches back to JPEG; while someone is watching it is the last
-JPEG). The HA live view uses go2rtc (WebRTC/HLS) and shows up in `rtsp status` as one TCP client
+about 2.4 s, because the camera switches back to JPEG; until 0.30, while someone was watching it
+was the last JPEG, see below). The HA live view uses go2rtc (WebRTC/HLS) and shows up in `rtsp status` as one TCP client
 from the HA host. `tools/ha_generic_camera.py options ENTRY_ID --still ... --stream ...
 --rtsp-transport tcp --framerate 5` sets this over the config-flow API.
+
+### Snapshot while a viewer is playing (v0.31.0)
+
+HA's live view goes through go2rtc, which keeps the RTSP session up for as long as the more-info
+dialog (or a live card) is open and, when the device sleeps, reconnects at every wake while that
+consumer exists. So "someone is watching" is not a corner case: it covers the minutes after a
+motion push, exactly when the next motion event arrives. Measured 2026-11-10 (fw 0.30): 6 of 8
+motion events between 08:26 and 08:48 got a 503 for HA's `camera.snapshot` (and for the zone
+scorer's first requests), and 7 of 9 gallery pictures were byte-identical (the stale JPEG). The RTC
+wakes in between, with no viewer, were all fine.
+
+Since 0.31 `/snapshot.jpg` calls `cam_want_snapshot()`: if a viewer is playing it closes H.264,
+opens JPEG (cold open, so the settle gate applies: the picture is a settled one) and sets a resume
+flag. The RTSP client loop, while it has nothing to send, polls `cam_h264_resume_due()` (flag set
+and `cam_http_idle_ms() >= CAM_H264_RESUME_MS` = 3 s, long enough for the zone scorer's five
+snapshots 0.5 s apart) and calls `cam_h264_resume()` = `rtsp_cam_acquire()` (close JPEG, open
+H.264, wait for the first access unit) + `rtsp_resync_clients()` (every client waits for the next
+IDR, `s_idr_req`). `rtsp_feed_frame()` keeps the RTP clock monotonic across the restart (the
+encoder's timestamps start over). `rtsp_cam_acquire()` itself (called at DESCRIBE, so a bare RTSP
+connect already switches the camera) waits for the same 3 s of HTTP idle, capped at 5 s, so a
+viewer that reconnects during the sequence (go2rtc does, after a few seconds without frames) does
+not take the camera between two snapshots. Cost for the viewer: a gap of roughly the snapshot's settle time
+plus 3 s plus the H.264 reopen (~2 s). `/stream` (MJPEG, open-ended) still yields to a viewer, and
+`cam mode h264` still pins H.264.
 
 ## Exposure at a cold open: scene hint + settle gate (v0.27.0)
 

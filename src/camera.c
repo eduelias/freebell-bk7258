@@ -458,6 +458,11 @@ static bool cam_stalled_locked(void)
 }
 
 /* HTTP wants JPEG frames. 0 = the camera is (now) in JPEG mode, -1 = stay/503 (see cam mode). */
+/* fw 0.31: a snapshot preempted a live RTSP viewer (JPEG for the picture); rtsp.c's client loop
+ * hands the camera back to H.264 through cam_h264_resume() once HTTP has been idle for a moment. */
+static bool s_cam_h264_resume;
+static uint32_t s_cam_resumes;
+
 int cam_want_jpeg(void)
 {
 	int ret = 0, playing = 0;
@@ -484,11 +489,75 @@ out:
 	return ret;
 }
 
+/* fw 0.31: GET /snapshot. Like cam_want_jpeg(), but a live RTSP viewer no longer wins: the camera is
+ * switched to JPEG for the picture and goes back to H.264 (cam_h264_resume) once HTTP has been idle
+ * for CAM_H264_RESUME_MS. Before, a motion event while someone watched the live stream (go2rtc keeps
+ * the RTSP session up, and reconnects at every wake while a viewer is open) got the JPEG taken before
+ * the switch, or a 503 when there was none: the gallery filled with the same picture. The picture is
+ * what the doorbell is for; the viewer sees a few seconds of gap and resumes at the next IDR.
+ * `cam mode h264` still pins H.264 (stale JPEG / 503 as before). */
+int cam_want_snapshot(void)
+{
+	int ret = 0, playing = 0;
+
+	rtos_lock_mutex(&s_cam_ctl);
+	cam_stalled_locked();
+	if (s_cam_open && !s_cam_h264)
+		goto out;
+	if (s_cam_pref == CAM_PREF_H264) {
+		ret = -1;
+		goto out;
+	}
+	if (s_cam_open && s_cam_h264) {
+		rtsp_clients(&playing);
+		if (playing > 0) {
+			s_cam_h264_resume = true;
+			os_printf("[cam] snapshot preempts %d live viewer(s)\r\n", playing);
+		}
+		cam_close_locked();
+	}
+	ret = cam_open_locked(cam_frame_w(), cam_frame_h(), false);
+out:
+	rtos_unlock_mutex(&s_cam_ctl);
+	return ret;
+}
+
+bool cam_h264_resume_due(void)
+{
+	return s_cam_h264_resume && cam_http_idle_ms() >= CAM_H264_RESUME_MS;
+}
+
+/* Called from an RTSP client thread (the same context as the PLAY-time acquire). */
+void cam_h264_resume(void)
+{
+	int playing = 0, ret;
+
+	rtos_lock_mutex(&s_cam_ctl);
+	if (!s_cam_h264_resume) {
+		rtos_unlock_mutex(&s_cam_ctl);
+		return;
+	}
+	s_cam_h264_resume = false;
+	rtos_unlock_mutex(&s_cam_ctl);
+	rtsp_clients(&playing);
+	if (playing <= 0)
+		return;   /* the viewer left meanwhile: stay JPEG, the next PLAY acquires as usual */
+	ret = rtsp_cam_acquire();
+	s_cam_resumes++;
+	rtsp_resync_clients();   /* new encoder session: everyone waits for its IDR */
+	os_printf("[cam] H.264 back for %d viewer(s) after a snapshot -> %d\r\n", playing, ret);
+}
+
 /* ---- rtsp.c callbacks: the RTSP server wants H.264 ---- */
 int rtsp_cam_acquire(void)
 {
 	int ret = 0, w;
 
+	/* fw 0.31: let a snapshot sequence finish first (HA's zone scorer takes five, 0.5 s apart; a
+	 * viewer that reconnects meanwhile would otherwise steal the camera between two of them and
+	 * the next one would take it back). Capped at 5 s: an open-ended MJPEG /stream still loses. */
+	for (w = 0; w < 500 && cam_http_idle_ms() < CAM_H264_RESUME_MS; w++)
+		rtos_delay_milliseconds(10);
 	rtos_lock_mutex(&s_cam_ctl);
 	if (s_cam_pref == CAM_PREF_JPEG) {
 		ret = -1;
@@ -619,12 +688,12 @@ void cli_cam_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv
 	} else if (argc >= 2 && os_strcmp(argv[1], "stat") == 0) {
 		static const char *const pref[] = {"auto", "jpeg", "h264"};
 		REPLY("[cam] open %d %s (mode %s) frames %u h264 %u dropped %u last jpeg %u bytes %ux%u seq %u age %u ms"
-		      " | scene %s (%s, %u mV, exp %u) open_frames %u settled %c@%u ms wait %u ms x%u settle %u/%u ms/%u%% ircut %s win %u fov %s\r\n", s_cam_open,
+		      " | scene %s (%s, %u mV, exp %u) open_frames %u settled %c@%u ms wait %u ms x%u settle %u/%u ms/%u%% ircut %s win %u fov %s resumes %u\r\n", s_cam_open,
 		      s_cam_open ? (s_cam_h264 ? "h264" : "jpeg") : "-", pref[s_cam_pref], s_cam_frames, s_cam_h264_frames,
 		      s_cam_drop, s_cam_len, s_cam_w, s_cam_h, s_cam_seq, s_cam_last_ms ? rtos_get_time() - s_cam_last_ms : 0,
 		      s_cam_scene ? cam_scene_name(s_cam_scene) : "stock", cam_scene_name(s_cam_scene_pref), s_cam_open_mv, s_cam_exp_class, s_cam_open_frames,
 		      s_cam_settle_how, s_cam_settled_ms, s_cam_settle_wait_ms, s_cam_settle_waits, s_cam_settle_n, s_cam_settle_ms, s_cam_settle_pct,
-		      s_ircut_state < 0 ? "unknown" : cam_scene_name(s_ircut_state), (unsigned)s_cam_win_rows, s_cam_full ? "full" : "crop");
+		      s_ircut_state < 0 ? "unknown" : cam_scene_name(s_ircut_state), (unsigned)s_cam_win_rows, s_cam_full ? "full" : "crop", (unsigned)s_cam_resumes);
 	} else if (argc >= 2 && os_strcmp(argv[1], "settle") == 0) {   /* cam settle [N [MS [PCT]]] */
 		char buf[32];
 		if (argc >= 3) {

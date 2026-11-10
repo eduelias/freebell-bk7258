@@ -4,6 +4,23 @@ Versions are the `FW_VERSION` in `src/version.h` (`project/main/app_main.c` befo
 report JSON and in `sys info`). Dates are 2026 unless stated; most of this was written between 2026-10-01 and
 2026-10-03.
 
+## 0.31.0
+- **A snapshot preempts a live viewer.** `GET /snapshot.jpg` while an RTSP client is playing used
+  to get the last JPEG taken before the switch to H.264, or a 503 when there was none (documented
+  since 0.22 as "while someone is watching it is the last JPEG"). With go2rtc that is not a corner
+  case: HA keeps the RTSP session up for as long as a live view is open and reconnects at every
+  wake, so a motion event during (or shortly after) a look at the live picture recorded a stale
+  frame; on 2026-11-10 seven of nine motion pictures in the HA gallery were the same picture.
+  `cam_want_snapshot()` now closes H.264, opens JPEG for the picture (the usual cold-open settle
+  gate applies) and the RTSP client loop takes the camera back (`cam_h264_resume()`,
+  `rtsp_cam_acquire` + `rtsp_resync_clients`) once HTTP has been idle for 3 s
+  (`CAM_H264_RESUME_MS`, so HA's zone scorer's five snapshots do not ping-pong the encoder). The
+  viewer sees a gap of a few seconds and resumes at the next IDR; the RTP clock is kept monotonic
+  across the encoder restart. `rtsp_cam_acquire()` (DESCRIBE/PLAY) now also waits for that
+  same 3 s of HTTP idle (capped at 5 s) so a viewer reconnecting in the middle of the sequence
+  does not take the camera between two snapshots. `/stream` (MJPEG) still yields to a playing
+  viewer (503), and `cam mode h264` still pins H.264. `cam stat` shows `resumes N`.
+
 ## 0.30.0
 - **Full field of view: `cam fov crop|full`** (KV `db_cam_fov`, default crop). `full` reads all 1024 rows
   of the OV9650 (1280x1024, 5:4) instead of the 720-row window: the whole field of view of the lens
