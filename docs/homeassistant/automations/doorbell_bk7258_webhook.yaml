@@ -18,7 +18,7 @@
     -> persistent notification + push. 2026-11-09: every ring/motion snapshot is also
     kept as /config/www/snapshots/<YYYYMMDD-HHMMSS>_{ring,motion,motion-single}.jpg
     (script.snapshot_keep -> sensor.snapshot_gallery, dashboard view Doorbell); the
-    ring-photo and motion pushes attach that file and open it on tap (clickAction),
+    ring-photo and motion pushes attach that file; tap opens the Doorbell gallery view (a /local/ file as clickAction does not work in the Android app),
     with Live / Gallery action buttons.'
   triggers:
   - trigger: webhook
@@ -111,7 +111,7 @@
             channel: doorbell
             importance: high
             tag: doorbell_ring_photo
-            clickAction: /local/snapshots/{{ snap }}
+            clickAction: /dashboard-prototype1/doorbell
             image: /local/snapshots/{{ snap }}
             actions:
             - action: URI
@@ -183,7 +183,7 @@
               channel: doorbell_motion
               tag: doorbell_motion
               image: /local/snapshots/{{ snap }}
-              clickAction: /local/snapshots/{{ snap }}
+              clickAction: /dashboard-prototype1/doorbell
               actions:
               - action: URI
                 title: Live
